@@ -5,6 +5,14 @@ import os from 'node:os';
 import path from 'node:path';
 import type { ProviderAdapter, BuildCtx } from './provider.ts';
 import type { SessionRecord } from '../types.ts';
+import { literalPasteLanded, normalizePane } from '../paste.ts';
+
+/**
+ * claude collapses a large bracketed paste into a chip like `❯ [Pasted text #1 +92 lines]`
+ * (the literal text is NOT rendered). Verified live (claude 2.1.x). The chip is the
+ * "landed" signal for multi-KB prompts.
+ */
+const PASTE_CHIP_RE = /\[Pasted text #\d+ \+\d+ lines?\]/;
 
 export class ClaudeAdapter implements ProviderAdapter {
   readonly name = 'claude' as const;
@@ -53,6 +61,17 @@ export class ClaudeAdapter implements ProviderAdapter {
       pane.includes('Is this a project you created') ||
       pane.includes('Do you trust the files in this folder')
     );
+  }
+
+  pasteLanded(pane: string, text: string): boolean {
+    // Small paste → literal end-probe; large paste → the collapsed chip.
+    return literalPasteLanded(pane, text) || PASTE_CHIP_RE.test(normalizePane(pane));
+  }
+
+  clearInputKeys(): string[] {
+    // Ctrl-U clears the whole composer (even a collapsed paste chip) and never exits.
+    // Verified live: chip gone, session alive, "Ctrl+Y to paste deleted text" hint shown.
+    return ['C-u'];
   }
 
   async resolveTranscript(rec: SessionRecord): Promise<string | null> {

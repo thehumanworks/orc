@@ -4,6 +4,14 @@
  */
 import type { ProviderAdapter, BuildCtx } from './provider.ts';
 import type { SessionRecord } from '../types.ts';
+import { literalPasteLanded, normalizePane } from '../paste.ts';
+
+/**
+ * pi collapses a large bracketed paste into a chip like `[paste #1 +93 lines]` (the
+ * literal text is NOT rendered). Verified live (pi 0.79.0). The chip is the "landed"
+ * signal for multi-KB prompts.
+ */
+const PASTE_CHIP_RE = /\[paste #\d+ \+\d+ lines?\]/;
 
 /**
  * pi's ready composer renders two `────` horizontal borders with an empty input line
@@ -65,6 +73,17 @@ export class PiAdapter implements ProviderAdapter {
   trustDialogMatch(_pane: string): boolean {
     // pi -a has no trust dialog.
     return false;
+  }
+
+  pasteLanded(pane: string, text: string): boolean {
+    // Small paste → literal end-probe; large paste → the collapsed chip.
+    return literalPasteLanded(pane, text) || PASTE_CHIP_RE.test(normalizePane(pane));
+  }
+
+  clearInputKeys(): string[] {
+    // Ctrl-U clears the whole composer (even a collapsed paste chip) and is SAFE — unlike
+    // Ctrl-C, which QUITS pi. Verified live: chip gone, session alive.
+    return ['C-u'];
   }
 
   async resolveTranscript(rec: SessionRecord): Promise<string | null> {

@@ -12,6 +12,7 @@ import { parseTranscript } from './transcript.ts';
 import type { Turn } from './transcript.ts';
 import { classifyState, reduceWait, INITIAL_TRACKING } from './state.ts';
 import type { WaitTracking } from './state.ts';
+import { pasteProbe } from './paste.ts';
 import type { AgentState, Provider, SessionRecord, SessionStatus } from './types.ts';
 
 const READY_TIMEOUT_MS = 30_000;
@@ -30,24 +31,6 @@ export interface WaitForOptions {
   timeoutMs?: number;
   /** Interval between polls. Default 1000. */
   pollMs?: number;
-}
-
-/**
- * A short prefix of the prompt's first non-empty line, used to verify the paste
- * actually landed in the input box before we submit. Whitespace is collapsed so
- * tmux's line-wrapping/indent doesn't cause a false negative; capped so long lines
- * (which the TUI may wrap) still match on their leading chunk.
- */
-function pasteProbe(text: string): string | null {
-  const firstLine = text.split('\n').map((l) => l.trim()).find((l) => l.length > 0);
-  if (!firstLine) return null;
-  const collapsed = firstLine.replace(/\s+/g, ' ');
-  return collapsed.slice(0, 24);
-}
-
-/** Collapse whitespace in a pane capture so it can be matched against a probe. */
-function normalizePane(pane: string): string {
-  return pane.replace(/\s+/g, ' ');
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -183,10 +166,16 @@ export class Session {
 
   /**
    * Send a prompt. Multi-line safe: paste-buffer (bracketed) → settle → VERIFY the
-   * text landed in the pane → Enter. The verify-before-submit loop (RESEARCH D.13)
+   * paste landed in the composer → Enter. The verify-before-submit loop (RESEARCH D.13)
    * is self-correcting: if the pane wasn't interactive yet (e.g. boot hooks still
    * running) and the paste was dropped, we re-paste rather than submit an empty box.
    * Ready-guarded so we never paste into an un-booted pane.
+   *
+   * LARGE-PROMPT SAFE: the verify checks `adapter.pasteLanded` — the literal END of the
+   * prompt (near the cursor, which stays on screen) OR the provider's collapsed paste
+   * chip — NOT the first line (which scrolls off the top of a multi-KB paste). Before
+   * any re-paste we CLEAR the composer (`adapter.clearInputKeys`) so a retry can never
+   * stack the prompt 2–3× (the old compounding bug). See `src/paste.ts`.
    */
   async send(prompt: string): Promise<void> {
     if (!(await this.isReady())) {
@@ -197,24 +186,32 @@ export class Session {
     }
     // Strip a single trailing newline to avoid an accidental extra submit.
     const text = prompt.replace(/\n$/, '');
-    const probe = pasteProbe(text);
+    // pasteProbe===null marks an empty/whitespace prompt: nothing to verify, treat the
+    // paste as landed (preserves the existing empty-prompt behavior).
+    const isEmpty = pasteProbe(text) === null;
 
     let landed = false;
     for (let attempt = 0; attempt < SEND_MAX_ATTEMPTS; attempt++) {
       await this.driver.paste(this.tmuxName, text);
       await sleep(PASTE_SETTLE_MS);
-      if (probe === null) {
-        // Empty/whitespace prompt — nothing to verify; treat as landed.
+      if (isEmpty) {
         landed = true;
         break;
       }
       const pane = await this.driver.capture(this.tmuxName);
-      if (normalizePane(pane).includes(probe)) {
+      if (this.adapter.pasteLanded(pane, text)) {
         landed = true;
         break;
       }
-      // Not visible yet — give the TUI a moment, then re-paste.
-      await sleep(POLL_INTERVAL_MS);
+      // Not confirmed. Clear the composer BEFORE re-pasting so a failed attempt can't
+      // stack the prompt; then give the TUI a moment and retry. (When the paste was
+      // simply dropped, the box is already empty and the clear is a harmless no-op.)
+      if (attempt < SEND_MAX_ATTEMPTS - 1) {
+        for (const key of this.adapter.clearInputKeys?.() ?? []) {
+          await this.driver.sendKeys(this.tmuxName, key);
+        }
+        await sleep(POLL_INTERVAL_MS);
+      }
     }
 
     if (!landed) {
