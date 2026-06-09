@@ -16,6 +16,11 @@ export function registryPath(): string {
   return path.join(orcHome(), 'registry.json');
 }
 
+/** Path to the trusted-peer file (`agi remote` list + the daemon's allowlist). */
+export function peersPath(): string {
+  return path.join(orcHome(), 'peers.json');
+}
+
 /** Base sessions dir (~/.orc/sessions). */
 export function sessionsDir(): string {
   return path.join(orcHome(), 'sessions');

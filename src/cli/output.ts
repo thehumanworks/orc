@@ -54,6 +54,17 @@ export function renderSessionList(views: SessionView[]): string {
   return views.map(renderSessionLine).join('\n');
 }
 
+/** A session view tagged with the host it lives on (for `agi list --all-hosts`). */
+export interface HostSessionView extends SessionView {
+  host: string;
+}
+
+/** Like `renderSessionList`, with a leading `host` column (the fleet view). */
+export function renderSessionListWithHost(views: HostSessionView[]): string {
+  if (views.length === 0) return '(no sessions)';
+  return views.map((v) => `${v.host.padEnd(14)} ${renderSessionLine(v)}`).join('\n');
+}
+
 /** One human line per workflow step result. */
 function renderStepResultLine(r: StepResult): string {
   const mark = r.ok ? 'ok' : 'FAIL';
@@ -114,11 +125,13 @@ Usage:
   agi read   <id|name> [--raw]                        Parsed transcript (default) or full pane (--raw)
   agi state  <id|name>                                Classify state once: starting|running|done|waiting|failed
   agi wait   <id|name> [--for S] [--timeout SEC]      Block until the agent settles (S: done|waiting|failed|settled)
-  agi list   [--workspace W | --all | --dead]         List sessions (alias: ps)
+  agi list   [--workspace W | --all | --dead | --all-hosts]  List sessions (alias: ps)
   agi attach <id|name> [--read-only]                  Print the tmux attach command
   agi kill   <id|name> [--worktree] [--purge]         Kill session (mark dead; --purge removes record)
   agi prune  [--worktree]                             Drop all dead records (+ optional worktrees)
   agi workflow <run|list|status|attach|logs> ...      Run/inspect multi-step workflows (alias: wf)
+  agi daemon [--port 8787] [--bind <ip>] [--insecure] Serve the HTTP API over tailscale
+  agi remote <add|list|rm> <host> [--port P]          Manage trusted peers (~/.orc/peers.json)
   agi help                                            This help
 
 spawn options:
@@ -158,7 +171,23 @@ HARD signal (a commit, a file); a worktree step defaults to state==='done' && co
 A non-worktree step with no predicate is reported \`unverified\` — a yield is NOT success.
 Run status: running | done | failed | orphaned (a --detach runner that died mid-run).
 
+daemon + remote (drive agents on other orc hosts over tailscale):
+  agi daemon            Run Bun.serve exposing the SDK as JSON. Binds to this host's
+                        tailscale IP by DEFAULT (never 0.0.0.0); refuses an unsafe --bind
+                        unless --insecure. --bind 127.0.0.1 for local testing. Every route
+                        except GET /health is behind a FAIL-CLOSED trust gate: a caller is
+                        allowed iff tailscale whois resolves its IP to an allowlisted peer
+                        (agi remote add) OR it presents x-orc-secret == \$ORC_DAEMON_SECRET.
+  agi remote add <h>    Trust peer <h> (also the host list for --host / --all-hosts).
+  agi --host <h> <cmd>  Run <cmd> against the daemon on <h> (host or host:port) over HTTP
+                        instead of locally — list/spawn/send/read/wait/state/kill/workflow.
+                        Output (and --json) is identical to local. Sends x-orc-secret from
+                        \$ORC_DAEMON_SECRET when set. Remote attach prints a tailscale ssh hint
+                        (the tmux session is host-local).
+  agi list --all-hosts  Fleet view: aggregate local + every trusted peer, with a host column.
+
 Global:
+  --host <h>            Run the command against the daemon on host <h> (see above)
   --json                machine-readable output; non-zero exit + {error} on failure
 
 read --json emits the parsed turn array ([{role,text},...]); --raw --json emits

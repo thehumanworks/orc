@@ -47,6 +47,27 @@ export function isSettled(s: AgentState): boolean {
   return s === 'done' || s === 'waiting' || s === 'failed';
 }
 
+/**
+ * Map a `--for` value (CLI) / `for` field (daemon `POST .../wait`) to the set of states
+ * `waitFor` should settle on. `settled` (default) = any non-progressing state. Returns
+ * null for an invalid value. Pure + synchronous; lives here (not in the CLI) so both the
+ * CLI and the daemon route mapping can share it without a circular import.
+ */
+export function resolveUntil(forArg: string): AgentState[] | null {
+  switch (forArg) {
+    case 'settled':
+      return ['done', 'waiting', 'failed'];
+    case 'done':
+      return ['done'];
+    case 'waiting':
+      return ['waiting'];
+    case 'failed':
+      return ['failed'];
+    default:
+      return null;
+  }
+}
+
 /** Debounce tracking carried across polls by `waitFor`. */
 export interface WaitTracking {
   /** The non-progressing state observed on the previous poll (null if progressing). */
