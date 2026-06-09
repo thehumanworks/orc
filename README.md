@@ -46,12 +46,16 @@ agi list   [--workspace W | --all | --dead]         List sessions for a workspac
 agi attach <id|name> [--read-only]                  Print the `tmux attach` command (does not exec)
 agi kill   <id|name> [--worktree] [--purge]         Kill the session (mark dead; --purge removes record)
 agi prune  [--worktree]                             Drop all dead records (+ optionally their worktrees)
+agi workflow run|list|status|logs|attach …          Run/inspect multi-step workflows (see Workflows)
+agi daemon [--port P] [--bind IP] [--insecure]      Serve the HTTP API over tailscale (see Daemon)
+agi remote add|list|rm <host>                       Manage trusted peer hosts (~/.orc/peers.json)
 agi help
 ```
 
 Every command accepts `--json`. On failure the process exits non-zero and, with `--json`, prints
 `{"error": "..."}`. `agi list --json` returns an array of records each with a live `status` field;
-`agi spawn --json` prints the new record so a caller can immediately `agi send <id>`.
+`agi spawn --json` prints the new record so a caller can immediately `agi send <id>`. Any command can
+be targeted at another host with `agi --host <h> <command>` (see Daemon).
 
 ### spawn options
 
@@ -310,6 +314,34 @@ a file under `~/.orc/runs/<runId>/` (outside any worktree, so the agent can't co
 gets a short "read this file" pointer — working around the `send()` large-paste bug. **Sessions are left
 alive** after a workflow finishes (v1 choice) so you can `agi attach`/`agi read` them and
 `agi workflow logs` can read their transcripts; tear them down with `agi kill` when done.
+
+## Daemon & remote hosts
+
+`orc` can drive agents and workflows on **other hosts** over your [tailscale](https://tailscale.com)
+network. Each host runs a daemon; one machine can then manage the whole fleet.
+
+```sh
+# On a host: serve the HTTP API. Binds to THIS host's tailscale IP by default.
+agi daemon                      # bind = tailscale IP (refuses 0.0.0.0 without --insecure)
+agi daemon --bind 127.0.0.1     # local testing
+
+# From a client: trust a peer, then target it with --host.
+agi remote add mini             # add a trusted tailnet host to ~/.orc/peers.json
+agi --host mini spawn -p claude --prompt "summarize this repo"
+agi --host mini wait <id> && agi --host mini read <id>
+agi list --all-hosts            # fleet view across local + trusted peers
+```
+
+The daemon is a thin JSON/HTTP layer over the SDK (`/sessions`, `/sessions/:id/{read,send,wait,kill}`,
+`/workflows/*`), so a remote agent's lifecycle is identical to a local one.
+
+**Security.** The daemon binds to the host's **tailscale interface only** (a `100.x` WireGuard
+address the tailnet won't route from off-net); it **refuses** to bind a public/LAN address without an
+explicit `--insecure`. Every route except `/health` goes through a **fail-closed** trust gate: a
+request is allowed only if `tailscale whois` resolves its source to an **allowlisted** peer
+(`agi remote add`) **or** it presents `x-orc-secret` equal to `$ORC_DAEMON_SECRET` — anything else is
+`403`. (The whois path needs a real two-host tailnet to exercise; the loopback test suite covers the
+secret path, the deny path, and bind-refusal.)
 
 ## Workspaces
 
