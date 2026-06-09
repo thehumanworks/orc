@@ -16,6 +16,24 @@ export { classifyState, reduceWait, isSettled } from './state.ts';
 export type { StateMatchers, WaitTracking } from './state.ts';
 export { parseTranscript, renderTurns } from './transcript.ts';
 export type { Turn, TurnRole } from './transcript.ts';
+export {
+  defineWorkflow,
+  runWorkflow,
+  validateWorkflowDef,
+  interpolate,
+  evaluateStep,
+} from './workflow.ts';
+export type {
+  WorkflowStep,
+  WorkflowDef,
+  WorkflowRun,
+  StepResult,
+  StepDoneCtx,
+  WorkflowEvent,
+  RunWorkflowOptions,
+  StepExecutor,
+} from './workflow.ts';
+export { writeRun, readRun, listRuns } from './runs.ts';
 export type {
   Provider,
   AgentOptions,
