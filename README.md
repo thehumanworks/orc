@@ -192,6 +192,86 @@ agi wait "$ID" --for done --timeout 120      # block up to 120s for the turn to 
 agi state "$ID" --json                       # {"id","state"} — point-in-time, no blocking
 ```
 
+## Workflows
+
+A **workflow** sequences multiple agent steps reliably — the layer above `agent()` that runs, say,
+`implement → review`. A workflow is a plain TypeScript file you commit (versioned under
+`orc.workflows/`); the core runner executes it in the **foreground** and persists a run record to
+`~/.orc/runs/<runId>.json` after every step transition, so a crash leaves an inspectable record.
+(`--detach` background runs and a `logs` reader are a separate later feature; the run record already
+carries enough per-step state for a status reader.)
+
+```sh
+agi workflow run <file> [--json]      # import the file's default-exported WorkflowDef and run it
+agi workflow list [--json]            # list persisted runs from ~/.orc/runs/ (newest first)
+agi workflow status <runId> [--json]  # print a run record (per-step state)
+```
+
+`agi workflow run` streams step events to stdout (`--json` prints only the final `WorkflowRun`) and
+**exits non-zero if the run failed**. There's a runnable example — a 2-step handoff where claude
+writes a token to a file and codex reads it back:
+
+```sh
+agi workflow run orc.workflows/example.ts --json
+```
+
+### Defining a workflow
+
+A workflow file `default`-exports a **plain object** `{ name, steps[] }`. No import is required for it
+to run — `agi workflow run` imports the file and the runner validates the shape. (`orc` is not a
+resolvable package name; the bin is `agi`.) The optional `defineWorkflow` helper — or just
+`satisfies WorkflowDef` with a type-only import via a relative path — gives an editor types without
+adding a runtime dependency.
+
+```ts
+// orc.workflows/feature.ts
+import type { WorkflowDef } from '../src/workflow.ts'; // type-only: erased at runtime
+export default {
+  name: 'feature',
+  steps: [
+    { id: 'implement', provider: 'claude', worktree: true, taskFile: 'tasks/01.md',
+      // a worktree step succeeds only when it YIELDS *and* its branch has a new commit:
+      done: ({ state, commitsAhead }) => state === 'done' && commitsAhead >= 1 },
+    { id: 'review', provider: 'codex', cwd: '${implement.worktree}',
+      prompt: 'Review the diff on this branch; write findings to REVIEW.md',
+      done: ({ state }) => state === 'done' },
+  ],
+} satisfies WorkflowDef;
+```
+
+Each step spawns an agent (`provider`, `prompt` or `taskFile`, optional `worktree`/`cwd`), waits for it
+to settle via the debounced `Session.waitFor`, then evaluates its `done(ctx)` predicate. A step's `cwd`
+(and `prompt`/`taskFile`) may interpolate a prior step's result field with `${stepId.field}` — e.g.
+`${implement.worktree}` to review the diff in the implementer's worktree.
+
+| step field | meaning |
+| --- | --- |
+| `id` | unique within the workflow; the key for `${id.field}` interpolation |
+| `provider` | `claude` \| `codex` \| `pi` |
+| `taskFile` / `prompt` | exactly one; long specs use `taskFile` (delivered as a file + pointer) |
+| `worktree` | create a fresh git worktree for this step (default false) |
+| `cwd` | working dir; may interpolate `${stepId.field}` |
+| `timeoutMs` | per-step `waitFor` timeout (default 600000) |
+| `done(ctx)` | success predicate over `{ state, commitsAhead, capture }` |
+| `continueOnFail` | default false → a failed step stops the run |
+
+### Reliability — a yield is **not** success
+
+`state === 'done'` means the turn **yielded** (ready for input), not that it succeeded: an agent that
+asks a clarifying question and stops is pane-indistinguishable from one that finished. So the runner
+**never** equates a yield with success:
+
+- `done` predicate provided → `ok = done(ctx)` (your call, over a hard signal).
+- else **worktree** step → `ok = state === 'done' && commitsAhead >= 1` (the commit is the evidence).
+- else (no predicate, no worktree) → `ok = state === 'done'`, but the step is flagged **`unverified`**
+  and the runner emits a loud warning — there's no universal success signal, so add a `done` predicate.
+
+Step instructions are delivered reliably: a `taskFile` or a large inline `prompt` (>~1KB) is written to
+a file under `~/.orc/runs/<runId>/` (outside any worktree, so the agent can't commit it) and the agent
+gets a short "read this file" pointer — working around the `send()` large-paste bug. **Sessions are left
+alive** after a workflow finishes (v1 choice) so you can `agi attach`/`agi read` them and a future
+`logs` command can read their transcripts; tear them down with `agi kill` when done.
+
 ## Workspaces
 
 A session is filed under a **workspace** key, and `agi list` (no flags) shows only the sessions for

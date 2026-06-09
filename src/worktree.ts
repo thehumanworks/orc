@@ -80,6 +80,21 @@ export async function createWorktree(args: CreateWorktreeArgs): Promise<Worktree
   return { path: real, branch };
 }
 
+/**
+ * Count commits on a worktree's branch ahead of `base` (default `main`):
+ * `git -C <worktree> rev-list --count base..HEAD`. This is the HARD success signal a
+ * workflow step uses (a commit is evidence the agent did real work — a yield alone is
+ * not). Returns 0 when the ref can't be resolved (e.g. no `base` branch) so an
+ * unverifiable worktree never falsely reports success. v1 assumes the integration
+ * branch is `main`, matching the dogfood harness and DESIGN-workflows.md.
+ */
+export async function commitCountVsMain(worktree: string, base = 'main'): Promise<number> {
+  const r = await git(['rev-list', '--count', `${base}..HEAD`], worktree);
+  if (r.code !== 0) return 0;
+  const n = parseInt(r.stdout.trim(), 10);
+  return Number.isFinite(n) ? n : 0;
+}
+
 /** Remove a worktree (force). Best-effort; tolerates already-removed. */
 export async function removeWorktree(repoCwd: string, wtPath: string): Promise<void> {
   const toplevel = (await gitToplevel(repoCwd)) ?? repoCwd;

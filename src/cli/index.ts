@@ -3,17 +3,24 @@
  * `agi` — the orc CLI dispatcher. Parses the subcommand first, then parses the
  * remainder with that command's own options map (parseArgs is strict on unknowns).
  */
+import path from 'node:path';
 import { parseArgs } from 'node:util';
 import type { ParseArgsConfig } from 'node:util';
 import { agent } from '../agent.ts';
 import { listSessions, getSession, pruneSessions } from '../index.ts';
 import { renderTurns } from '../transcript.ts';
+import { runWorkflow } from '../workflow.ts';
+import type { WorkflowDef, WorkflowEvent, WorkflowRun } from '../workflow.ts';
+import { readRun, listRuns } from '../runs.ts';
 import type { AgentOptions, AgentState, Provider, SystemPromptMode } from '../types.ts';
 import {
   printJson,
   printError,
   renderSessionDetail,
   renderSessionList,
+  renderWorkflowEvent,
+  renderRunDetail,
+  renderRunList,
   HELP_TEXT,
 } from './output.ts';
 import type { SessionView } from './output.ts';
@@ -481,6 +488,94 @@ async function cmdWait(args: string[]): Promise<number> {
   return reached ? 0 : 1;
 }
 
+/**
+ * `agi workflow <sub>` — the only command with a sub-arg. argv[1] is the workflow
+ * subcommand (run|list|status); the remainder is that sub's own args.
+ */
+async function cmdWorkflow(args: string[]): Promise<number> {
+  const sub = args[0];
+  const rest = args.slice(1);
+  switch (sub) {
+    case 'run':
+      return cmdWorkflowRun(rest);
+    case 'list':
+      return cmdWorkflowList(rest);
+    case 'status':
+      return cmdWorkflowStatus(rest);
+    default:
+      printError(`unknown workflow subcommand '${sub ?? ''}' (run|list|status)`, false);
+      return 1;
+  }
+}
+
+async function cmdWorkflowRun(args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, { json: { type: 'boolean' } });
+  const json = jsonFlag(values);
+  const file = positionals[0];
+  if (!file) {
+    printError('workflow run requires <file> (a TS module default-exporting a WorkflowDef)', json);
+    return 1;
+  }
+
+  // Dynamically import the file. A WorkflowDef is a PLAIN object default-export — the
+  // file needs no import to work; runWorkflow VALIDATES the shape. (`defineWorkflow` is
+  // an optional typing helper an author may import via a relative path.)
+  let def: WorkflowDef;
+  try {
+    const mod = (await import(path.resolve(file))) as { default?: WorkflowDef };
+    if (!mod.default) {
+      printError(`workflow file '${file}' has no default export`, json);
+      return 1;
+    }
+    def = mod.default;
+  } catch (e) {
+    printError(`failed to import workflow '${file}': ${(e as Error).message}`, json);
+    return 1;
+  }
+
+  let run: WorkflowRun;
+  try {
+    // Stream step events to stdout in human mode; --json prints only the final record.
+    run = await runWorkflow(def, {
+      onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
+    });
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
+
+  if (json) printJson(run);
+  // Non-zero exit when the run failed, so callers/CI can gate on it.
+  return run.status === 'done' ? 0 : 1;
+}
+
+async function cmdWorkflowList(args: string[]): Promise<number> {
+  const { values } = parse(args, { json: { type: 'boolean' } });
+  const json = jsonFlag(values);
+  const runs = await listRuns();
+  if (json) printJson(runs);
+  else process.stdout.write(`${renderRunList(runs)}\n`);
+  return 0;
+}
+
+async function cmdWorkflowStatus(args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, { json: { type: 'boolean' } });
+  const json = jsonFlag(values);
+  const runId = positionals[0];
+  if (!runId) {
+    printError('workflow status requires <runId>', json);
+    return 1;
+  }
+  const run = await readRun(runId);
+  if (!run) {
+    printError(`no run found for '${runId}'`, json);
+    return 1;
+  }
+  if (json) printJson(run);
+  else process.stdout.write(`${renderRunDetail(run)}\n`);
+  return 0;
+}
+
 /** Map a raw subcommand (with aliases) to a canonical name. */
 export function resolveCommand(raw: string | undefined): string {
   switch (raw) {
@@ -505,6 +600,9 @@ export function resolveCommand(raw: string | undefined): string {
       return 'kill';
     case 'prune':
       return 'prune';
+    case 'workflow':
+    case 'wf':
+      return 'workflow';
     case 'help':
     case '--help':
     case '-h':
@@ -540,6 +638,8 @@ async function main(): Promise<number> {
       return cmdKill(rest);
     case 'prune':
       return cmdPrune(rest);
+    case 'workflow':
+      return cmdWorkflow(rest);
     case 'help':
       process.stdout.write(HELP_TEXT);
       return 0;

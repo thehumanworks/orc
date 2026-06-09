@@ -2,6 +2,7 @@
  * Human + JSON renderers for the agi CLI.
  */
 import type { SessionRecord } from '../types.ts';
+import type { WorkflowEvent, WorkflowRun, StepResult } from '../workflow.ts';
 
 export interface SessionView extends SessionRecord {
   status?: 'running' | 'dead';
@@ -53,6 +54,57 @@ export function renderSessionList(views: SessionView[]): string {
   return views.map(renderSessionLine).join('\n');
 }
 
+/** One human line per workflow step result. */
+function renderStepResultLine(r: StepResult): string {
+  const mark = r.ok ? 'ok' : 'FAIL';
+  const flag = r.unverified ? ' UNVERIFIED' : '';
+  const wt = r.worktree ? ` worktree=${r.worktree}` : '';
+  return `  [${mark}] ${r.id} (${r.provider}) state=${r.state} commitsAhead=${r.commitsAhead}${flag}  session=${r.sessionId}${wt}`;
+}
+
+/** Render a streamed workflow event as a human progress line (trailing newline). */
+export function renderWorkflowEvent(e: WorkflowEvent): string {
+  switch (e.type) {
+    case 'run-start':
+      return `> run ${e.runId} '${e.name}' (${e.steps} step${e.steps === 1 ? '' : 's'})\n`;
+    case 'step-start':
+      return `  - ${e.stepId} [${e.provider}] running...\n`;
+    case 'step-done':
+      return `${renderStepResultLine(e.result)}\n`;
+    case 'step-warn':
+      return `  ! warning: ${e.message}\n`;
+    case 'step-error':
+      return `  ! ${e.stepId} error: ${e.error}\n`;
+    case 'run-done':
+      return `= run ${e.runId} ${e.status}\n`;
+  }
+}
+
+/** Multi-line detail of a persisted run (for `agi workflow status`). */
+export function renderRunDetail(run: WorkflowRun): string {
+  const head = [
+    `id:         ${run.id}`,
+    `name:       ${run.name}`,
+    `status:     ${run.status}`,
+    `startedAt:  ${run.startedAt}`,
+    run.finishedAt ? `finishedAt: ${run.finishedAt}` : null,
+    `steps:      ${run.steps.length}`,
+  ].filter((l): l is string => l !== null);
+  const steps = run.steps.map(renderStepResultLine);
+  return [...head, ...steps].join('\n');
+}
+
+/** One line per run for `agi workflow list`. */
+export function renderRunList(runs: WorkflowRun[]): string {
+  if (runs.length === 0) return '(no runs)';
+  return runs
+    .map((r) => {
+      const okCount = r.steps.filter((s) => s.ok).length;
+      return `${r.id}  ${r.status.padEnd(7)} ${r.name}  steps=${okCount}/${r.steps.length}  ${r.startedAt}`;
+    })
+    .join('\n');
+}
+
 export const HELP_TEXT = `agi — orc multi-agent orchestration CLI
 
 Usage:
@@ -66,6 +118,7 @@ Usage:
   agi attach <id|name> [--read-only]                  Print the tmux attach command
   agi kill   <id|name> [--worktree] [--purge]         Kill session (mark dead; --purge removes record)
   agi prune  [--worktree]                             Drop all dead records (+ optional worktrees)
+  agi workflow <run|list|status> ...                  Run/inspect multi-step workflows (alias: wf)
   agi help                                            This help
 
 spawn options:
@@ -84,6 +137,18 @@ spawn options:
 wait options:
   --for <S>             done | waiting | failed | settled (default: settled = any of the three)
   --timeout <sec>       give up after SEC seconds (default 600); returns the last observed state
+
+workflow subcommands:
+  agi workflow run <file> [--json]    Import the file's default-exported WorkflowDef and run it,
+                                      streaming step events (or --json the final WorkflowRun).
+                                      Exits non-zero if the run failed.
+  agi workflow list [--json]          List persisted runs from ~/.orc/runs/ (newest first)
+  agi workflow status <runId> [--json]  Print a run record (per-step state)
+
+A workflow file default-exports a PLAIN object { name, steps[] } — no import required
+(runWorkflow validates the shape). A step succeeds by an explicit \`done\` predicate over a
+HARD signal (a commit, a file); a worktree step defaults to state==='done' && commitsAhead>=1.
+A non-worktree step with no predicate is reported \`unverified\` — a yield is NOT success.
 
 Global:
   --json                machine-readable output; non-zero exit + {error} on failure
