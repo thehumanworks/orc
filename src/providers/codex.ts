@@ -10,11 +10,14 @@ import type { SessionRecord } from '../types.ts';
 
 /**
  * codex's bottom status line: a model token, then ' · ' (U+00B7 with surrounding
- * spaces), then an absolute path (the cwd, possibly with a truncating '…'). Present
- * only when the composer is live; absent from the trust dialog and update interstitial.
- * Example: `gpt-5.5 high · /private/var/folders/.../repo`
+ * spaces), then the cwd path (possibly with a truncating '…', and possibly followed
+ * by ' · <branch>'). Present only when the composer is live; absent from the trust
+ * dialog and update interstitial. The path is ABSOLUTE for dirs outside $HOME
+ * (`gpt-5.5 high · /private/var/.../repo`) but HOME-RELATIVE with a leading '~' for
+ * dirs under $HOME (`gpt-5.5 xhigh · ~/projects/orc · Main [default]`), so accept
+ * either '/' or '~' after the dot (verified live, codex-cli 0.138.0).
  */
-const STATUS_LINE_RE = /\S[ \t]·[ \t]\//;
+const STATUS_LINE_RE = /\S[ \t]·[ \t][~/]/;
 
 export class CodexAdapter implements ProviderAdapter {
   readonly name = 'codex' as const;
