@@ -196,15 +196,17 @@ agi state "$ID" --json                       # {"id","state"} — point-in-time,
 
 A **workflow** sequences multiple agent steps reliably — the layer above `agent()` that runs, say,
 `implement → review`. A workflow is a plain TypeScript file you commit (versioned under
-`orc.workflows/`); the core runner executes it in the **foreground** and persists a run record to
-`~/.orc/runs/<runId>.json` after every step transition, so a crash leaves an inspectable record.
-(`--detach` background runs and a `logs` reader are a separate later feature; the run record already
-carries enough per-step state for a status reader.)
+`orc.workflows/`); the core runner executes it and persists a run record to
+`~/.orc/runs/<runId>.json` after every step transition, so a crash leaves an inspectable record. A
+run can be **foreground** or **backgrounded** (`--detach`), is **reconcilable** (a crashed runner is
+detected, not stuck `running`), and is **inspectable** per step (`agi workflow logs`).
 
 ```sh
-agi workflow run <file> [--json]      # import the file's default-exported WorkflowDef and run it
-agi workflow list [--json]            # list persisted runs from ~/.orc/runs/ (newest first)
-agi workflow status <runId> [--json]  # print a run record (per-step state)
+agi workflow run <file> [--detach] [--json]       # run a WorkflowDef; --detach backgrounds it
+agi workflow list [--json]                         # list persisted runs from ~/.orc/runs/ (newest first)
+agi workflow status <runId> [--json]               # print a run record (per-step state)
+agi workflow attach <runId> [--read-only]          # print the tmux attach command for a --detach runner
+agi workflow logs <runId> [--step <id>] [--raw]    # per-step transcript of the work each agent did
 ```
 
 `agi workflow run` streams step events to stdout (`--json` prints only the final `WorkflowRun`) and
@@ -213,6 +215,43 @@ writes a token to a file and codex reads it back:
 
 ```sh
 agi workflow run orc.workflows/example.ts --json
+```
+
+### Backgrounding — `--detach`, attach, reconcile
+
+`--detach` runs the workflow as a **detached, reattachable tmux session** named `orc-wf-<runId>`
+(consistent with how orc runs agents — it reuses the `Driver`, it does **not** nohup a bare process).
+The runId is minted up front and an initial `running` record is written before the command returns,
+so `agi workflow run --detach` prints the `runId` (or `{runId, runnerTmux}` with `--json`) and exits
+**0 immediately** — the detached runner owns the record from there and persists it incrementally just
+like a foreground run. Steps run with the **same cwd** as your `agi` invocation, so a `--detach` run
+behaves identically to foreground.
+
+```sh
+RUN=$(agi workflow run orc.workflows/example.ts --detach --json | bun -e 'console.log(JSON.parse(await Bun.stdin.text()).runId)')
+eval "$(agi workflow attach "$RUN")"     # reattach to watch the orchestration live
+agi workflow status "$RUN" --json        # poll until status reaches done|failed|orphaned
+```
+
+**Liveness reconcile.** `status` (and `list`) never trust a stale `running`: if a record still says
+`running` but its `runnerTmux` session is no longer alive, the runner died mid-run and the run is
+reported **`orphaned`** (the new fifth status). This is a read-time reconcile — the verdict is
+persisted once observed so it sticks. A record the runner itself finalized (`done`/`failed`) is
+trusted as-is. (Internally, `--detach` launches `agi workflow run <file> --run-id <runId>` in the
+foreground inside the tmux session; that `--run-id` entrypoint is how both sides agree on the record.)
+
+### Inspecting the work — `agi workflow logs`
+
+Workflow steps leave their sessions **alive** (the v1 choice), so you can read exactly what each
+step's agent did. `agi workflow logs <runId>` prints every step's **token-efficient parsed
+transcript** (the same view as `agi read`), labeled `### step <id> (<provider>)`; `--step <id>`
+narrows to one step, `--raw` shows the live pane capture instead, and `--json` emits
+`{ step, turns }[]` (or `{ step, provider, pane }[]` with `--raw`).
+
+```sh
+agi workflow logs "$RUN"               # all steps, parsed
+agi workflow logs "$RUN" --step b      # just step b — e.g. to see codex echo step a's handoff token
+agi workflow logs "$RUN" --step b --raw
 ```
 
 ### Defining a workflow
@@ -269,8 +308,8 @@ asks a clarifying question and stops is pane-indistinguishable from one that fin
 Step instructions are delivered reliably: a `taskFile` or a large inline `prompt` (>~1KB) is written to
 a file under `~/.orc/runs/<runId>/` (outside any worktree, so the agent can't commit it) and the agent
 gets a short "read this file" pointer — working around the `send()` large-paste bug. **Sessions are left
-alive** after a workflow finishes (v1 choice) so you can `agi attach`/`agi read` them and a future
-`logs` command can read their transcripts; tear them down with `agi kill` when done.
+alive** after a workflow finishes (v1 choice) so you can `agi attach`/`agi read` them and
+`agi workflow logs` can read their transcripts; tear them down with `agi kill` when done.
 
 ## Workspaces
 
