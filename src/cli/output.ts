@@ -118,7 +118,7 @@ Usage:
   agi attach <id|name> [--read-only]                  Print the tmux attach command
   agi kill   <id|name> [--worktree] [--purge]         Kill session (mark dead; --purge removes record)
   agi prune  [--worktree]                             Drop all dead records (+ optional worktrees)
-  agi workflow <run|list|status> ...                  Run/inspect multi-step workflows (alias: wf)
+  agi workflow <run|list|status|attach|logs> ...      Run/inspect multi-step workflows (alias: wf)
   agi help                                            This help
 
 spawn options:
@@ -139,16 +139,24 @@ wait options:
   --timeout <sec>       give up after SEC seconds (default 600); returns the last observed state
 
 workflow subcommands:
-  agi workflow run <file> [--json]    Import the file's default-exported WorkflowDef and run it,
-                                      streaming step events (or --json the final WorkflowRun).
-                                      Exits non-zero if the run failed.
+  agi workflow run <file> [--detach] [--json]   Import the file's default-exported WorkflowDef and
+                                      run it, streaming step events (or --json the final WorkflowRun).
+                                      Exits non-zero if the run failed. --detach runs it as a
+                                      detached tmux session (orc-wf-<runId>) and returns the runId
+                                      immediately (--json: {runId,runnerTmux}).
   agi workflow list [--json]          List persisted runs from ~/.orc/runs/ (newest first)
-  agi workflow status <runId> [--json]  Print a run record (per-step state)
+  agi workflow status <runId> [--json]  Print a run record (per-step state). A \`running\` record
+                                      whose runner session has died is reported \`orphaned\`.
+  agi workflow attach <runId> [--read-only]  Print the tmux attach command for a --detach run's runner
+  agi workflow logs <runId> [--step <id>] [--raw] [--json]  Per-step transcript ('### step <id>
+                                      (<provider>)'). --raw shows the live pane; --json emits
+                                      {step,turns}[] (or {step,provider,pane}[] with --raw).
 
 A workflow file default-exports a PLAIN object { name, steps[] } — no import required
 (runWorkflow validates the shape). A step succeeds by an explicit \`done\` predicate over a
 HARD signal (a commit, a file); a worktree step defaults to state==='done' && commitsAhead>=1.
 A non-worktree step with no predicate is reported \`unverified\` — a yield is NOT success.
+Run status: running | done | failed | orphaned (a --detach runner that died mid-run).
 
 Global:
   --json                machine-readable output; non-zero exit + {error} on failure

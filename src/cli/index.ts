@@ -4,14 +4,23 @@
  * remainder with that command's own options map (parseArgs is strict on unknowns).
  */
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
 import type { ParseArgsConfig } from 'node:util';
 import { agent } from '../agent.ts';
 import { listSessions, getSession, pruneSessions } from '../index.ts';
 import { renderTurns } from '../transcript.ts';
-import { runWorkflow } from '../workflow.ts';
-import type { WorkflowDef, WorkflowEvent, WorkflowRun } from '../workflow.ts';
-import { readRun, listRuns } from '../runs.ts';
+import {
+  runWorkflow,
+  runnerTmuxName,
+  reconcileRun,
+  assembleStepLogs,
+  validateWorkflowDef,
+} from '../workflow.ts';
+import type { WorkflowDef, WorkflowEvent, WorkflowRun, StepResult } from '../workflow.ts';
+import { readRun, listRuns, writeRun } from '../runs.ts';
+import { getDriver } from '../drivers/driver.ts';
+import { orcHome } from '../paths.ts';
 import type { AgentOptions, AgentState, Provider, SystemPromptMode } from '../types.ts';
 import {
   printJson,
@@ -502,27 +511,36 @@ async function cmdWorkflow(args: string[]): Promise<number> {
       return cmdWorkflowList(rest);
     case 'status':
       return cmdWorkflowStatus(rest);
+    case 'attach':
+      return cmdWorkflowAttach(rest);
+    case 'logs':
+      return cmdWorkflowLogs(rest);
     default:
-      printError(`unknown workflow subcommand '${sub ?? ''}' (run|list|status)`, false);
+      printError(`unknown workflow subcommand '${sub ?? ''}' (run|list|status|attach|logs)`, false);
       return 1;
   }
 }
 
 async function cmdWorkflowRun(args: string[]): Promise<number> {
-  const { values, positionals } = parse(args, { json: { type: 'boolean' } });
+  const { values, positionals } = parse(args, {
+    json: { type: 'boolean' },
+    detach: { type: 'boolean' },
+    'run-id': { type: 'string' },
+  });
   const json = jsonFlag(values);
   const file = positionals[0];
   if (!file) {
     printError('workflow run requires <file> (a TS module default-exporting a WorkflowDef)', json);
     return 1;
   }
+  const absFile = path.resolve(file);
 
   // Dynamically import the file. A WorkflowDef is a PLAIN object default-export — the
   // file needs no import to work; runWorkflow VALIDATES the shape. (`defineWorkflow` is
   // an optional typing helper an author may import via a relative path.)
   let def: WorkflowDef;
   try {
-    const mod = (await import(path.resolve(file))) as { default?: WorkflowDef };
+    const mod = (await import(absFile)) as { default?: WorkflowDef };
     if (!mod.default) {
       printError(`workflow file '${file}' has no default export`, json);
       return 1;
@@ -533,10 +551,19 @@ async function cmdWorkflowRun(args: string[]): Promise<number> {
     return 1;
   }
 
+  if (values.detach === true) {
+    return cmdWorkflowRunDetached(absFile, def, json);
+  }
+
   let run: WorkflowRun;
   try {
     // Stream step events to stdout in human mode; --json prints only the final record.
+    // `--run-id` is the entrypoint a detached runner executes: reuse the id minted by
+    // `--detach` and re-thread runnerTmux (the runner re-persists the record from scratch).
+    const runId = values['run-id'] as string | undefined;
     run = await runWorkflow(def, {
+      runId,
+      runnerTmux: runId ? runnerTmuxName(runId) : undefined,
       onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
     });
   } catch (e) {
@@ -549,12 +576,75 @@ async function cmdWorkflowRun(args: string[]): Promise<number> {
   return run.status === 'done' ? 0 : 1;
 }
 
+/**
+ * `--detach`: run the workflow as a detached, reattachable tmux session — consistent with
+ * how orc runs agents (reuse the Driver; never nohup a bare process). Mint the runId up
+ * front, write an initial `running` record (so `status` resolves immediately), spawn a
+ * session `orc-wf-<runId>` whose argv runs the workflow in the FOREGROUND inside it
+ * (`<bun> <cli> workflow run <absFile> --run-id <runId>`), then print and exit 0. The
+ * detached runner owns the record from there. cwd is THIS invocation's cwd so steps that
+ * share cwd behave identically to a foreground run.
+ */
+async function cmdWorkflowRunDetached(
+  absFile: string,
+  def: WorkflowDef,
+  json: boolean,
+): Promise<number> {
+  // The parent doesn't call runWorkflow, so validate the def here — a malformed workflow
+  // must fail cleanly now, not spawn a doomed runner and hand back a self-orphaning runId.
+  try {
+    validateWorkflowDef(def);
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
+
+  const runId = randomUUID().slice(0, 8);
+  const runnerTmux = runnerTmuxName(runId);
+
+  const run: WorkflowRun = {
+    id: runId,
+    name: def.name,
+    startedAt: new Date().toISOString(),
+    status: 'running',
+    runnerTmux,
+    steps: [],
+  };
+  await writeRun(run);
+
+  // process.execPath = the exact bun binary running us → no reliance on the tmux server's
+  // PATH resolving `bun`. Thread ORC_HOME so the runner persists to the same runs dir
+  // (a new tmux session inherits the server env, not ours).
+  const argv = [process.execPath, import.meta.path, 'workflow', 'run', absFile, '--run-id', runId];
+  try {
+    await getDriver().spawn({
+      name: runnerTmux,
+      cwd: process.cwd(),
+      argv,
+      env: { ORC_HOME: orcHome() },
+    });
+  } catch (e) {
+    // Spawn failed → finalize the record we wrote so it doesn't linger as a phantom run.
+    run.status = 'failed';
+    run.finishedAt = new Date().toISOString();
+    await writeRun(run).catch(() => {});
+    printError(`failed to launch detached runner: ${(e as Error).message}`, json);
+    return 1;
+  }
+
+  if (json) printJson({ runId, runnerTmux });
+  else process.stdout.write(`${runId}\n`);
+  return 0;
+}
+
 async function cmdWorkflowList(args: string[]): Promise<number> {
   const { values } = parse(args, { json: { type: 'boolean' } });
   const json = jsonFlag(values);
   const runs = await listRuns();
-  if (json) printJson(runs);
-  else process.stdout.write(`${renderRunList(runs)}\n`);
+  // Reconcile each stale `running` against its runner's liveness (persists the verdict).
+  const reconciled = await Promise.all(runs.map((r) => reconcileRun(r)));
+  if (json) printJson(reconciled);
+  else process.stdout.write(`${renderRunList(reconciled)}\n`);
   return 0;
 }
 
@@ -571,9 +661,120 @@ async function cmdWorkflowStatus(args: string[]): Promise<number> {
     printError(`no run found for '${runId}'`, json);
     return 1;
   }
+  // Don't trust a stale `running`: if the runner session is gone, report `orphaned`.
+  await reconcileRun(run);
   if (json) printJson(run);
   else process.stdout.write(`${renderRunDetail(run)}\n`);
   return 0;
+}
+
+async function cmdWorkflowAttach(args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, {
+    'read-only': { type: 'boolean' },
+    json: { type: 'boolean' },
+  });
+  const json = jsonFlag(values);
+  const runId = positionals[0];
+  if (!runId) {
+    printError('workflow attach requires <runId>', json);
+    return 1;
+  }
+  const run = await readRun(runId);
+  if (!run) {
+    printError(`no run found for '${runId}'`, json);
+    return 1;
+  }
+  if (!run.runnerTmux) {
+    printError(`run '${runId}' has no runner session to attach (it was not run with --detach)`, json);
+    return 1;
+  }
+  const cmd = getDriver().attachCommand(run.runnerTmux, { readOnly: values['read-only'] === true });
+  if (json) printJson({ runId, command: cmd });
+  else process.stdout.write(`${cmd}\n`);
+  return 0;
+}
+
+/**
+ * `agi workflow logs <runId> [--step <id>] [--raw]` — read the actual work each step's
+ * agent did. Default: the token-efficient parsed transcript per step (the same view as
+ * `agi read`), labeled `### step <id> (<provider>)`. `--raw` shows the live pane capture
+ * instead. `--json` emits `{ step, turns }[]` (parsed) or `{ step, provider, pane }[]` (raw).
+ */
+async function cmdWorkflowLogs(args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, {
+    step: { type: 'string' },
+    raw: { type: 'boolean' },
+    json: { type: 'boolean' },
+  });
+  const json = jsonFlag(values);
+  const runId = positionals[0];
+  if (!runId) {
+    printError('workflow logs requires <runId>', json);
+    return 1;
+  }
+  const run = await readRun(runId);
+  if (!run) {
+    printError(`no run found for '${runId}'`, json);
+    return 1;
+  }
+  const stepId = values.step as string | undefined;
+
+  // Select the step(s) to read; an unknown --step is a clear error.
+  let selected: StepResult[] = run.steps;
+  if (stepId !== undefined) {
+    selected = run.steps.filter((s) => s.id === stepId);
+    if (selected.length === 0) {
+      const have = run.steps.map((s) => s.id).join(', ') || 'none';
+      printError(`run '${runId}' has no step '${stepId}' (steps: ${have})`, json);
+      return 1;
+    }
+  }
+
+  try {
+    if (values.raw === true) {
+      // Raw: the live tmux pane (with scrollback) of each step's still-alive session.
+      const panes: { step: string; provider: StepResult['provider']; pane: string }[] = [];
+      for (const s of selected) {
+        let pane = '';
+        if (s.sessionId) {
+          const session = await getSession(s.sessionId);
+          if (session) pane = await session.capture({ scrollback: true }).catch(() => '');
+        }
+        panes.push({ step: s.id, provider: s.provider, pane });
+      }
+      if (json) {
+        printJson(panes);
+      } else {
+        process.stdout.write(
+          `${panes
+            .map((p) => `### step ${p.step} (${p.provider})\n${p.pane.trimEnd() || '(no pane — session gone)'}`)
+            .join('\n\n')}\n`,
+        );
+      }
+      return 0;
+    }
+
+    // Default: each step's parsed transcript, read from the provider's on-disk JSONL.
+    const logs = await assembleStepLogs(selected, async (s) => {
+      if (!s.sessionId) return [];
+      const session = await getSession(s.sessionId);
+      if (!session) return [];
+      return session.readParsed().catch(() => []);
+    });
+    if (json) {
+      printJson(logs.map((l) => ({ step: l.step, turns: l.turns })));
+    } else {
+      process.stdout.write(
+        `${logs
+          .map((l) => `### step ${l.step} (${l.provider})\n${renderTurns(l.turns) || '(no transcript on disk yet)'}`)
+          .join('\n\n')}\n`,
+      );
+    }
+    return 0;
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
 }
 
 /** Map a raw subcommand (with aliases) to a canonical name. */

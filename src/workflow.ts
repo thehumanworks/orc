@@ -21,6 +21,9 @@ import { Session } from './session.ts';
 import { commitCountVsMain } from './worktree.ts';
 import { writeRun } from './runs.ts';
 import { runInstructionsDir } from './paths.ts';
+import { getDriver } from './drivers/driver.ts';
+import type { Driver } from './drivers/driver.ts';
+import type { Turn } from './transcript.ts';
 import type { AgentState, Provider } from './types.ts';
 
 const VALID_PROVIDERS: Provider[] = ['claude', 'codex', 'pi'];
@@ -81,7 +84,19 @@ export interface WorkflowRun {
   name: string;
   startedAt: string;
   finishedAt?: string;
-  status: 'running' | 'done' | 'failed';
+  /**
+   * Lifecycle. `running`/`done`/`failed` are written by the runner itself. `orphaned` is
+   * NEVER written by the runner — it's a read-time reconcile verdict (see
+   * `reconcileRunStatus`): a record still says `running` but its `runnerTmux` session is
+   * gone, so the runner died mid-run.
+   */
+  status: 'running' | 'done' | 'failed' | 'orphaned';
+  /**
+   * Name of the detached tmux session that owns this run (`orc-wf-<runId>`), when the run
+   * was launched with `--detach`. Used by status/list liveness reconcile and by
+   * `agi workflow attach`. Absent for a plain foreground run (nothing to reattach/reconcile).
+   */
+  runnerTmux?: string;
   steps: StepResult[];
 }
 
@@ -109,6 +124,19 @@ export interface RunWorkflowOptions {
    * `${...}` interpolation, status transitions) is exercisable without live agents.
    */
   execStep?: StepExecutor;
+  /**
+   * Use this runId INSTEAD of generating one. The entrypoint a detached runner executes
+   * (`agi workflow run <file> --run-id <id>`) passes the id minted by `--detach` so both
+   * sides agree on the record path.
+   */
+  runId?: string;
+  /**
+   * The detached runner's own tmux session name (`orc-wf-<runId>`), threaded onto the
+   * persisted record so status/list liveness reconcile can find the session. The runner
+   * re-persists the record from scratch on run-start, so it must re-supply this or the
+   * field the `--detach` parent wrote would be wiped.
+   */
+  runnerTmux?: string;
 }
 
 /**
@@ -314,12 +342,13 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
     }
   };
 
-  const runId = randomUUID().slice(0, 8);
+  const runId = opts.runId ?? randomUUID().slice(0, 8);
   const run: WorkflowRun = {
     id: runId,
     name: def.name,
     startedAt: new Date().toISOString(),
     status: 'running',
+    ...(opts.runnerTmux ? { runnerTmux: opts.runnerTmux } : {}),
     steps: [],
   };
   await writeRun(run);
@@ -378,4 +407,82 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
   await writeRun(run);
   emit({ type: 'run-done', runId, status: run.status, run });
   return run;
+}
+
+/** The tmux session name that owns a detached workflow run: `orc-wf-<runId>`. */
+export function runnerTmuxName(runId: string): string {
+  return `orc-wf-${runId}`;
+}
+
+/**
+ * Reconcile a persisted run status against its runner's liveness — the PURE decision
+ * behind `agi workflow status`/`list`. A finalized status (`done`/`failed`/`orphaned`)
+ * is TRUSTED as-is (the runner, or a prior reconcile, wrote it deliberately). Only a
+ * `running` record is suspect: if its runner session is provably NOT alive the runner
+ * died mid-run, so the effective status is `orphaned`. `runnerAlive === null` means
+ * liveness is unknowable (no `runnerTmux` — e.g. a plain foreground run), so `running`
+ * is trusted rather than guessed.
+ */
+export function reconcileRunStatus(
+  recordStatus: WorkflowRun['status'],
+  runnerAlive: boolean | null,
+): WorkflowRun['status'] {
+  if (recordStatus !== 'running') return recordStatus;
+  if (runnerAlive === false) return 'orphaned';
+  return 'running';
+}
+
+/**
+ * Apply `reconcileRunStatus` to a run record using a real driver, and PERSIST the
+ * transition once observed so it sticks (a crashed runner isn't re-probed forever).
+ * Mutates and returns `run`. No-op unless the record is a stale `running`.
+ *
+ * INVARIANT this relies on: a detached runner's tmux session dies STRICTLY AFTER its
+ * final `done`/`failed` write (the write happens inside the bun process; the session
+ * ends only when bun exits). So a not-alive session under a `running` record is always a
+ * genuine crash, never a clean finish mid-flight — do not add `remain-on-exit` or any
+ * post-`runWorkflow` work to the runner, which would break this and yield false orphans.
+ */
+export async function reconcileRun(run: WorkflowRun, driver: Driver = getDriver()): Promise<WorkflowRun> {
+  if (run.status !== 'running') return run;
+  const alive = run.runnerTmux ? await driver.isAlive(run.runnerTmux) : null;
+  const effective = reconcileRunStatus(run.status, alive);
+  if (effective === run.status) return run;
+  run.status = effective;
+  run.finishedAt = run.finishedAt ?? new Date().toISOString();
+  await writeRun(run);
+  return run;
+}
+
+/** A single step's transcript, for `agi workflow logs`. */
+export interface StepLog {
+  step: string;
+  provider: Provider;
+  turns: Turn[];
+}
+
+/**
+ * Assemble per-step transcripts for `agi workflow logs`. PURE orchestration over an
+ * injected `readTurns` reader (so it's unit-testable with a fake run record + fake reader
+ * — no live session required). With `stepId`, returns just that one step and throws a
+ * clear error if the run has no such step.
+ */
+export async function assembleStepLogs(
+  steps: StepResult[],
+  readTurns: (step: StepResult) => Promise<Turn[]>,
+  stepId?: string,
+): Promise<StepLog[]> {
+  let selected = steps;
+  if (stepId !== undefined) {
+    selected = steps.filter((s) => s.id === stepId);
+    if (selected.length === 0) {
+      const have = steps.map((s) => s.id).join(', ') || 'none';
+      throw new Error(`run has no step '${stepId}' (steps: ${have})`);
+    }
+  }
+  const logs: StepLog[] = [];
+  for (const s of selected) {
+    logs.push({ step: s.id, provider: s.provider, turns: await readTurns(s) });
+  }
+  return logs;
 }

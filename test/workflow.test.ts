@@ -9,6 +9,9 @@ import {
   evaluateStep,
   runWorkflow,
   deliverInstructions,
+  runnerTmuxName,
+  reconcileRunStatus,
+  assembleStepLogs,
 } from '../src/workflow.ts';
 import type {
   WorkflowDef,
@@ -17,6 +20,7 @@ import type {
   StepExecutor,
   WorkflowEvent,
 } from '../src/workflow.ts';
+import type { Turn } from '../src/transcript.ts';
 import type { Session } from '../src/session.ts';
 import { readRun, listRuns } from '../src/runs.ts';
 import { runInstructionsDir } from '../src/paths.ts';
@@ -348,5 +352,81 @@ describe('runWorkflow with a fake executor', () => {
     expect(calls.map((c) => c.id)).toEqual(['a']); // stopped after the throw
     expect(run.status).toBe('failed');
     expect(run.steps[0]!.state).toBe('failed');
+  });
+
+  test('opts.runId/runnerTmux are honored and persisted (the --detach entrypoint)', async () => {
+    const def: WorkflowDef = { name: 'detached', steps: [step({ id: 'a' })] };
+    const run = await runWorkflow(def, {
+      execStep: fakeExec({}, []),
+      runId: 'deadbeef',
+      runnerTmux: 'orc-wf-deadbeef',
+    });
+    expect(run.id).toBe('deadbeef'); // used INSTEAD of a generated one
+    expect(run.runnerTmux).toBe('orc-wf-deadbeef');
+    const onDisk = await readRun('deadbeef');
+    expect(onDisk!.runnerTmux).toBe('orc-wf-deadbeef'); // survives the runner's re-persist
+    expect(onDisk!.status).toBe('done');
+  });
+});
+
+describe('runnerTmuxName', () => {
+  test('builds the orc-wf-<runId> session name', () => {
+    expect(runnerTmuxName('deadbeef')).toBe('orc-wf-deadbeef');
+  });
+});
+
+describe('reconcileRunStatus — stale running vs runner liveness', () => {
+  test('a running record whose runner is dead is orphaned', () => {
+    expect(reconcileRunStatus('running', false)).toBe('orphaned');
+  });
+  test('a running record whose runner is alive stays running', () => {
+    expect(reconcileRunStatus('running', true)).toBe('running');
+  });
+  test('a running record with unknowable liveness (no runnerTmux) is trusted as running', () => {
+    expect(reconcileRunStatus('running', null)).toBe('running');
+  });
+  test('a finalized status is trusted regardless of liveness', () => {
+    // even if the (now-gone) runner reads not-alive, done/failed/orphaned are deliberate.
+    expect(reconcileRunStatus('done', false)).toBe('done');
+    expect(reconcileRunStatus('failed', false)).toBe('failed');
+    expect(reconcileRunStatus('failed', null)).toBe('failed');
+    expect(reconcileRunStatus('orphaned', true)).toBe('orphaned');
+  });
+});
+
+describe('assembleStepLogs — per-step transcript assembly', () => {
+  const steps: StepResult[] = [
+    { id: 'a', sessionId: 'sid-a', provider: 'claude', state: 'done', ok: true, commitsAhead: 0 },
+    { id: 'b', sessionId: 'sid-b', provider: 'codex', state: 'done', ok: true, commitsAhead: 0 },
+  ];
+  // Fake transcript reader: returns a single assistant turn naming the step's session.
+  const reader = async (s: StepResult): Promise<Turn[]> => [
+    { role: 'assistant', text: `transcript of ${s.sessionId}` },
+  ];
+
+  test('assembles a log per step (label data + injected turns), in order', async () => {
+    const logs = await assembleStepLogs(steps, reader);
+    expect(logs).toEqual([
+      { step: 'a', provider: 'claude', turns: [{ role: 'assistant', text: 'transcript of sid-a' }] },
+      { step: 'b', provider: 'codex', turns: [{ role: 'assistant', text: 'transcript of sid-b' }] },
+    ]);
+  });
+
+  test('--step narrows to one step', async () => {
+    const logs = await assembleStepLogs(steps, reader, 'b');
+    expect(logs.map((l) => l.step)).toEqual(['b']);
+    expect(logs[0]!.provider).toBe('codex');
+  });
+
+  test('an unknown --step throws a clear error listing the steps', async () => {
+    await expect(assembleStepLogs(steps, reader, 'zzz')).rejects.toThrow(
+      /no step 'zzz' \(steps: a, b\)/,
+    );
+  });
+
+  test('the reader is used verbatim (e.g. empty turns for a step with no transcript)', async () => {
+    const empty = async (): Promise<Turn[]> => [];
+    const logs = await assembleStepLogs(steps, empty, 'a');
+    expect(logs[0]!.turns).toEqual([]);
   });
 });

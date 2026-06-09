@@ -22,6 +22,10 @@ export {
   validateWorkflowDef,
   interpolate,
   evaluateStep,
+  runnerTmuxName,
+  reconcileRunStatus,
+  reconcileRun,
+  assembleStepLogs,
 } from './workflow.ts';
 export type {
   WorkflowStep,
@@ -29,6 +33,7 @@ export type {
   WorkflowRun,
   StepResult,
   StepDoneCtx,
+  StepLog,
   WorkflowEvent,
   RunWorkflowOptions,
   StepExecutor,
