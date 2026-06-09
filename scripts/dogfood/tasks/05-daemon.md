@@ -32,12 +32,20 @@ GET  /workflows/runs/:id/logs?step=                       → per-step parsed tr
   `tailscale ip -4`, subprocess), NEVER `0.0.0.0`. `--bind` may override for local testing
   (`127.0.0.1`). Refuse to start bound to a non-loopback, non-tailscale address unless `--insecure`.
 
-### 2. Trust gate (all endpoints except `/health`)
+### 2. Trust gate (all endpoints except `/health`) — MUST FAIL CLOSED
 Identity from tailscale: resolve the request's source IP via `tailscale whois <ip>` (subprocess) to a
-tailnet node; allow only if the node/host is in the peer allowlist `~/.orc/peers.json`. On failure →
-`403`. If `tailscale whois` is unavailable, fall back to a shared-secret header
-(`x-orc-secret`, value from `ORC_DAEMON_SECRET`) and document that whois is preferred. Keep the gate a
-PURE function `(identity, allowlist) → allow/deny` so it is unit-testable.
+tailnet node; the node/host must be in the peer allowlist `~/.orc/peers.json`. A shared-secret header
+(`x-orc-secret` matching `ORC_DAEMON_SECRET`) is an explicit fallback for when whois is unavailable;
+whois is preferred.
+
+**FAIL CLOSED — non-negotiable.** A request is allowed ONLY IF
+`(whois resolves the source IP to an ALLOWLISTED node)` OR `(a valid x-orc-secret is presented)`.
+In EVERY other case respond `403` — including, explicitly, when `tailscale whois` is unavailable AND
+no secret is configured (do NOT degrade to "allow" because no auth mechanism is available). Unknown or
+unresolvable identity is DENY, never allow. Keep the decision a PURE function
+`(identity|null, allowlist, presentedSecret|null, configuredSecret|null) → boolean` and unit-test the
+deny cases EXHAUSTIVELY: whois-unavailable + no secret → deny; whois resolves a non-allowlisted node →
+deny; no identity + wrong/absent secret → deny; allowlisted node → allow; valid secret → allow.
 
 ### 3. Client mode — `agi --host <host> <command>`
 When `--host <h>` is present, the existing CLI commands (`list`, `spawn`, `send`, `read`, `wait`,
@@ -56,6 +64,11 @@ When `--host <h>` is present, the existing CLI commands (`list`, `spawn`, `send`
 
 ## Verification — REQUIRED, real (no mocks); gates done
 Bind to `127.0.0.1` (loopback stands in for the tailscale IP locally). Throwaway `ORC_HOME`.
+0. **Bind refusal (the layer-1 safety boundary — locally verifiable, do NOT skip):** assert
+   `agi daemon --bind 0.0.0.0 --port <p>` REFUSES to start (non-zero exit, clear error) WITHOUT
+   `--insecure`, and that `--bind 127.0.0.1` (loopback) is allowed. Binding to the tailscale IP is the
+   real security primitive (WireGuard won't route `100.x` from off-tailnet); a stray public bind must
+   be impossible by default.
 1. Start `agi daemon --bind 127.0.0.1 --port <p>` (background it). `GET /health` returns ok.
 2. Drive a REAL agent THROUGH the API end to end: `agi --host 127.0.0.1:<p> spawn -p claude --prompt
    "use your Bash tool to run: echo REMOTE_OK then say done"`, then `agi --host … wait <id>`,
@@ -63,9 +76,19 @@ Bind to `127.0.0.1` (loopback stands in for the tailscale IP locally). Throwaway
    remote-driven lifecycle must match a local one.
 3. Run a workflow through the API (`agi --host … workflow run <abs>/orc.workflows/example.ts`) and read
    its run via `/workflows/runs/:id`.
-4. Trust gate: a request with no/!allowlisted identity (and no secret) → `403`; with the secret → ok.
+4. Trust gate (fail-closed): a request with no allowlisted identity AND no secret → `403`; with a
+   WRONG secret → `403`; with the correct `x-orc-secret` → ok. (On loopback, `tailscale whois` cannot
+   resolve `127.0.0.1`, so this exercises the SECRET path + the deny path.)
 5. Clean up: stop the daemon, kill sessions, remove throwaway ORC_HOME, restore `~/.codex/config.toml`.
    You run inside tmux; prefix nested spawns with `TMUX= ` if needed.
+
+### Verification ceiling — REPORT HONESTLY (do not rubber-stamp)
+Loopback testing covers the plumbing, the secret-path auth, the deny/403 path, and bind-refusal — but
+the PRIMARY, recommended trust mechanism (`tailscale whois` + allowlist) gets ZERO live coverage by
+construction (whois can't resolve loopback). Your final report AND the commit message must say so
+plainly: "plumbing + secret-path + bind-refusal verified on loopback; the whois+allowlist trust path is
+NOT exercised and needs a real two-host tailnet test before being relied on." A green loopback run is
+NOT "F3 fully works." (This is acceptable to merge ONLY because the gate fails closed by design.)
 
 ## When done
 1. `bun run typecheck` and `bun test` green.
