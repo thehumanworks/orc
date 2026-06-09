@@ -13,10 +13,9 @@
  */
 import path from 'node:path';
 import { agent, getSession } from '../../src/index.ts';
-import type { Session } from '../../src/index.ts';
+import type { Session, Provider } from '../../src/index.ts';
 
 const REPO = path.resolve(import.meta.dir, '../..');
-const TASK_PATH = path.join(import.meta.dir, 'TASK.md');
 const POLL_MS = 20_000;
 const TIMEOUT_MS = 45 * 60_000;
 
@@ -38,14 +37,15 @@ async function report(s: Session): Promise<void> {
   console.log((await gitOut(wt, ['diff', '--stat', 'main'])).trimEnd());
 }
 
-async function doSpawn(): Promise<void> {
-  const task = await Bun.file(TASK_PATH).text();
-  console.log('spawning claude implementer in a worktree…');
+async function doSpawn(taskFileArg: string, provider: Provider): Promise<void> {
+  const taskPath = path.resolve(taskFileArg);
+  const task = await Bun.file(taskPath).text();
+  console.log(`spawning ${provider} implementer in a worktree for ${path.basename(taskPath)}…`);
   // Boot WITHOUT pasting the (multi-KB) task: a large prompt scrolls its first line out of
   // the composer, defeating send()'s verify-before-submit probe. Instead drop the task as a
   // file OUTSIDE the worktree (under the main repo's gitignored .orc/, so the agent can't
   // accidentally commit it) and send a SHORT pointer prompt the agent reads.
-  const s = await agent({ provider: 'claude', cwd: REPO, worktree: true });
+  const s = await agent({ provider, cwd: REPO, worktree: true });
   const taskFile = path.join(REPO, '.orc', `dogfood-task-${s.id}.md`);
   await Bun.write(taskFile, task);
   await s.send(
@@ -147,12 +147,12 @@ async function doWatch(id: string): Promise<void> {
   console.log('\nwatch timed out');
 }
 
-const [cmd, arg] = process.argv.slice(2);
-if (cmd === 'spawn') {
-  await doSpawn();
+const [cmd, arg, arg2] = process.argv.slice(2);
+if (cmd === 'spawn' && arg) {
+  await doSpawn(arg, (arg2 as Provider) ?? 'claude');
 } else if (cmd === 'watch' && arg) {
   await doWatch(arg);
 } else {
-  console.log('usage: run.ts spawn | watch <id>');
+  console.log('usage: run.ts spawn <task-file> [provider] | watch <id>');
   process.exit(1);
 }
