@@ -11,6 +11,8 @@ import type { SessionRecord } from './types.ts';
 
 export { agent, validateOptions } from './agent.ts';
 export { Session } from './session.ts';
+export { parseTranscript, renderTurns } from './transcript.ts';
+export type { Turn, TurnRole } from './transcript.ts';
 export type {
   Provider,
   AgentOptions,

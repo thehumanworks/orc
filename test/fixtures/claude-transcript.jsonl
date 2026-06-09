@@ -1,0 +1,9 @@
+{"type":"ai-title","title":"some generated title"}
+{"type":"user","isSidechain":false,"message":{"content":"hello, please help"}}
+{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"private chain of thought"},{"type":"text","text":"Sure, I'll run a command."},{"type":"tool_use","name":"Bash","input":{"command":"echo hi","description":"say hi"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"abc","content":"TOOL_RESULT_BODY_DROPME"}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Edit","input":{"file_path":"src/x.ts","old_string":"a","new_string":"b"}}]}}
+{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"subagent turn that must not leak"}]}}
+{"type":"system","content":"system bookkeeping noise"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"All done."}]}}
+{"type":"user","message":{"content":"truncated half-written final li

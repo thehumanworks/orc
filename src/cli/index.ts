@@ -7,6 +7,7 @@ import { parseArgs } from 'node:util';
 import type { ParseArgsConfig } from 'node:util';
 import { agent } from '../agent.ts';
 import { listSessions, getSession, pruneSessions } from '../index.ts';
+import { renderTurns } from '../transcript.ts';
 import type { AgentOptions, Provider, SystemPromptMode } from '../types.ts';
 import {
   printJson,
@@ -229,8 +230,7 @@ async function cmdSend(args: string[]): Promise<number> {
 
 async function cmdRead(args: string[]): Promise<number> {
   const { values, positionals } = parse(args, {
-    scrollback: { type: 'boolean' },
-    transcript: { type: 'boolean' },
+    raw: { type: 'boolean' },
     json: { type: 'boolean' },
   });
   const json = jsonFlag(values);
@@ -245,22 +245,37 @@ async function cmdRead(args: string[]): Promise<number> {
     return 1;
   }
   try {
-    if (values.transcript) {
-      const file = await session.transcript();
-      const contents = file ? await session.readTranscript() : null;
+    // --raw: the full tmux pane (with scrollback) exactly as tmux shows it. The escape
+    // hatch for when the parsed transcript isn't enough.
+    if (values.raw === true) {
+      const pane = await session.capture({ scrollback: true });
       if (json) {
-        printJson({ id: session.id, transcript: file, contents });
-      } else if (contents) {
-        process.stdout.write(contents.endsWith('\n') ? contents : `${contents}\n`);
+        printJson({ id: session.id, pane });
       } else {
-        process.stdout.write('(no transcript found yet)\n');
+        process.stdout.write(pane.endsWith('\n') ? pane : `${pane}\n`);
       }
       return 0;
     }
-    const pane = await session.capture({ scrollback: values.scrollback === true });
+
+    // Default: the token-efficient parsed transcript (conversation + one-line tool
+    // summaries) read from the provider's on-disk JSONL.
+    const turns = await session.readParsed();
+    if (turns.length > 0) {
+      if (json) {
+        printJson(turns);
+      } else {
+        process.stdout.write(`${renderTurns(turns)}\n`);
+      }
+      return 0;
+    }
+
+    // Fallback: nothing on disk yet (just booted / nothing written). Show the live
+    // pane so `read` always shows something, and flag it so callers can tell.
+    const pane = await session.capture();
     if (json) {
-      printJson({ id: session.id, pane });
+      printJson({ id: session.id, fallback: true, pane });
     } else {
+      process.stderr.write('(no on-disk transcript yet — showing live pane; --raw for full pane)\n');
       process.stdout.write(pane.endsWith('\n') ? pane : `${pane}\n`);
     }
     return 0;

@@ -49,14 +49,12 @@ export class ClaudeAdapter implements ProviderAdapter {
     // glob ~/.claude/projects/*/<sid>.jsonl — do NOT recompute the slug. claude DOES
     // honor our --session-id (the file IS named <sid>.jsonl), so the glob is correct.
     //
-    // BUG 5 (investigated live, claude 2.1.169): for an orc-launched INTERACTIVE
-    // session this file contains ONLY an `ai-title` event — the user/assistant turns
-    // are never written here, not while live and not on clean `/exit`, and not under any
-    // other filename in the project dir. The turns aren't on disk under ~/.claude at all
-    // for interactive sessions (full JSONL is only written in `claude -p` print mode).
-    // So this resolves the correct (title-only) file; for the live conversation use
-    // `agi read --scrollback`. A cwd+mtime rewrite (like codex) would NOT help — there is
-    // no fuller file to discover. Documented in README; left as a glob deliberately.
+    // Verified live (claude 2.1.170): for an orc-launched INTERACTIVE session this file
+    // DOES contain the real `user`/`assistant` turns, appended as the conversation
+    // progresses (alongside `ai-title`/bookkeeping events). An earlier comment here
+    // claimed the file was title-only and that turns were never on disk for interactive
+    // sessions — that was WRONG. The default parsed `agi read` parses these turns; the
+    // raw pane (`agi read --raw`) remains available as the escape hatch.
     const base = path.join(os.homedir(), '.claude', 'projects');
     const glob = new Bun.Glob(`*/${rec.sessionId}.jsonl`);
     for await (const match of glob.scan({ cwd: base, absolute: true })) {

@@ -59,7 +59,7 @@ Usage:
   agi spawn  --provider <claude|codex|pi> [options]   Launch a new agent session
              aliases: agent, new
   agi send   <id|name> [PROMPT | - | @file]           Send a prompt (multi-line safe)
-  agi read   <id|name> [--scrollback] [--transcript]  Read pane or on-disk transcript
+  agi read   <id|name> [--raw]                        Parsed transcript (default) or full pane (--raw)
   agi list   [--workspace W | --all | --dead]         List sessions (alias: ps)
   agi attach <id|name> [--read-only]                  Print the tmux attach command
   agi kill   <id|name> [--worktree] [--purge]         Kill session (mark dead; --purge removes record)
@@ -81,4 +81,7 @@ spawn options:
 
 Global:
   --json                machine-readable output; non-zero exit + {error} on failure
+
+read --json emits the parsed turn array ([{role,text},...]); --raw --json emits
+{id,pane}; if no transcript exists yet it falls back to {id,fallback:true,pane}.
 `;

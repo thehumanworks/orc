@@ -38,7 +38,7 @@ agi <command> ...
 ```
 agi spawn  --provider <claude|codex|pi> [options]   Launch a new agent session (aliases: agent, new)
 agi send   <id|name> [PROMPT | - | @file]           Send a prompt (multi-line safe)
-agi read   <id|name> [--scrollback] [--transcript]  Read the live pane or the on-disk transcript
+agi read   <id|name> [--raw]                        Parsed transcript (default); --raw = full tmux pane
 agi list   [--workspace W | --all | --dead]         List sessions for a workspace (alias: ps)
 agi attach <id|name> [--read-only]                  Print the `tmux attach` command (does not exec)
 agi kill   <id|name> [--worktree] [--purge]         Kill the session (mark dead; --purge removes record)
@@ -78,9 +78,9 @@ ID=$(agi spawn -p claude --json | bun -e 'console.log(JSON.parse(await Bun.stdin
 # Send a multi-line prompt from a file (delivered as ONE message).
 agi send "$ID" @prompt.txt
 
-# Watch the live pane / read the full transcript.
+# Read the token-efficient parsed transcript; --raw for the full tmux pane.
 agi read "$ID"
-agi read "$ID" --transcript
+agi read "$ID" --raw
 
 # Reattach as a human (read-only view).
 eval "$(agi attach "$ID" --read-only)"
@@ -101,7 +101,8 @@ const session = await agent({
 
 console.log(session.id, session.tmuxName, await session.status());
 console.log(await session.capture());          // live pane
-console.log(await session.readTranscript());   // on-disk JSONL
+console.log(await session.readTranscript());   // raw on-disk JSONL
+console.log(await session.readParsed());        // token-efficient parsed turns (Turn[])
 
 await session.send('now do the next thing');    // multi-line safe
 
@@ -113,12 +114,11 @@ await session.kill({ removeWorktree: true });
 
 - **claude** — native `--agent <name>`; `--append-system-prompt` (append, default) or
   `--system-prompt` (replace). Transcript resolved by globbing the session id.
-  **Note:** for an orc-launched *interactive* claude session, the on-disk
-  `~/.claude/projects/*/<sid>.jsonl` only ever contains a title (`ai-title`) event — the
-  user/assistant turns are NOT flushed there while the session is live, nor on clean
-  `/exit` (verified against claude 2.1.169). So `agi read --transcript` is title-only for
-  live claude; use **`agi read --scrollback`** to read the actual conversation. (Full
-  JSONL transcripts are written in `claude -p` print mode, which orc does not use.)
+  **Note:** an orc-launched *interactive* claude session DOES write its real
+  `user`/`assistant` turns to `~/.claude/projects/*/<sid>.jsonl` as the conversation
+  progresses (verified against claude 2.1.170). So the default parsed `agi read` reads
+  the actual conversation from disk; `agi read --raw` is the live-pane escape hatch.
+  (An earlier note claimed the file was title-only — that was wrong.)
 - **codex** — no launch-time `--agent` flag and no `--session-id`. A persona/system prompt (or a
   resolved `agentName` body) is written to `AGENTS.md` in the cwd. Transcript discovered by matching
   the rollout file's `cwd` with an mtime guard.
@@ -142,7 +142,7 @@ never mutates your CLI config. The boot loop only auto-confirms the trust dialog
 interstitial (e.g. codex's "Update available" banner, whose default is a self-update) is dismissed
 with `Escape` and never accepted.
 
-`agi kill` keeps the session record (marked dead) so `agi read --transcript` still resolves after a
+`agi kill` keeps the session record (marked dead) so `agi read` still resolves the transcript after a
 kill — the transcript path is resolved and persisted at kill time. Dead records are hidden from
 `agi list` by default (`--dead`/`--all` to show them). Use `agi kill <id> --purge` to remove a single
 record, or `agi prune` to drop all dead records.

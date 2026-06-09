@@ -53,6 +53,14 @@ describe('codex readyMatch (BUG 2)', () => {
     expect(a.readyMatch(READY_PANE)).toBe(true);
   });
 
+  test('ready on a HOME-relative (~) status line with a branch suffix', () => {
+    // Real capture (codex-cli 0.138.0): a cwd under $HOME renders the path as
+    // '~/...' (not absolute) and appends ' · <branch>'. The matcher must accept it.
+    const homeReady =
+      '  gpt-5.5 xhigh · ~/projects/orc/.orc/worktrees/b51785e4 · Main [default]';
+    expect(a.readyMatch(homeReady)).toBe(true);
+  });
+
   test('NOT ready on the trust dialog (despite containing ›)', () => {
     expect(a.readyMatch(TRUST_PANE)).toBe(false);
   });

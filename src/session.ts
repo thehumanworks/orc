@@ -8,6 +8,8 @@ import { getDriver } from './drivers/driver.ts';
 import { getProvider } from './providers/provider.ts';
 import { upsertRecord, removeRecord } from './registry.ts';
 import { removeWorktree } from './worktree.ts';
+import { parseTranscript } from './transcript.ts';
+import type { Turn } from './transcript.ts';
 import type { Provider, SessionRecord, SessionStatus } from './types.ts';
 
 const READY_TIMEOUT_MS = 30_000;
@@ -185,6 +187,18 @@ export class Session {
     const f = Bun.file(file);
     if (!(await f.exists())) return null;
     return f.text();
+  }
+
+  /**
+   * Parse the on-disk transcript into token-efficient turns (conversation text plus
+   * one-line tool-call summaries; no raw tool output, reasoning, or UI chrome). This
+   * is the SDK mirror of the default `agi read`. Returns `[]` when no transcript is
+   * on disk yet (e.g. just booted) — callers wanting a live view should `capture()`.
+   */
+  async readParsed(): Promise<Turn[]> {
+    const jsonl = await this.readTranscript();
+    if (!jsonl) return [];
+    return parseTranscript(this.provider, jsonl);
   }
 
   attachCommand(opts?: { readOnly?: boolean }): string {

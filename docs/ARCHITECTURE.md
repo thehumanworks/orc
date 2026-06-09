@@ -99,6 +99,7 @@ class Session {
   capture(opts?: { scrollback?: boolean }): Promise<string>;  // tmux capture-pane
   transcript(): Promise<string | null>;              // path to on-disk JSONL (provider-resolved)
   readTranscript(): Promise<string | null>;          // raw JSONL contents
+  readParsed(): Promise<Turn[]>;                      // token-efficient parsed turns (default `agi read`)
   attachCommand(opts?: { readOnly?: boolean }): string;       // `tmux attach [-r] -t <name>`
   kill(opts?: { removeWorktree?: boolean }): Promise<void>;   // kill tmux session (+ optional worktree)
   toJSON(): SessionRecord;
@@ -201,7 +202,7 @@ agi spawn  --provider <p> [--model M] [--agent NAME | --system-prompt P] [--prom
            [--cwd DIR] [--workspace W] [--worktree [--branch B]] [--no-wait] [--json]
            # prints the SessionRecord (human or json). Alias: `agi agent`, `agi new`.
 agi send   <id|name> [PROMPT | - | @file] [--json]      # multi-line safe; piped stdin or '-' if PROMPT omitted
-agi read   <id|name> [--scrollback] [--transcript] [--json]   # pane capture or on-disk transcript
+agi read   <id|name> [--raw] [--json]                   # parsed transcript (default) or full pane (--raw)
 agi list   [--workspace W | --all | --dead] [--json]    # active sessions for a workspace. Alias: `agi ps`.
 agi attach <id|name> [--read-only] [--json]             # prints `tmux attach ...` (does not exec by default)
 agi kill   <id|name> [--worktree] [--purge] [--json]    # mark session dead (keep record); --purge removes record
