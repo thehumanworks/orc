@@ -37,6 +37,16 @@ export class ClaudeAdapter implements ProviderAdapter {
     return pane.includes('bypass permissions on');
   }
 
+  busyMatch(pane: string): boolean {
+    // While a turn is in progress, claude's bottom bar reads
+    //   `⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt`
+    // — the literal `esc to interrupt` is the working indicator. When idle/done it is
+    // ABSENT (the bar reads `… · ← for agents`). Note the ready footer
+    // (`bypass permissions on`) is present in BOTH states, so the classifier checks
+    // busy before ready. (Verified live, claude 2.1.170.)
+    return pane.includes('esc to interrupt');
+  }
+
   trustDialogMatch(pane: string): boolean {
     return (
       pane.includes('trust this folder') ||

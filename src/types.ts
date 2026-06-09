@@ -8,6 +8,27 @@ export type SystemPromptMode = 'append' | 'replace';
 
 export type SessionStatus = 'running' | 'dead';
 
+/**
+ * Classified state of an interactive agent session. This is the foundation for
+ * orchestration, so the definitions are load-bearing — be precise:
+ *
+ * - `starting` — booted but not yet showing a ready composer (transient).
+ * - `running`  — the assistant is actively working (a turn is in progress).
+ * - `done`     — the turn has YIELDED: the composer is idle and ready for input.
+ *   This means "ready for YOUR input," NOT "succeeded." It covers BOTH "finished the
+ *   task" AND "asked a clarifying question and is waiting for your reply" — those two
+ *   are pane-indistinguishable for claude/codex in yolo mode (both render as the idle
+ *   composer with no working indicator), so a conversational question is reported as
+ *   `done`, not `waiting`.
+ * - `waiting`  — blocked specifically on a TUI MODAL that needs a response: a trust
+ *   dialog, an approval/permission selection, or an update interstitial. (A
+ *   conversational question is `done`, per above — it is not pane-distinguishable.)
+ * - `failed`   — the process/pane is no longer alive. This is crash OR clean exit
+ *   (e.g. `/exit`); pane-gone cannot distinguish them, so `failed` means "TERMINATED,"
+ *   NOT "errored."
+ */
+export type AgentState = 'starting' | 'running' | 'done' | 'waiting' | 'failed';
+
 export interface AgentOptions {
   provider: Provider;
   model?: string;

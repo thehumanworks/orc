@@ -27,6 +27,13 @@ export interface ProviderAdapter {
   buildArgv(ctx: BuildCtx): string[];
   /** True when the input box has rendered (boot complete). Matches VISIBLE pane. */
   readyMatch(pane: string): boolean;
+  /**
+   * True when the provider's "actively working" indicator is present (a turn is in
+   * progress). Matches the VISIBLE pane. Used by `Session.state()` to distinguish
+   * `running` from `done`. NOTE: claude/codex render BOTH this and `readyMatch`'s
+   * footer mid-turn, so the classifier checks `busyMatch` before `readyMatch`.
+   */
+  busyMatch(pane: string): boolean;
   /** True when a first-run trust dialog is showing and needs an Enter to confirm. */
   trustDialogMatch(pane: string): boolean;
   /**

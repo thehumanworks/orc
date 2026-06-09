@@ -1,0 +1,24 @@
+> You are in /private/var/folders/4m/3lqz345x4079phy2699l6bfc0000gn/T/tmp.6qzSms
+
+  Do you trust the contents of this directory? Working with untrusted contents
+  comes with higher risk of prompt injection. Trusting the directory allows
+  project-local config, hooks, and exec policies to load.
+
+› 1. Yes, continue
+  2. No, quit
+
+  Press enter to continue
+
+
+
+
+
+
+
+
+
+
+
+
+
+

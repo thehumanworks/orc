@@ -10,12 +10,27 @@ import { upsertRecord, removeRecord } from './registry.ts';
 import { removeWorktree } from './worktree.ts';
 import { parseTranscript } from './transcript.ts';
 import type { Turn } from './transcript.ts';
-import type { Provider, SessionRecord, SessionStatus } from './types.ts';
+import { classifyState, reduceWait, INITIAL_TRACKING } from './state.ts';
+import type { WaitTracking } from './state.ts';
+import type { AgentState, Provider, SessionRecord, SessionStatus } from './types.ts';
 
 const READY_TIMEOUT_MS = 30_000;
 const POLL_INTERVAL_MS = 250;
 const PASTE_SETTLE_MS = 200;
 const SEND_MAX_ATTEMPTS = 3;
+
+const DEFAULT_WAIT_UNTIL: AgentState[] = ['done', 'waiting', 'failed'];
+const DEFAULT_WAIT_TIMEOUT_MS = 600_000;
+const DEFAULT_WAIT_POLL_MS = 1000;
+
+export interface WaitForOptions {
+  /** States that count as "settled enough to return". Default done/waiting/failed. */
+  until?: AgentState[];
+  /** Give up after this long and return the last observed state. Default 600000. */
+  timeoutMs?: number;
+  /** Interval between polls. Default 1000. */
+  pollMs?: number;
+}
 
 /**
  * A short prefix of the prompt's first non-empty line, used to verify the paste
@@ -73,6 +88,61 @@ export class Session {
 
   async status(): Promise<SessionStatus> {
     return (await this.driver.isAlive(this.tmuxName)) ? 'running' : 'dead';
+  }
+
+  /**
+   * Classify the current agent state from driver liveness + a SINGLE pane capture.
+   * Thin wrapper over the pure `classifyState` (which is unit-tested on canned panes).
+   * See `AgentState` for the precise meaning of each value — in particular `done` means
+   * "ready for your input" (NOT "succeeded") and `failed` means "terminated" (NOT
+   * "errored").
+   */
+  async state(): Promise<AgentState> {
+    const alive = await this.driver.isAlive(this.tmuxName);
+    if (!alive) return 'failed';
+    let pane: string;
+    try {
+      pane = await this.driver.capture(this.tmuxName);
+    } catch {
+      // Pane vanished between the liveness check and the capture — treat as gone.
+      return 'failed';
+    }
+    return classifyState(this.adapter, alive, pane);
+  }
+
+  /**
+   * Poll `state()` until it SETTLES into a state in `until` or the timeout elapses.
+   *
+   * RELIABILITY: a non-progressing state must be observed for 2 CONSECUTIVE polls
+   * before it is returned (the `reduceWait` debounce). This prevents a sub-second gap
+   * between tool calls — when the working indicator momentarily drops and a single poll
+   * reads `done` — from being misread as end-of-turn. A `running`/`starting` reading
+   * resets the debounce.
+   *
+   * On timeout, returns the LAST observed state (does not throw). The returned state is
+   * in `until` iff it genuinely settled; on timeout it is typically still progressing.
+   */
+  async waitFor(opts?: WaitForOptions): Promise<AgentState> {
+    const until = opts?.until ?? DEFAULT_WAIT_UNTIL;
+    const timeoutMs = opts?.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
+    const pollMs = opts?.pollMs ?? DEFAULT_WAIT_POLL_MS;
+    const deadline = Date.now() + timeoutMs;
+
+    let tracking: WaitTracking = INITIAL_TRACKING;
+    let last = await this.state();
+    {
+      const r = reduceWait(tracking, last, until);
+      tracking = r.tracking;
+      if (r.settled) return r.settled;
+    }
+    while (Date.now() < deadline) {
+      await sleep(pollMs);
+      last = await this.state();
+      const r = reduceWait(tracking, last, until);
+      tracking = r.tracking;
+      if (r.settled) return r.settled;
+    }
+    return last;
   }
 
   /** Whether the input box is rendered (boot complete). */
