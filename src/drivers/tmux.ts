@@ -5,6 +5,21 @@
 import type { Driver, SpawnArgs } from './driver.ts';
 import type { PaneInfo } from '../types.ts';
 
+/**
+ * Fixed pane geometry for every orc session — the SINGLE source of truth.
+ *
+ * A detached `new-session` with no `-x/-y` inherits whatever width the tmux server
+ * was started with (observed as narrow as 48 columns). At that width the providers'
+ * bottom status line WRAPS, so the busy marker `esc to interrupt` lands on a wrapped
+ * continuation that `capture-pane` truncates — `busyMatch` then misses it and a
+ * working agent misclassifies as `done`. We pin a comfortably WIDE geometry (wider
+ * than the longest provider status line) so a status line never wraps and state
+ * detection is width-stable. Paired with `window-size manual` (see `spawn`) so a
+ * later narrow `agi attach` can't shrink the window and reintroduce the bug.
+ */
+export const PANE_WIDTH = 200;
+export const PANE_HEIGHT = 50;
+
 const FIELD = '\t';
 const LIST_FORMAT = [
   '#{session_name}',
@@ -47,6 +62,36 @@ export function sanitizeTmuxName(raw: string): string {
   return cleaned.length > 0 ? cleaned : 'agent';
 }
 
+/**
+ * Build the `new-session` argv for a spawn — pure, so it is unit-testable without a
+ * live tmux server. The `-x/-y` width/height flags MUST precede the `--` separator
+ * (anything after `--` is the program argv, not a new-session flag).
+ */
+export function buildSpawnArgs(a: SpawnArgs): string[] {
+  // new-session -d (detached) -s name -c cwd -x W -y H -- <prog> <args...>
+  // The `--` form passes argv directly (no shell quoting of prompt text). The fixed
+  // -x/-y geometry keeps the pane wide enough that no status line wraps (see PANE_WIDTH).
+  const args = [
+    'new-session',
+    '-d',
+    '-s',
+    a.name,
+    '-c',
+    a.cwd,
+    '-x',
+    String(PANE_WIDTH),
+    '-y',
+    String(PANE_HEIGHT),
+  ];
+  if (a.env) {
+    for (const [k, v] of Object.entries(a.env)) {
+      args.push('-e', `${k}=${v}`);
+    }
+  }
+  args.push('--', ...a.argv);
+  return args;
+}
+
 export class TmuxDriver implements Driver {
   readonly name = 'tmux';
   private static serverPrepared = false;
@@ -63,19 +108,15 @@ export class TmuxDriver implements Driver {
   }
 
   async spawn(a: SpawnArgs): Promise<void> {
-    // new-session -d (detached) -s name -c cwd -- <prog> <args...>
-    // The `--` form passes argv directly (no shell quoting of prompt text).
-    const args = ['new-session', '-d', '-s', a.name, '-c', a.cwd];
-    if (a.env) {
-      for (const [k, v] of Object.entries(a.env)) {
-        args.push('-e', `${k}=${v}`);
-      }
-    }
-    args.push('--', ...a.argv);
-    const r = await tmux(args);
+    const r = await tmux(buildSpawnArgs(a));
     if (r.code !== 0) {
       throw new Error(`tmux new-session failed: ${r.stderr.trim() || r.stdout.trim()}`);
     }
+    // Pin the geometry: with the default `window-size latest`, a later (e.g. read-only)
+    // `agi attach` from a narrow terminal would resize the window to the client and
+    // re-wrap the status line. `manual` keeps the `-x/-y` size regardless of clients.
+    // Best-effort (the -x/-y creation size is the load-bearing part); ignore failures.
+    await tmux(['set-option', '-t', a.name, 'window-size', 'manual']).catch(() => {});
     // Apply server fidelity options now that a server is guaranteed running.
     await this.prepareServer();
   }
