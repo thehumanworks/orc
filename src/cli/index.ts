@@ -8,7 +8,7 @@ import type { ParseArgsConfig } from 'node:util';
 import { agent } from '../agent.ts';
 import { listSessions, getSession, pruneSessions } from '../index.ts';
 import { renderTurns } from '../transcript.ts';
-import type { AgentOptions, Provider, SystemPromptMode } from '../types.ts';
+import type { AgentOptions, AgentState, Provider, SystemPromptMode } from '../types.ts';
 import {
   printJson,
   printError,
@@ -381,6 +381,106 @@ async function cmdPrune(args: string[]): Promise<number> {
   return 0;
 }
 
+/**
+ * Map a `--for` value to the set of states `waitFor` should settle on. `settled`
+ * (default) = any non-progressing state. Returns null for an invalid value. Pure +
+ * synchronous so it's unit-testable.
+ */
+export function resolveUntil(forArg: string): AgentState[] | null {
+  switch (forArg) {
+    case 'settled':
+      return ['done', 'waiting', 'failed'];
+    case 'done':
+      return ['done'];
+    case 'waiting':
+      return ['waiting'];
+    case 'failed':
+      return ['failed'];
+    default:
+      return null;
+  }
+}
+
+async function cmdState(args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, {
+    json: { type: 'boolean' },
+  });
+  const json = jsonFlag(values);
+  const idOrName = positionals[0];
+  if (!idOrName) {
+    printError('state requires <id|name>', json);
+    return 1;
+  }
+  const session = await getSession(idOrName);
+  if (!session) {
+    printError(`no session found for '${idOrName}'`, json);
+    return 1;
+  }
+  let state: AgentState;
+  try {
+    state = await session.state();
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
+  if (json) printJson({ id: session.id, state });
+  else process.stdout.write(`${state}\n`);
+  return 0;
+}
+
+async function cmdWait(args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, {
+    for: { type: 'string' },
+    timeout: { type: 'string' },
+    json: { type: 'boolean' },
+  });
+  const json = jsonFlag(values);
+  const idOrName = positionals[0];
+  if (!idOrName) {
+    printError('wait requires <id|name>', json);
+    return 1;
+  }
+  const forArg = (values.for as string | undefined) ?? 'settled';
+  const until = resolveUntil(forArg);
+  if (!until) {
+    printError(`invalid --for '${forArg}' (done|waiting|failed|settled)`, json);
+    return 1;
+  }
+  let timeoutMs: number | undefined;
+  if (values.timeout !== undefined) {
+    const sec = Number(values.timeout);
+    if (!Number.isFinite(sec) || sec < 0) {
+      printError(`invalid --timeout '${values.timeout}' (seconds)`, json);
+      return 1;
+    }
+    timeoutMs = Math.round(sec * 1000);
+  }
+  const session = await getSession(idOrName);
+  if (!session) {
+    printError(`no session found for '${idOrName}'`, json);
+    return 1;
+  }
+  const startedAt = Date.now();
+  let state: AgentState;
+  try {
+    state = await session.waitFor({ until, timeoutMs });
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
+  const elapsedMs = Date.now() - startedAt;
+  // Reached a state in the requested set ⇒ success; otherwise we hit the timeout and
+  // are reporting the last observed (still-progressing) state.
+  const reached = until.includes(state);
+  const timedOut = !reached;
+  if (json) {
+    printJson({ id: session.id, state, elapsedMs, timedOut });
+  } else {
+    process.stdout.write(`${state}${timedOut ? ' (timed out)' : ''}\n`);
+  }
+  return reached ? 0 : 1;
+}
+
 /** Map a raw subcommand (with aliases) to a canonical name. */
 export function resolveCommand(raw: string | undefined): string {
   switch (raw) {
@@ -392,6 +492,10 @@ export function resolveCommand(raw: string | undefined): string {
       return 'send';
     case 'read':
       return 'read';
+    case 'state':
+      return 'state';
+    case 'wait':
+      return 'wait';
     case 'list':
     case 'ps':
       return 'list';
@@ -424,6 +528,10 @@ async function main(): Promise<number> {
       return cmdSend(rest);
     case 'read':
       return cmdRead(rest);
+    case 'state':
+      return cmdState(rest);
+    case 'wait':
+      return cmdWait(rest);
     case 'list':
       return cmdList(rest);
     case 'attach':

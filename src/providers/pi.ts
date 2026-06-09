@@ -5,6 +5,26 @@
 import type { ProviderAdapter, BuildCtx } from './provider.ts';
 import type { SessionRecord } from '../types.ts';
 
+/**
+ * pi's ready composer renders two `────` horizontal borders with an empty input line
+ * between, and a bottom BUDGET-METER line like
+ *   `$0.000 (sub) 0.0%/200k (auto) … grok-composer-2.5-fast`
+ * The stable, composer-only marker in that line is the percent-of-budget token
+ * (`0.0%/200k`): a number, then `%/`, then a `<n>k` cap. It is ABSENT during early boot
+ * and PRESENT once the composer is live (verified live, pi 0.79.0).
+ */
+const BUDGET_METER_RE = /\d+(?:\.\d+)?%\/\d+k/;
+
+/**
+ * pi's working indicator: a Braille spinner frame (U+2800–U+28FF) followed by
+ * ` Working...` (e.g. `⠋ Working...`), shown at the bottom while a turn is in progress
+ * and ABSENT on the idle composer. Captured live (pi 0.79.0) from the VISIBLE pane —
+ * note pi has NO `esc to interrupt` working hint (its `escape interrupt` text lives only
+ * in the boot banner, which scrolls out of the visible pane), so that is NOT usable. The
+ * spinner-anchored form avoids matching a stray "Working" in assistant prose.
+ */
+const WORKING_RE = /[⠀-⣿] Working/;
+
 export class PiAdapter implements ProviderAdapter {
   readonly name = 'pi' as const;
 
@@ -28,8 +48,18 @@ export class PiAdapter implements ProviderAdapter {
   }
 
   readyMatch(pane: string): boolean {
-    // pi renders its input box; the box border / prompt char indicates ready.
-    return pane.includes('│') || pane.includes('❯') || pane.includes('>');
+    // BUG: the old check (`pane.includes('│') || '❯' || '>'`) did NOT match pi's
+    // composer — it has none of those chars — so `agi send` threw "not ready" and
+    // prompts were lost. The reliable marker is the bottom budget-meter line.
+    return BUDGET_METER_RE.test(pane);
+  }
+
+  busyMatch(pane: string): boolean {
+    // pi's working indicator is the spinner-prefixed `Working...` line (see WORKING_RE).
+    // It is present throughout a turn and absent on the idle composer (captured live,
+    // pi 0.79.0). The budget meter (readyMatch) is present in BOTH states, so the
+    // classifier checks busy before ready.
+    return WORKING_RE.test(pane);
   }
 
   trustDialogMatch(_pane: string): boolean {

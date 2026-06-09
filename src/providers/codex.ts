@@ -52,6 +52,16 @@ export class CodexAdapter implements ProviderAdapter {
     return STATUS_LINE_RE.test(pane);
   }
 
+  busyMatch(pane: string): boolean {
+    // While a turn is in progress, codex shows a working line like
+    //   `• Working (3s • esc to interrupt)`
+    // — the literal `esc to interrupt` is the working indicator. When done that line
+    // is gone, leaving only the status line (`gpt-5.5 xhigh · /path`), which
+    // `readyMatch` keys off. The status line is present in BOTH states, so the
+    // classifier checks busy before ready. (Verified live, codex-cli 0.138.0.)
+    return pane.includes('esc to interrupt');
+  }
+
   trustDialogMatch(pane: string): boolean {
     // Match the QUESTION, not the option label: "Yes, continue" is a substring of the
     // full-access dialog's "Yes, continue anyway", so keying off the label would

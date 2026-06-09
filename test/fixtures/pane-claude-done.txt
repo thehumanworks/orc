@@ -1,0 +1,24 @@
+
+╭─── Claude Code v2.1.170 ─────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting        │
+│                 Welcome back Tomas!                │ started                 │
+│                                                    │ Ask Claude to create a… │
+│                       ▐▛███▜▌                      │ ─────────────────────── │
+│                      ▝▜█████▛▘                     │ What's new              │
+│                        ▘▘ ▝▝                       │ Introducing Claude Fab… │
+│   Opus 4.8 (1M context) with xh… · Claude Max ·    │ Fixed sessions not sav… │
+│   rodat.human@gmail.com's Organization             │ Added `--safe-mode` fl… │
+│               /…/T/tmp.Z2nibquw6c/cl               │ /release-notes for more │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+                                                              ◉ xhigh · /effort
+────────────────────────────────────────────────────────────────────────────────
+❯ Try "refactor <filepath>"
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+                                                     Remote Control connecting…

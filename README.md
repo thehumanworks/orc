@@ -39,6 +39,9 @@ agi <command> ...
 agi spawn  --provider <claude|codex|pi> [options]   Launch a new agent session (aliases: agent, new)
 agi send   <id|name> [PROMPT | - | @file]           Send a prompt (multi-line safe)
 agi read   <id|name> [--raw]                        Parsed transcript (default); --raw = full tmux pane
+agi state  <id|name>                                Classify state once: starting|running|done|waiting|failed
+agi wait   <id|name> [--for done|waiting|failed|settled] [--timeout <sec>]
+                                                    Block until the agent settles (default --for settled)
 agi list   [--workspace W | --all | --dead]         List sessions for a workspace (alias: ps)
 agi attach <id|name> [--read-only]                  Print the `tmux attach` command (does not exec)
 agi kill   <id|name> [--worktree] [--purge]         Kill the session (mark dead; --purge removes record)
@@ -106,6 +109,10 @@ console.log(await session.readParsed());        // token-efficient parsed turns 
 
 await session.send('now do the next thing');    // multi-line safe
 
+console.log(await session.state());             // 'starting'|'running'|'done'|'waiting'|'failed'
+const settled = await session.waitFor();        // blocks until done/waiting/failed (debounced)
+await session.waitFor({ until: ['done'], timeoutMs: 120_000, pollMs: 1000 });
+
 const all = await listSessions({ all: true });
 await session.kill({ removeWorktree: true });
 ```
@@ -146,6 +153,44 @@ with `Escape` and never accepted.
 kill — the transcript path is resolved and persisted at kill time. Dead records are hidden from
 `agi list` by default (`--dead`/`--all` to show them). Use `agi kill <id> --purge` to remove a single
 record, or `agi prune` to drop all dead records.
+
+## Agent state & `wait`
+
+`agi state <id>` classifies an interactive session in one shot (driver liveness + a single pane
+capture); `agi wait <id>` blocks until it settles. Both are built on `Session.state()` /
+`Session.waitFor()` in the SDK. The five states are the foundation for orchestration, so their
+meanings are precise and load-bearing:
+
+| state | meaning |
+| --- | --- |
+| `starting` | booted but not yet showing a ready composer (transient) |
+| `running` | the assistant is actively working — a turn is in progress |
+| `done` | the turn YIELDED: the composer is idle and ready for input |
+| `waiting` | blocked on a TUI **modal** (trust dialog, approval/permission, update interstitial) |
+| `failed` | the process/pane is no longer alive |
+
+Two nuances matter:
+
+- **`done` means "ready for YOUR input," not "succeeded."** It covers both "finished the task" and
+  "asked a clarifying question and is waiting for your reply." For claude/codex in yolo mode those two
+  are **pane-indistinguishable** (both render as the idle composer with no working indicator), so a
+  conversational question is reported as `done`, **not** `waiting`. `waiting` is reserved for actual
+  TUI modals that need a keypress.
+- **`failed` means "terminated," not "errored."** A crash and a clean `/exit` both just leave the pane
+  gone, and those are not pane-distinguishable, so `failed` carries no success/failure judgement.
+
+`agi wait` polls `state()` (~1s) until it reaches a state in the requested set, **debounced**: a
+non-progressing state must hold for **2 consecutive polls** before it's returned, so a sub-second gap
+between an agent's tool calls is never misread as end-of-turn. `--for` selects the target set
+(`done` | `waiting` | `failed` | `settled`, where `settled` = any of the three; default `settled`).
+On timeout it returns the last observed state (it does not throw); exit code is `0` iff the reached
+state is in the requested set, non-zero on timeout.
+
+```sh
+agi wait "$ID" --json                       # {"id","state","elapsedMs","timedOut"}
+agi wait "$ID" --for done --timeout 120      # block up to 120s for the turn to yield
+agi state "$ID" --json                       # {"id","state"} — point-in-time, no blocking
+```
 
 ## Workspaces
 
