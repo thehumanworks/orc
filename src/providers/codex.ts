@@ -7,6 +7,14 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import type { ProviderAdapter, BuildCtx } from './provider.ts';
 import type { SessionRecord } from '../types.ts';
+import { literalPasteLanded, normalizePane } from '../paste.ts';
+
+/**
+ * codex collapses a large bracketed paste into a chip like `› [Pasted Content 12295 chars]`
+ * (the literal text is NOT rendered). Verified live (codex-cli 0.138.0). The chip is the
+ * "landed" signal for multi-KB prompts.
+ */
+const PASTE_CHIP_RE = /\[Pasted Content \d+ chars?\]/;
 
 /**
  * codex's bottom status line: a model token, then ' · ' (U+00B7 with surrounding
@@ -77,6 +85,17 @@ export class CodexAdapter implements ProviderAdapter {
    */
   interstitialMatch(pane: string): boolean {
     return pane.includes('Update available') || pane.includes('Update now (runs');
+  }
+
+  pasteLanded(pane: string, text: string): boolean {
+    // Small paste → literal end-probe; large paste → the collapsed chip.
+    return literalPasteLanded(pane, text) || PASTE_CHIP_RE.test(normalizePane(pane));
+  }
+
+  clearInputKeys(): string[] {
+    // Ctrl-U clears the whole composer (even a collapsed paste chip) and never exits.
+    // Verified live: chip gone (placeholder hint returns), session alive.
+    return ['C-u'];
   }
 
   async resolveTranscript(rec: SessionRecord): Promise<string | null> {

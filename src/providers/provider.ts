@@ -42,6 +42,21 @@ export interface ProviderAdapter {
    * default action is a self-update. Optional; providers without one omit it.
    */
   interstitialMatch?(pane: string): boolean;
+  /**
+   * Confirm our pasted prompt actually landed in the composer, given a fresh pane
+   * capture and the exact text we pasted. Matches EITHER regime (see `src/paste.ts`):
+   * the literal end-probe (small paste shown verbatim) OR this provider's collapsed
+   * paste chip (large/multi-line paste — the literal text is NOT rendered). Used by
+   * `Session.send()`'s verify-before-submit loop.
+   */
+  pasteLanded(pane: string, text: string): boolean;
+  /**
+   * Safe key sequence (tmux key names) to CLEAR a non-empty composer before a re-paste,
+   * so a failed send attempt can't stack the prompt 2–3×. MUST be safe — NEVER a key
+   * that interrupts/exits the TUI (e.g. NEVER Ctrl-C on pi: it quits). Optional; omit
+   * when no safe clear exists (send() then leans on the end-probe to make retries rare).
+   */
+  clearInputKeys?(): string[];
   /** Resolve the on-disk transcript path for a launched session. */
   resolveTranscript(rec: SessionRecord): Promise<string | null>;
 }
