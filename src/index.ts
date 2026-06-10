@@ -128,7 +128,7 @@ export async function pruneSessions(opts?: {
   if (opts?.removeWorktree) {
     for (const r of dead) {
       if (r.worktreePath) {
-        await removeWorktree(r.workspace, r.worktreePath).catch(() => {});
+        await removeWorktree(r.cwd, r.worktreePath, { branch: r.branch }).catch(() => {});
       }
     }
   }

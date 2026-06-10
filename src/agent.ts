@@ -170,7 +170,7 @@ export async function agent(opts: AgentOptions): Promise<Session> {
   } catch (e) {
     if (!spawned) {
       if (worktreePath) {
-        await removeWorktree(workspace, worktreePath).catch(() => {});
+        await removeWorktree(baseCwd, worktreePath, { branch }).catch(() => {});
       }
       await removeRecord(shortId).catch(() => {});
     }

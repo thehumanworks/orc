@@ -74,4 +74,21 @@ describe('agent() worktree rollback on pre-spawn failure', () => {
     const after = await listWorktreePaths(repo);
     expect(after).toEqual(before);
   });
+
+  test('removes worktree when workspace is logical (non-repo path)', async () => {
+    const repo = await mkRepo();
+    const before = await listWorktreePaths(repo);
+
+    await expect(
+      agent({
+        provider: 'claude',
+        cwd: repo,
+        workspace: 'my-logical-project',
+        worktree: true,
+        waitForReady: false,
+      }),
+    ).rejects.toThrow(/spawn failed for test/);
+
+    expect(await listWorktreePaths(repo)).toEqual(before);
+  });
 });

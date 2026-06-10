@@ -95,11 +95,26 @@ export async function commitCountVsMain(worktree: string, base = 'main'): Promis
   return Number.isFinite(n) ? n : 0;
 }
 
-/** Remove a worktree (force). Best-effort; tolerates already-removed. */
-export async function removeWorktree(repoCwd: string, wtPath: string): Promise<void> {
-  const toplevel = (await gitToplevel(repoCwd)) ?? repoCwd;
+/**
+ * Remove a worktree (force) and optionally delete its branch.
+ * Resolves the git toplevel from `wtPath` first so logical `--workspace` strings
+ * (non-repo paths) still work when `repoCwd` is not a git directory.
+ */
+export async function removeWorktree(
+  repoCwd: string,
+  wtPath: string,
+  opts?: { branch?: string },
+): Promise<void> {
+  const toplevel = (await gitToplevel(wtPath)) ?? (await gitToplevel(repoCwd)) ?? repoCwd;
   const r = await git(['worktree', 'remove', '--force', wtPath], toplevel);
   if (r.code !== 0 && !/is not a working tree|No such file/i.test(r.stderr)) {
     throw new Error(`git worktree remove failed: ${r.stderr.trim()}`);
+  }
+  const branch = opts?.branch?.trim();
+  if (branch) {
+    const dr = await git(['branch', '-D', branch], toplevel);
+    if (dr.code !== 0 && !/not found|not a valid object name|checked out/i.test(dr.stderr + dr.stdout)) {
+      throw new Error(`git branch -D failed: ${dr.stderr.trim() || dr.stdout.trim()}`);
+    }
   }
 }

@@ -309,7 +309,9 @@ export class Session {
 
     await this.driver.kill(this.tmuxName);
     if (opts?.removeWorktree && this.record.worktreePath) {
-      await removeWorktree(this.record.workspace, this.record.worktreePath).catch(() => {});
+      await removeWorktree(this.record.cwd, this.record.worktreePath, {
+        branch: this.record.branch,
+      }).catch(() => {});
     }
 
     if (opts?.purge) {
