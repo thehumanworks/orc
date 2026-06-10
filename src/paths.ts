@@ -44,8 +44,35 @@ export function runsDir(): string {
   return path.join(orcHome(), 'runs');
 }
 
+const RUN_ID_MAX_LEN = 128;
+const RUN_ID_RE = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * Reject unsafe workflow run ids (path traversal, empty, overlong). Minted ids and
+ * user `--run-id` values must pass before joining under runsDir() or tmux names.
+ */
+export function assertValidRunId(runId: string): void {
+  const id = runId.trim();
+  if (id.length === 0) {
+    throw new Error(`invalid runId '${runId}' (empty)`);
+  }
+  if (id === '.' || id === '..') {
+    throw new Error(`invalid runId '${runId}'`);
+  }
+  if (id.length > RUN_ID_MAX_LEN) {
+    throw new Error(`invalid runId '${runId}' (max length ${RUN_ID_MAX_LEN})`);
+  }
+  if (id.includes('/') || id.includes('\\') || id.includes('\0')) {
+    throw new Error(`invalid runId '${runId}'`);
+  }
+  if (!RUN_ID_RE.test(id)) {
+    throw new Error(`invalid runId '${runId}' (use letters, digits, hyphen, underscore)`);
+  }
+}
+
 /** Path to a single run record: ~/.orc/runs/<runId>.json. */
 export function runPath(runId: string): string {
+  assertValidRunId(runId);
   return path.join(runsDir(), `${runId}.json`);
 }
 
@@ -56,5 +83,6 @@ export function runPath(runId: string): string {
  * workaround). A directory (not a .json), so it never collides with run records.
  */
 export function runInstructionsDir(runId: string): string {
+  assertValidRunId(runId);
   return path.join(runsDir(), runId);
 }

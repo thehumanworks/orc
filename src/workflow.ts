@@ -21,11 +21,13 @@ import { Session } from './session.ts';
 import { commitCountVsMain } from './worktree.ts';
 import { validateAlias } from './registry.ts';
 import { writeRun } from './runs.ts';
-import { runInstructionsDir } from './paths.ts';
+import { assertValidRunId, runInstructionsDir } from './paths.ts';
+import { sanitizeTmuxName } from './drivers/tmux.ts';
 import { getDriver } from './drivers/driver.ts';
 import type { Driver } from './drivers/driver.ts';
 import type { Turn } from './transcript.ts';
 import type { AgentState, Provider } from './types.ts';
+import type { WaitForResult } from './session.ts';
 
 const VALID_PROVIDERS: Provider[] = ['claude', 'codex', 'pi'];
 const DEFAULT_STEP_TIMEOUT_MS = 600_000;
@@ -246,6 +248,20 @@ export function evaluateStep(
   return { ok, unverified: ok };
 }
 
+/** Map a debounced wait result + hard signals into a step outcome (exported for tests). */
+export function stepOutcomeFromWait(
+  step: Pick<WorkflowStep, 'done' | 'worktree'>,
+  wait: WaitForResult,
+  ctx: Omit<StepDoneCtx, 'state'>,
+): { state: AgentState; ok: boolean; unverified?: boolean } {
+  if (!wait.settled) {
+    return { state: wait.state, ok: false };
+  }
+  const fullCtx: StepDoneCtx = { state: wait.state, ...ctx };
+  const { ok, unverified } = evaluateStep(step, fullCtx);
+  return { state: wait.state, ok, unverified: unverified || undefined };
+}
+
 /**
  * Drop a step's instruction text to a file OUTSIDE any worktree (~/.orc/runs/<runId>/)
  * and return its absolute path, so the agent reads it by pointer and can't commit it.
@@ -313,13 +329,13 @@ const defaultExecStep: StepExecutor = async ({ step, runId, emit }) => {
   });
   await deliverInstructions(session, step, runId);
 
-  const state = await session.waitFor({
+  const wait = await session.waitForResult({
     until: ['done', 'waiting', 'failed'],
     timeoutMs: step.timeoutMs ?? DEFAULT_STEP_TIMEOUT_MS,
   });
   const commitsAhead = session.worktreePath ? await commitCountVsMain(session.worktreePath) : 0;
   const capture = await session.capture().catch(() => '');
-  const { ok, unverified } = evaluateStep(step, { state, commitsAhead, capture });
+  const { state, ok, unverified } = stepOutcomeFromWait(step, wait, { commitsAhead, capture });
 
   void emit; // warnings are emitted centrally by runWorkflow from the result.
   return {
@@ -352,6 +368,7 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
   };
 
   const runId = opts.runId ?? randomUUID().slice(0, 8);
+  if (opts.runId !== undefined) assertValidRunId(opts.runId);
   const run: WorkflowRun = {
     id: runId,
     name: def.name,
@@ -420,7 +437,8 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
 
 /** The tmux session name that owns a detached workflow run: `orc-wf-<runId>`. */
 export function runnerTmuxName(runId: string): string {
-  return `orc-wf-${runId}`;
+  assertValidRunId(runId);
+  return `orc-wf-${sanitizeTmuxName(runId)}`;
 }
 
 /**

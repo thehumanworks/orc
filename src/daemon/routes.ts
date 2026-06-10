@@ -3,6 +3,7 @@
  * argument translation can be unit-tested without a live socket. The handlers in
  * `server.ts` switch on the `RouteName` this returns and call the matching SDK function.
  */
+import { validateOptions } from '../agent.ts';
 import type { AgentOptions, Provider, SystemPromptMode } from '../types.ts';
 import type { WaitForOptions } from '../session.ts';
 import { resolveUntil } from '../state.ts';
@@ -130,7 +131,7 @@ export function mapSpawnRequest(body: SpawnRequest): AgentOptions {
     worktree = body.branch ? { branch: body.branch } : true;
   }
 
-  return {
+  const opts: AgentOptions = {
     provider,
     model: body.model,
     agentName: body.agent,
@@ -143,6 +144,8 @@ export function mapSpawnRequest(body: SpawnRequest): AgentOptions {
     worktree,
     ...(body.noWait ? { waitForReady: false } : {}),
   };
+  validateOptions(opts);
+  return opts;
 }
 
 /** The body shape `POST /sessions/:id/wait` accepts. */

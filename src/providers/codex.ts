@@ -34,6 +34,15 @@ export class CodexAdapter implements ProviderAdapter {
     // Inject persona/system prompt as AGENTS.md (auto-loaded, also user-visible).
     if (ctx.systemPrompt && ctx.systemPrompt.trim().length > 0) {
       const target = path.join(ctx.cwd, 'AGENTS.md');
+      try {
+        await fs.access(target);
+        throw new Error(
+          `refusing to overwrite existing AGENTS.md in ${ctx.cwd}; orc injects a Codex persona there on spawn — remove the file or use a different cwd`,
+        );
+      } catch (e) {
+        if (e instanceof Error && e.message.startsWith('refusing to overwrite')) throw e;
+        /* ENOENT — safe to write */
+      }
       await Bun.write(target, `${ctx.systemPrompt.trim()}\n`);
     }
   }

@@ -23,6 +23,7 @@ export {
   validateWorkflowDef,
   interpolate,
   evaluateStep,
+  stepOutcomeFromWait,
   runnerTmuxName,
   reconcileRunStatus,
   reconcileRun,
@@ -39,6 +40,7 @@ export type {
   RunWorkflowOptions,
   StepExecutor,
 } from './workflow.ts';
+export { assertValidRunId } from './paths.ts';
 export { writeRun, readRun, listRuns } from './runs.ts';
 export type {
   Provider,

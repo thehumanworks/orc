@@ -7,6 +7,7 @@ import {
   validateWorkflowDef,
   interpolate,
   evaluateStep,
+  stepOutcomeFromWait,
   runWorkflow,
   deliverInstructions,
   runnerTmuxName,
@@ -175,6 +176,25 @@ describe('evaluateStep — yield is NOT success', () => {
   });
   test('non-worktree, no predicate, non-done state: honest failure (not unverified)', () => {
     expect(evaluateStep({}, { ...base, state: 'failed' })).toEqual({ ok: false, unverified: false });
+  });
+});
+
+describe('stepOutcomeFromWait / wait timeout', () => {
+  const ctx = { commitsAhead: 0, capture: '' };
+
+  test('timeout with last state done yields ok:false (no unverified success)', () => {
+    expect(stepOutcomeFromWait({}, { state: 'done', settled: false }, ctx)).toEqual({
+      state: 'done',
+      ok: false,
+    });
+  });
+
+  test('settled done without predicate still uses evaluateStep (unverified when ok)', () => {
+    expect(stepOutcomeFromWait({}, { state: 'done', settled: true }, ctx)).toEqual({
+      state: 'done',
+      ok: true,
+      unverified: true,
+    });
   });
 });
 

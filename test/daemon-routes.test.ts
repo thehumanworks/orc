@@ -64,6 +64,9 @@ describe('mapSpawnRequest — request → AgentOptions', () => {
   test('missing provider throws', () => {
     expect(() => mapSpawnRequest({})).toThrow(/provider is required/);
   });
+  test('rejects invalid provider', () => {
+    expect(() => mapSpawnRequest({ provider: 'gpt' as 'claude' })).toThrow(/invalid provider/);
+  });
   test('maps agent→agentName and passes prompt/model/cwd/workspace', () => {
     const o = mapSpawnRequest({
       provider: 'codex',

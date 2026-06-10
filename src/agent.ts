@@ -11,7 +11,7 @@ import { sanitizeTmuxName } from './drivers/tmux.ts';
 import { getProvider } from './providers/provider.ts';
 import type { BuildCtx } from './providers/provider.ts';
 import { effectiveAgentModel, resolveAgentDef } from './agentdefs.ts';
-import { createWorktree, gitToplevel, isInsideGitRepo } from './worktree.ts';
+import { createWorktree, gitToplevel, isInsideGitRepo, removeWorktree } from './worktree.ts';
 import { removeRecord, reserveRecord, upsertRecord, validateAlias } from './registry.ts';
 import { piSessionDir } from './paths.ts';
 import { Session } from './session.ts';
@@ -168,7 +168,12 @@ export async function agent(opts: AgentOptions): Promise<Session> {
       record = launched;
     }
   } catch (e) {
-    if (!spawned) await removeRecord(shortId).catch(() => {});
+    if (!spawned) {
+      if (worktreePath) {
+        await removeWorktree(workspace, worktreePath).catch(() => {});
+      }
+      await removeRecord(shortId).catch(() => {});
+    }
     throw e;
   }
 

@@ -124,6 +124,18 @@ describe('daemon over a live loopback socket', () => {
     expect(res.status).toBe(404);
   });
 
+  test('POST /sessions with invalid provider → 400 (not 500)', async () => {
+    const s = start({ secret: 'topsecret', allowlist: ['mini'], whois: async () => null });
+    const res = await fetch(url(s, '/sessions'), {
+      method: 'POST',
+      headers: { 'x-orc-secret': 'topsecret', 'content-type': 'application/json' },
+      body: JSON.stringify({ provider: 'gpt' }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error?: string };
+    expect(body.error).toMatch(/invalid provider/);
+  });
+
   test('/sessions/:id/read applies cursor selection to parsed transcripts', async () => {
     const transcript = path.join(home, 'claude-read.jsonl');
     await fs.writeFile(

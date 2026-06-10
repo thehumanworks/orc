@@ -7,11 +7,12 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { runsDir, runPath } from './paths.ts';
+import { assertValidRunId, runsDir, runPath } from './paths.ts';
 import type { WorkflowRun } from './workflow.ts';
 
 /** Write (or overwrite) a run record atomically. */
 export async function writeRun(run: WorkflowRun): Promise<void> {
+  assertValidRunId(run.id);
   const dir = runsDir();
   await fs.mkdir(dir, { recursive: true });
   const target = runPath(run.id);
@@ -20,8 +21,9 @@ export async function writeRun(run: WorkflowRun): Promise<void> {
   await fs.rename(tmp, target);
 }
 
-/** Read a single run record by id. Missing/corrupt => null. */
+/** Read a single run record by id. Invalid id throws; missing/corrupt => null. */
 export async function readRun(runId: string): Promise<WorkflowRun | null> {
+  assertValidRunId(runId);
   const f = Bun.file(runPath(runId));
   if (!(await f.exists())) return null;
   try {
