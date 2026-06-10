@@ -137,7 +137,7 @@ Usage:
 spawn options:
   --provider, -p <p>     claude | codex | pi (required)
   --model, -m <model>    model name
-  --agent <name>         named agent definition (mutually exclusive with --system-prompt)
+  --agent <name>         named agent definition (codex TOML matched by name; mutually exclusive with --system-prompt)
   --system-prompt <txt>  system prompt text
   --system-prompt-mode   append (default) | replace
   --prompt <txt | ->     initial prompt sent after boot (- reads stdin)

@@ -32,7 +32,7 @@ orc/
     session.ts            # Session handle class (send/capture/transcript/attachCommand/kill/status)
     registry.ts           # persist + reconcile session records; workspace association
     worktree.ts           # git worktree create/remove + collision-safe naming
-    agentdefs.ts          # resolve claude/codex agent .md (project .claude/agents → user ~/.claude/agents)
+    agentdefs.ts          # resolve named agent definitions (codex TOML/prompts, claude agent md)
     drivers/
       driver.ts           # Driver interface + factory
       tmux.ts             # TmuxDriver
@@ -110,10 +110,11 @@ class Session {
 ## Validation rules (in `agent()`)
 1. `provider` required, ∈ {claude,codex,pi}.
 2. `agentName` and `systemPrompt` are **mutually exclusive** → throw on both (matches spec).
-3. `agentName` for `provider=codex|pi`: resolve the agent's markdown body ourselves (see agentdefs);
-   if it resolves, feed it as the system prompt for that provider (codex→AGENTS.md;
-   pi→--append-system-prompt). If it can't be resolved to a body → throw a clear error:
-   `provider=<p> has no native named agents; pass systemPrompt or use provider=claude`.
+3. `agentName` for `provider=codex|pi`: resolve the agent body ourselves (see agentdefs).
+   For codex, search project/user `.codex/agents/*.toml` by parsed `name` first, then
+   legacy `.codex/prompts/<name>.md`, then claude agent markdown. Codex TOML agents inject
+   `developer_instructions` and may supply the effective model when `opts.model` is omitted.
+   For pi, search claude agent markdown. If no body resolves → throw a clear error.
 4. `worktree` requires cwd to be inside a git repo.
 
 ## Boot + multi-line send (decided recipe — from research D.13/D.13b)

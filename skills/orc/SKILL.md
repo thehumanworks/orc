@@ -113,12 +113,13 @@ reuse it with `orc spawn --agent <name>`:
 
 - `claude` resolves a named agent natively from `.claude/agents/<name>.md` (project) or
   `~/.claude/agents/<name>.md` (user).
-- `codex` resolves `.codex/prompts/<name>.md` (under `$CODEX_HOME`, default `~/.codex`), then the
+- `codex` resolves `.codex/agents/*.toml` by parsed `name` first (project, then
+  `$CODEX_HOME/agents`, default `~/.codex/agents`), then `.codex/prompts/<name>.md`, then the
   claude locations; `pi` resolves the claude locations. orc injects the agent's body as the system
   prompt.
 
 Treat these definitions as **living artifacts**: when a specialized subagent underperforms, edit its
-`.md` and improve it — that's how the fleet gets better over time. A good agent definition states the
+`.toml` or `.md` and improve it — that's how the fleet gets better over time. A good agent definition states the
 role, the standards it holds, what to focus on, and what "done" means for it. (`--agent` and a raw
 `--system-prompt` are mutually exclusive; use `--agent` for anything reusable.)
 

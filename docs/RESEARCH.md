@@ -102,6 +102,12 @@ Treat a claude-style `agentName` as **unsupported for codex in v1, but degrade g
 2. If only a bare `agentName` string is given and we can't resolve a body, **error with a clear message**: `provider=codex does not support named agents; pass a systemPrompt or use provider=claude`.
 Do NOT silently map `agentName` to codex `--profile` — that conflates persona with config and would surprise users.
 
+**2026-06 update:** current Codex custom subagent definitions are standalone TOML files in
+project `.codex/agents/` or user `$CODEX_HOME/agents` / `~/.codex/agents`, identified by their
+parsed `name` field. orc now resolves those for `provider=codex` before the legacy markdown prompt
+stores, injects `developer_instructions`, and uses the TOML `model` only when the caller omitted
+`--model`.
+
 ### B.6 pi — closest concept
 
 pi has **no named-agent persona** either. It has `skills/` (SKILL.md, e.g. `~/.pi/agent/skills/dagu/`), `extensions/` (e.g. `pi-goal-extension`), and `--prompt-template` files. Closest analog to "agent persona" is `--system-prompt` / `--append-system-prompt` (see C) or a prompt-template. pi is secondary; recommend same strategy as codex — resolve the agent body ourselves and feed via `--append-system-prompt`.
@@ -421,7 +427,7 @@ pi -a --model <model> --append-system-prompt <resolvedSystemPrompt> \
 
 ### agentName resolution behavior (per provider)
 - **claude:** native. `--agent <bareName>`; resolution project `.claude/agents/` → user `~/.claude/agents/` (`name:` frontmatter / filename). We may also resolve the agent .md ourselves to reuse cross-provider.
-- **codex:** no native named agent. Resolve the agent's markdown body ourselves and inject as `AGENTS.md` in the worktree (or `-c experimental_instructions_file=<tmp>`). If only a bare name with no resolvable body → **error clearly**. Never map to `--profile`.
+- **codex:** resolve project/user `.codex/agents/*.toml` by parsed `name` first, then legacy `.codex/prompts/<name>.md`, then claude agent markdown; inject TOML `developer_instructions` or the markdown body as `AGENTS.md`. TOML `model` is used only when the caller omitted `--model`. Never map `agentName` to `--profile`.
 - **pi:** no native named agent. Same as codex — feed resolved body via `--append-system-prompt`.
 
 ### systemPrompt default

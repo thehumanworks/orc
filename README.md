@@ -145,11 +145,13 @@ await session.kill({ removeWorktree: true });
 | provider | resolution order |
 | --- | --- |
 | claude | native `--agent <name>` (project `.claude/agents/` → user `~/.claude/agents/`) |
-| codex  | project `.codex/prompts/<name>.md` → user `$CODEX_HOME/prompts/<name>.md` → `.claude/agents/<name>.md` → `~/.claude/agents/<name>.md` |
+| codex  | project `.codex/agents/*.toml` (matched by `name`) → user `$CODEX_HOME/agents/*.toml` → project `.codex/prompts/<name>.md` → user `$CODEX_HOME/prompts/<name>.md` → `.claude/agents/<name>.md` → `~/.claude/agents/<name>.md` |
 | pi     | project `.claude/agents/<name>.md` → user `~/.claude/agents/<name>.md` |
 
-For codex/pi the resolved markdown body becomes the injected system prompt (codex → `AGENTS.md`;
-pi → `--append-system-prompt`). A bare `agentName` with no resolvable definition throws a clear error
+For codex/pi the resolved body becomes the injected system prompt (codex TOML uses
+`developer_instructions`; markdown uses the file body; codex → `AGENTS.md`; pi →
+`--append-system-prompt`). If a Codex TOML agent supplies `model`, orc uses it only when
+`--model` was omitted. A bare `agentName` with no resolvable definition throws a clear error
 listing the locations searched. `agentName` and `systemPrompt` are mutually exclusive.
 
 First-run workspace-trust dialogs (claude/codex) are auto-confirmed with `Enter` at boot — `orc`

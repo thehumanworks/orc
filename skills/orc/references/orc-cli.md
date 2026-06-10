@@ -36,10 +36,10 @@ state detection is reliable.
 ## Named agents (specialized, reusable subagents)
 `orc spawn --agent <name>` resolves a definition and injects its body as the system prompt:
 - **claude**: native `--agent` — `./.claude/agents/<name>.md` then `~/.claude/agents/<name>.md`
-- **codex**: `./.codex/prompts/<name>.md` → `$CODEX_HOME/prompts/<name>.md` (default `~/.codex/prompts`) → the claude locations (injected via `AGENTS.md`)
+- **codex**: `./.codex/agents/*.toml` by parsed `name` → `$CODEX_HOME/agents/*.toml` (default `~/.codex/agents`) → `./.codex/prompts/<name>.md` → `$CODEX_HOME/prompts/<name>.md` → the claude locations (injected via `AGENTS.md`)
 - **pi**: the claude locations (injected via `--append-system-prompt`)
 
-Edit these `.md` files to iterate on a role over time.
+Edit these `.toml` or `.md` files to iterate on a role over time.
 
 ## Workflows
 | command | purpose |

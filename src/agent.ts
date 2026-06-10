@@ -10,7 +10,7 @@ import { getDriver } from './drivers/driver.ts';
 import { sanitizeTmuxName } from './drivers/tmux.ts';
 import { getProvider } from './providers/provider.ts';
 import type { BuildCtx } from './providers/provider.ts';
-import { resolveAgentDef } from './agentdefs.ts';
+import { effectiveAgentModel, resolveAgentDef } from './agentdefs.ts';
 import { createWorktree, gitToplevel, isInsideGitRepo } from './worktree.ts';
 import { upsertRecord } from './registry.ts';
 import { piSessionDir } from './paths.ts';
@@ -50,6 +50,7 @@ export async function agent(opts: AgentOptions): Promise<Session> {
 
   // Resolve system prompt: explicit systemPrompt, OR (codex/pi) the agentName body.
   let resolvedSystemPrompt = opts.systemPrompt;
+  let effectiveModel = opts.model;
   let nativeAgentName: string | undefined;
 
   if (opts.agentName) {
@@ -58,12 +59,12 @@ export async function agent(opts: AgentOptions): Promise<Session> {
       nativeAgentName = opts.agentName;
     } else {
       // codex/pi have no native launch-time named-agent flag, so resolve the agent's
-      // markdown body ourselves (codex's own prompt store first, then claude agents).
+      // prompt body ourselves (codex's own agent/prompt stores first, then claude agents).
       const def = await resolveAgentDef(opts.agentName, baseCwd, provider);
       if (!def || def.body.trim().length === 0) {
         const looked =
           provider === 'codex'
-            ? '.codex/prompts/, ~/.codex/prompts/, .claude/agents/, ~/.claude/agents/'
+            ? '.codex/agents/, $CODEX_HOME/agents/, .codex/prompts/, $CODEX_HOME/prompts/, .claude/agents/, ~/.claude/agents/'
             : '.claude/agents/, ~/.claude/agents/';
         throw new Error(
           `agentName "${opts.agentName}" not found for provider=${provider} ` +
@@ -71,6 +72,7 @@ export async function agent(opts: AgentOptions): Promise<Session> {
         );
       }
       resolvedSystemPrompt = def.body;
+      effectiveModel = effectiveAgentModel(opts.model, def, provider);
     }
   }
 
@@ -115,7 +117,7 @@ export async function agent(opts: AgentOptions): Promise<Session> {
   }
 
   const ctx: BuildCtx = {
-    model: opts.model,
+    model: effectiveModel,
     sessionId,
     systemPrompt: resolvedSystemPrompt,
     systemPromptMode,
@@ -133,7 +135,7 @@ export async function agent(opts: AgentOptions): Promise<Session> {
     id: shortId,
     sessionId,
     provider,
-    model: opts.model,
+    model: effectiveModel,
     agentName: opts.agentName,
     tmuxName,
     cwd,
