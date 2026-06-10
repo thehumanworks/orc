@@ -74,6 +74,9 @@ be targeted at another host with `orc --host <h> <command>` (see Daemon).
 | `--branch <b>` | worktree branch name |
 | `--no-wait` | return immediately; skip the boot wait **and** the initial-prompt send |
 
+If `--worktree` is used and spawn fails before the agent boots (driver error, provider prep, etc.),
+orc removes the new worktree and drops the registry record so nothing is left behind.
+
 ### Examples
 
 ```sh
@@ -143,8 +146,9 @@ await session.kill({ removeWorktree: true });
   conversation from disk; `orc read --raw` is the live-pane escape hatch.
   (An earlier note claimed the file was title-only — that was wrong.)
 - **codex** — no launch-time `--agent` flag and no `--session-id`. A persona/system prompt (or a
-  resolved `agentName` body) is written to `AGENTS.md` in the cwd. Transcript discovered by matching
-  the rollout file's `cwd` with an mtime guard.
+  resolved `agentName` body) is written to `AGENTS.md` in the cwd when that file does **not** already
+  exist; orc **refuses to overwrite** an existing `AGENTS.md` (use another cwd or remove the file).
+  Transcript discovered by matching the rollout file's `cwd` with an mtime guard.
 - **pi** — `--append-system-prompt` (or `--system-prompt`); `--session-id` + `--session-dir`.
   Transcript resolved by globbing the session id.
 
@@ -313,6 +317,14 @@ A step's `cwd` (and `prompt`/`taskFile`) may interpolate a prior step's result f
 | `done(ctx)` | success predicate over `{ state, commitsAhead, capture }` |
 | `continueOnFail` | default false → a failed step stops the run |
 
+**Run ids.** Minted ids and optional `orc workflow run … --run-id <id>` must be non-empty, at most
+128 characters, and use only letters, digits, hyphen, and underscore (no path separators). Invalid
+ids are rejected before writing under `~/.orc/runs/` or naming `orc-wf-<runId>`.
+
+**Per-step timeout.** When a step's `waitFor` hits `timeoutMs` without debounced settle, the step is
+**failed** (`ok: false`) even if the last observed pane state was `done` — a timeout is not treated
+as unverified success.
+
 ### Reliability — a yield is **not** success
 
 `state === 'done'` means the turn **yielded** (ready for input), not that it succeeded: an agent that
@@ -348,7 +360,9 @@ orc list --all-hosts            # fleet view across local + trusted peers
 ```
 
 The daemon is a thin JSON/HTTP layer over the SDK (`/sessions`, `/sessions/:id/{read,send,wait,kill}`,
-`/workflows/*`), so a remote agent's lifecycle is identical to a local one.
+`/workflows/*`), so a remote agent's lifecycle is identical to a local one. Malformed requests (e.g.
+`POST /sessions` without a valid `provider`, invalid `for` on wait, bad workflow `file`) return
+**HTTP 400** with `{"error":"…"}` — the same validation messages the local CLI would print.
 
 **Security.** The daemon binds to the host's **tailscale interface only** (a `100.x` WireGuard
 address the tailnet won't route from off-net); it **refuses** to bind a public/LAN address without an

@@ -156,7 +156,8 @@ Decided argv (research A.4 / RECOMMENDATIONS):
   - readyMatch: pane includes `bypass permissions on` or the `❯` box. trustDialog: includes `trust this folder` / `Is this a project you created`.
   - transcript: glob `~/.claude/projects/*/<sid>.jsonl` (do NOT recompute slug).
 - **codex:** `codex --dangerously-bypass-approvals-and-sandbox [-m M]`
-  - systemPrompt/agentName-body → write `AGENTS.md` into cwd in `prepare()`. No --session-id.
+  - systemPrompt/agentName-body → write `AGENTS.md` into cwd in `prepare()` only if absent; refuse
+    to overwrite an existing file. No --session-id.
   - readyMatch: pane includes the model line / `›` input box. trustDialog: includes `trust the contents of this directory`.
   - transcript: newest `~/.codex/sessions/Y/M/D/rollout-*.jsonl` whose first-line session_meta.payload.cwd == realpath(cwd) AND mtime > createdAt. Never `--ephemeral`.
 - **pi:** `pi -a [--model M] [--append-system-prompt P | --system-prompt P] --session-id SID --session-dir <orc sessions dir>`
