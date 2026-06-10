@@ -122,7 +122,7 @@ Usage:
   orc spawn  --provider <claude|codex|pi> [options]   Launch a new agent session
              aliases: agent, new
   orc send   <id|name> [PROMPT | - | @file]           Send a prompt (multi-line safe)
-  orc read   <id|name> [--raw]                        Parsed transcript (default) or full pane (--raw)
+  orc read   <id|name> [--last|--index N|--full|--raw]  Latest parsed turn by default; --full = full transcript; --raw = full pane
   orc state  <id|name>                                Classify state once: starting|running|done|waiting|failed
   orc wait   <id|name> [--for S] [--timeout SEC]      Block until the agent settles (S: done|waiting|failed|settled)
   orc list   [--workspace W | --all | --dead | --all-hosts]  List sessions (alias: ps)
@@ -190,7 +190,9 @@ Global:
   --host <h>            Run the command against the daemon on host <h> (see above)
   --json                machine-readable output; non-zero exit + {error} on failure
 
-read --json emits the parsed turn array ([{role,text},...]); --raw --json emits
+read defaults to the latest parsed conversation turn. --full emits the full parsed
+transcript, --index N emits zero-based parsed turn N, and --raw emits the full pane.
+read --json emits the selected parsed turn array ([{role,text},...]); --raw --json emits
 {id,pane}; if no transcript exists yet it falls back to {id,fallback:true,pane}.
 state --json emits {id,state}. wait --json emits {id,state,elapsedMs,timedOut};
 exit 0 iff the requested state actually settled after debounce, non-zero on timeout.

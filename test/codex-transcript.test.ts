@@ -86,4 +86,57 @@ describe('codex resolveTranscript', () => {
     const resolved = await runResolver(home, JSON.stringify(rec));
     expect(resolved).toBeNull();
   });
+
+  test('prefers session_meta timestamp over newest mtime for same-cwd sessions', async () => {
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), 'orc-codexhome-'));
+    tmpDirs.push(home);
+    const sessDir = path.join(home, '.codex', 'sessions', '2026', '06', '10');
+    await fs.mkdir(sessDir, { recursive: true });
+
+    const targetCwd = '/private/tmp/orc-codex-work';
+    const parentFile = path.join(sessDir, 'rollout-2026-06-10T09-47-47-parent.jsonl');
+    await fs.writeFile(
+      parentFile,
+      `${JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: 'parent',
+          cwd: targetCwd,
+          timestamp: '2026-06-10T09:47:47.384Z',
+        },
+      })}\n`,
+    );
+
+    const childFile = path.join(sessDir, 'rollout-2026-06-10T09-52-31-child.jsonl');
+    await fs.writeFile(
+      childFile,
+      `${JSON.stringify({
+        type: 'session_meta',
+        payload: {
+          id: 'child',
+          cwd: targetCwd,
+          timestamp: '2026-06-10T09:52:31.500Z',
+        },
+      })}\n`,
+    );
+
+    // Regression guard: the parent keeps writing later, so mtime alone would pick it.
+    const olderMtime = new Date('2026-06-10T09:52:32.000Z');
+    const newerMtime = new Date('2026-06-10T09:55:00.000Z');
+    await fs.utimes(childFile, olderMtime, olderMtime);
+    await fs.utimes(parentFile, newerMtime, newerMtime);
+
+    const rec = {
+      id: 'abcd1234',
+      sessionId: 'abcd1234-0000-0000-0000-000000000000',
+      provider: 'codex',
+      tmuxName: 'orc-codex-abcd1234',
+      cwd: targetCwd,
+      workspace: targetCwd,
+      createdAt: '2026-06-10T09:52:31.277Z',
+    };
+
+    const resolved = await runResolver(home, JSON.stringify(rec));
+    expect(resolved).toBe(childFile);
+  });
 });

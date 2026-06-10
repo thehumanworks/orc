@@ -99,7 +99,7 @@ class Session {
   capture(opts?: { scrollback?: boolean }): Promise<string>;  // tmux capture-pane
   transcript(): Promise<string | null>;              // path to on-disk JSONL (provider-resolved)
   readTranscript(): Promise<string | null>;          // raw JSONL contents
-  readParsed(): Promise<Turn[]>;                      // token-efficient parsed turns (default `orc read`)
+  readParsed(): Promise<Turn[]>;                      // full token-efficient parsed turns (`orc read --full`)
   attach(opts?: { readOnly?: boolean }): Promise<number>;     // exec `tmux attach [-r] -t <name>`
   attachCommand(opts?: { readOnly?: boolean }): string;       // command string for JSON/script output
   kill(opts?: { removeWorktree?: boolean }): Promise<void>;   // kill tmux session (+ optional worktree)
@@ -204,7 +204,7 @@ orc spawn  --provider <p> [--model M] [--agent NAME | --system-prompt P] [--prom
            [--cwd DIR] [--workspace W] [--worktree [--branch B]] [--no-wait] [--json]
            # prints the SessionRecord (human or json). Alias: `orc agent`, `orc new`.
 orc send   <id|name> [PROMPT | - | @file] [--json]      # multi-line safe; piped stdin or '-' if PROMPT omitted
-orc read   <id|name> [--raw] [--json]                   # parsed transcript (default) or full pane (--raw)
+orc read   <id|name> [--last|--index N|--full|--raw] [--json] # latest parsed turn (default), selected/full transcript, or full pane
 orc list   [--workspace W | --all | --dead] [--json]    # active sessions for a workspace. Alias: `orc ps`.
 orc attach <id|name> [--read-only] [--json]             # attaches locally; --json prints `tmux attach ...`
 orc kill   <id|name> [--worktree] [--purge] [--json]    # mark session dead (keep record); --purge removes record

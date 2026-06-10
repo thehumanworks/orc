@@ -6,6 +6,7 @@
  */
 import type { SessionRecord } from '../types.ts';
 import type { Turn } from '../transcript.ts';
+import type { TurnSelection } from '../transcript.ts';
 import type { WorkflowRun } from '../workflow.ts';
 import { DEFAULT_DAEMON_PORT } from './peers.ts';
 
@@ -143,9 +144,19 @@ export class DaemonClient {
     return this.post(`/sessions/${encodeURIComponent(id)}/wait`, body) as Promise<WaitResult>;
   }
 
-  async read(id: string, opts?: { raw?: boolean }): Promise<ReadResult> {
-    const qs = opts?.raw ? '?raw=1' : '';
-    return this.get(`/sessions/${encodeURIComponent(id)}/read${qs}`) as Promise<ReadResult>;
+  async read(id: string, opts?: { raw?: boolean; selection?: TurnSelection }): Promise<ReadResult> {
+    const q = new URLSearchParams();
+    if (opts?.raw) {
+      q.set('raw', '1');
+    } else if (opts?.selection?.mode === 'full') {
+      q.set('full', '1');
+    } else if (opts?.selection?.mode === 'index') {
+      q.set('index', String(opts.selection.index));
+    }
+    const qs = q.toString();
+    return this.get(
+      `/sessions/${encodeURIComponent(id)}/read${qs ? `?${qs}` : ''}`,
+    ) as Promise<ReadResult>;
   }
 
   async kill(

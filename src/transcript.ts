@@ -2,8 +2,8 @@
  * Token-efficient transcript parsing. Each provider writes a JSONL message log to
  * disk; we normalize it into a flat list of `Turn`s — the conversation text plus
  * ONE-LINE tool-call summaries — dropping raw tool output, reasoning/thinking, and
- * all UI chrome. This is what `orc read` shows by default (the raw tmux pane is the
- * `--raw` escape hatch).
+ * all UI chrome. `orc read` selects from this compact view by default (the raw tmux
+ * pane is the `--raw` escape hatch).
  */
 import type { Provider } from './types.ts';
 
@@ -15,8 +15,27 @@ export interface Turn {
   text: string;
 }
 
+export type TurnSelection =
+  | { mode: 'latest' }
+  | { mode: 'full' }
+  | { mode: 'index'; index: number };
+
 const HINT_MAX = 60;
 const PATH_MAX = 48;
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+function asRecord(v: unknown): Record<string, unknown> {
+  return isRecord(v) ? v : {};
+}
+
+function nonEmptyText(v: unknown): string | null {
+  if (typeof v !== 'string') return null;
+  const text = v.trim();
+  return text.length > 0 ? text : null;
+}
 
 /** Collapse all whitespace runs to single spaces. */
 function oneLine(s: string): string {
@@ -57,36 +76,24 @@ function parseLines(jsonl: string): unknown[] {
 // ---------------------------------------------------------------------------
 
 /** One-line summary for a claude tool_use block (name + a short arg hint). */
-function claudeToolSummary(name: string, input: Record<string, unknown>): string {
-  if (name === 'Bash' && typeof input.command === 'string') {
-    return `Bash: ${hint(input.command)}`;
+function claudeToolSummary(name: string, input: unknown): string {
+  const args = asRecord(input);
+  if (name === 'Bash' && typeof args.command === 'string') {
+    return `Bash: ${hint(args.command)}`;
   }
   // File tools (Read/Write/Edit/NotebookEdit/…): `<Name> <path>`.
-  if (typeof input.file_path === 'string') {
-    return `${name} ${shortenPath(input.file_path)}`;
+  if (typeof args.file_path === 'string') {
+    return `${name} ${shortenPath(args.file_path)}`;
   }
-  if (typeof input.pattern === 'string') {
-    return `${name}: ${hint(input.pattern)}`;
+  if (typeof args.pattern === 'string') {
+    return `${name}: ${hint(args.pattern)}`;
   }
   // Generic single-line hint from the most descriptive string field present.
   for (const key of ['command', 'query', 'url', 'prompt', 'description']) {
-    const v = input[key];
+    const v = args[key];
     if (typeof v === 'string') return `${name}: ${hint(v)}`;
   }
   return name;
-}
-
-interface ClaudeBlock {
-  type?: string;
-  text?: string;
-  name?: string;
-  input?: Record<string, unknown>;
-}
-
-interface ClaudeLine {
-  type?: string;
-  isSidechain?: boolean;
-  message?: { content?: string | ClaudeBlock[] };
 }
 
 /**
@@ -100,11 +107,11 @@ interface ClaudeLine {
 export function parseClaude(jsonl: string): Turn[] {
   const turns: Turn[] = [];
   for (const raw of parseLines(jsonl)) {
-    const o = raw as ClaudeLine;
-    if (o.isSidechain === true) continue;
-    if (o.type !== 'user' && o.type !== 'assistant') continue;
-    const content = o.message?.content;
-    const role: TurnRole = o.type;
+    if (!isRecord(raw)) continue;
+    if (raw.isSidechain === true) continue;
+    if (raw.type !== 'user' && raw.type !== 'assistant') continue;
+    const content = asRecord(raw.message).content;
+    const role: TurnRole = raw.type;
 
     if (typeof content === 'string') {
       const text = content.trim();
@@ -120,15 +127,16 @@ export function parseClaude(jsonl: string): Turn[] {
       if (t) turns.push({ role, text: t });
       pending = '';
     };
-    for (const block of content) {
-      if (block.type === 'text' && typeof block.text === 'string') {
-        pending += (pending ? '\n' : '') + block.text;
+    for (const rawBlock of content) {
+      if (!isRecord(rawBlock)) continue;
+      if (rawBlock.type === 'text' && typeof rawBlock.text === 'string') {
+        pending += (pending ? '\n' : '') + rawBlock.text;
       } else if (
-        (block.type === 'tool_use' || block.type === 'server_tool_use') &&
-        typeof block.name === 'string'
+        (rawBlock.type === 'tool_use' || rawBlock.type === 'server_tool_use') &&
+        typeof rawBlock.name === 'string'
       ) {
         flush();
-        turns.push({ role: 'tool', text: claudeToolSummary(block.name, block.input ?? {}) });
+        turns.push({ role: 'tool', text: claudeToolSummary(rawBlock.name, rawBlock.input) });
       }
       // tool_result / thinking / advisor_tool_result / others: dropped.
     }
@@ -143,12 +151,13 @@ export function parseClaude(jsonl: string): Turn[] {
 
 /** One-line summary for a codex tool call (name + a short arg hint). */
 function codexToolSummary(name: string, argsRaw: string): string {
-  let args: Record<string, unknown> = {};
+  let parsed: unknown = {};
   try {
-    args = JSON.parse(argsRaw) as Record<string, unknown>;
+    parsed = JSON.parse(argsRaw);
   } catch {
     // Non-JSON arg payload — fall through to the bare name.
   }
+  const args = asRecord(parsed);
   let cmd = args.cmd;
   if (cmd == null && args.command != null) {
     cmd = Array.isArray(args.command) ? args.command.join(' ') : args.command;
@@ -156,6 +165,9 @@ function codexToolSummary(name: string, argsRaw: string): string {
   if (typeof cmd === 'string') return `${name}: ${hint(cmd)}`;
   for (const v of Object.values(args)) {
     if (typeof v === 'string') return `${name}: ${hint(v)}`;
+    if (Array.isArray(v) && v.every((item) => typeof item === 'string')) {
+      return `${name}: ${hint(v.join(' '))}`;
+    }
   }
   return name;
 }
@@ -169,16 +181,37 @@ const CODEX_CALL_TYPES = new Set([
   'web_search_call',
 ]);
 
-interface CodexLine {
-  type?: string;
-  payload?: {
-    type?: string;
-    message?: string;
-    name?: string;
-    arguments?: string;
-    input?: unknown;
-    action?: unknown;
-  };
+function codexMessageText(payload: Record<string, unknown>): string | null {
+  const direct = nonEmptyText(payload.message);
+  if (direct) return direct;
+
+  const content = payload.content;
+  if (typeof content === 'string') return nonEmptyText(content);
+  if (!Array.isArray(content)) return null;
+
+  const parts: string[] = [];
+  for (const rawBlock of content) {
+    if (!isRecord(rawBlock)) continue;
+    const text = nonEmptyText(rawBlock.text);
+    if (text) parts.push(text);
+  }
+  return parts.length > 0 ? parts.join('\n') : null;
+}
+
+function codexEventTurn(payload: Record<string, unknown>): Turn | null {
+  if (payload.type === 'user_message') {
+    const text = nonEmptyText(payload.message);
+    return text ? { role: 'user', text } : null;
+  }
+  if (payload.type === 'agent_message') {
+    const text = nonEmptyText(payload.message);
+    return text ? { role: 'assistant', text } : null;
+  }
+  return null;
+}
+
+function turnKey(turn: Turn): string {
+  return `${turn.role}\0${turn.text}`;
 }
 
 /**
@@ -192,32 +225,48 @@ interface CodexLine {
  */
 export function parseCodex(jsonl: string): Turn[] {
   const turns: Turn[] = [];
-  for (const raw of parseLines(jsonl)) {
-    const o = raw as CodexLine;
-    const p = o.payload;
-    if (!p) continue;
+  const lines = parseLines(jsonl);
+  const eventText = new Set<string>();
 
-    if (o.type === 'event_msg') {
-      if (p.type === 'user_message' && typeof p.message === 'string') {
-        const text = p.message.trim();
-        if (text) turns.push({ role: 'user', text });
-      } else if (p.type === 'agent_message' && typeof p.message === 'string') {
-        const text = p.message.trim();
-        if (text) turns.push({ role: 'assistant', text });
+  for (const raw of lines) {
+    if (!isRecord(raw) || raw.type !== 'event_msg') continue;
+    const event = codexEventTurn(asRecord(raw.payload));
+    if (event) eventText.add(turnKey(event));
+  }
+
+  for (const raw of lines) {
+    if (!isRecord(raw)) continue;
+    const p = asRecord(raw.payload);
+    if (Object.keys(p).length === 0) continue;
+
+    if (raw.type === 'event_msg') {
+      const event = codexEventTurn(p);
+      if (event) turns.push(event);
+      continue;
+    }
+
+    if (raw.type !== 'response_item' || typeof p.type !== 'string') continue;
+
+    if (p.type === 'message') {
+      const role = p.role === 'assistant' || p.role === 'user' ? p.role : undefined;
+      const text = codexMessageText(p);
+      if (role && text) {
+        const turn = { role, text } satisfies Turn;
+        if (!eventText.has(turnKey(turn))) turns.push(turn);
       }
       continue;
     }
 
-    if (o.type === 'response_item' && p.type && CODEX_CALL_TYPES.has(p.type)) {
+    if (CODEX_CALL_TYPES.has(p.type)) {
       const name = typeof p.name === 'string' ? p.name : p.type;
       // arguments (function_call) is a JSON string; custom tools carry `input`;
       // shell calls carry an `action`. Normalize to a JSON string for the summarizer.
-      let argsRaw = p.arguments;
+      let argsRaw = typeof p.arguments === 'string' ? p.arguments : undefined;
       if (typeof argsRaw !== 'string') {
         const fallback = p.input ?? p.action ?? {};
-        argsRaw = typeof fallback === 'string' ? fallback : JSON.stringify(fallback);
+        argsRaw = typeof fallback === 'string' ? fallback : JSON.stringify(fallback ?? {});
       }
-      turns.push({ role: 'tool', text: codexToolSummary(name, argsRaw) });
+      turns.push({ role: 'tool', text: codexToolSummary(name, argsRaw ?? '') });
     }
   }
   return turns;
@@ -226,23 +275,6 @@ export function parseCodex(jsonl: string): Turn[] {
 // ---------------------------------------------------------------------------
 // pi
 // ---------------------------------------------------------------------------
-
-interface PiBlock {
-  type?: string;
-  text?: string;
-  name?: string;
-  input?: Record<string, unknown>;
-}
-
-interface PiLine {
-  type?: string;
-  role?: string;
-  text?: string;
-  name?: string;
-  input?: Record<string, unknown>;
-  message?: { role?: string; content?: string | PiBlock[] } | string;
-  content?: string | PiBlock[];
-}
 
 /**
  * pi `<session-dir>/*_<sid>.jsonl`. UNVERIFIED: no pi transcript was available to
@@ -253,18 +285,19 @@ interface PiLine {
 export function parsePi(jsonl: string): Turn[] {
   const turns: Turn[] = [];
   for (const raw of parseLines(jsonl)) {
-    const o = raw as PiLine;
-    const msg = typeof o.message === 'object' && o.message ? o.message : undefined;
-    const role = (o.role ?? msg?.role ?? o.type) as string | undefined;
+    if (!isRecord(raw)) continue;
+    const msg = isRecord(raw.message) ? raw.message : undefined;
+    const role = (raw.role ?? msg?.role ?? raw.type) as string | undefined;
 
     // A standalone tool-call line.
-    if (o.type === 'tool_use' && typeof o.name === 'string') {
-      turns.push({ role: 'tool', text: claudeToolSummary(o.name, o.input ?? {}) });
+    if (raw.type === 'tool_use' && typeof raw.name === 'string') {
+      turns.push({ role: 'tool', text: claudeToolSummary(raw.name, raw.input) });
       continue;
     }
 
     if (role !== 'user' && role !== 'assistant') continue;
-    const content = o.content ?? (typeof o.message === 'string' ? o.message : msg?.content) ?? o.text;
+    const content =
+      raw.content ?? (typeof raw.message === 'string' ? raw.message : msg?.content) ?? raw.text;
 
     if (typeof content === 'string') {
       const text = content.trim();
@@ -278,12 +311,13 @@ export function parsePi(jsonl: string): Turn[] {
       if (t) turns.push({ role, text: t });
       pending = '';
     };
-    for (const block of content) {
-      if (block.type === 'text' && typeof block.text === 'string') {
-        pending += (pending ? '\n' : '') + block.text;
-      } else if (block.type === 'tool_use' && typeof block.name === 'string') {
+    for (const rawBlock of content) {
+      if (!isRecord(rawBlock)) continue;
+      if (rawBlock.type === 'text' && typeof rawBlock.text === 'string') {
+        pending += (pending ? '\n' : '') + rawBlock.text;
+      } else if (rawBlock.type === 'tool_use' && typeof rawBlock.name === 'string') {
         flush();
-        turns.push({ role: 'tool', text: claudeToolSummary(block.name, block.input ?? {}) });
+        turns.push({ role: 'tool', text: claudeToolSummary(rawBlock.name, rawBlock.input) });
       }
     }
     flush();
@@ -305,6 +339,47 @@ export function parseTranscript(provider: Provider, jsonl: string): Turn[] {
     case 'pi':
       return parsePi(jsonl);
   }
+}
+
+/**
+ * Split the flat parsed transcript into conversation turns. A new user message starts
+ * a new group; tool summaries and assistant text stay attached to the surrounding
+ * user turn so `orc read` can show useful context instead of a lone trailing tool.
+ */
+export function conversationTurns(turns: readonly Turn[]): Turn[][] {
+  const groups: Turn[][] = [];
+  let current: Turn[] = [];
+  for (const turn of turns) {
+    if (turn.role === 'user' && current.length > 0) {
+      groups.push(current);
+      current = [];
+    }
+    current.push(turn);
+  }
+  if (current.length > 0) groups.push(current);
+  return groups;
+}
+
+/** Select the full transcript, the latest conversation turn, or a zero-based turn. */
+export function selectTurns(
+  turns: readonly Turn[],
+  selection: TurnSelection = { mode: 'latest' },
+): Turn[] {
+  if (selection.mode === 'full') return turns.slice();
+  const groups = conversationTurns(turns);
+  if (groups.length === 0) {
+    if (selection.mode === 'index') {
+      throw new Error(`turn index ${selection.index} out of range (no parsed turns)`);
+    }
+    return [];
+  }
+
+  const index = selection.mode === 'index' ? selection.index : groups.length - 1;
+  if (!Number.isInteger(index) || index < 0 || index >= groups.length) {
+    const range = groups.length === 0 ? 'no parsed turns' : `available: 0..${groups.length - 1}`;
+    throw new Error(`turn index ${index} out of range (${range})`);
+  }
+  return groups[index]!.slice();
 }
 
 /**

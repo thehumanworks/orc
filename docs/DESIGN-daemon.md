@@ -37,7 +37,7 @@ per node. So:
 GET  /sessions?workspace=&all=&dead=     → list (each record gains a live `state` from F1)
 POST /sessions   {provider,model,agent,systemPrompt,prompt,worktree,cwd,workspace}  → spawn
 GET  /sessions/:id                       → record + state()
-GET  /sessions/:id/read?raw=             → parsed turns (or raw pane)        [reuses readParsed]
+GET  /sessions/:id/read?raw=&full=&last=&index=  → selected parsed turns (or raw pane) [reuses readParsed]
 POST /sessions/:id/send   {prompt}       → send
 POST /sessions/:id/wait   {for,timeoutMs}→ waitFor (long-poll)               [reuses F1]
 POST /sessions/:id/kill   {worktree,purge}

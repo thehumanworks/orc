@@ -24,6 +24,8 @@ import type { WorkflowDef, WorkflowRun, StepResult } from '../workflow.ts';
 import { readRun, listRuns, writeRun } from '../runs.ts';
 import { getDriver } from '../drivers/driver.ts';
 import { orcHome } from '../paths.ts';
+import { selectTurns } from '../transcript.ts';
+import type { TurnSelection } from '../transcript.ts';
 import { decideTrust, isAllowlisted } from './trust.ts';
 import type { Identity } from './trust.ts';
 import { whoisIdentity } from './tailscale.ts';
@@ -98,6 +100,25 @@ async function readJsonBody(req: Request): Promise<Record<string, unknown>> {
 
 function boolParam(v: string | null): boolean {
   return v === '1' || v === 'true' || v === 'yes';
+}
+
+function readSelectionFromParams(params: URLSearchParams): TurnSelection {
+  const full = boolParam(params.get('full'));
+  const last = boolParam(params.get('last'));
+  const indexRaw = params.get('index');
+  const selectionFlags = [full, last, indexRaw !== null].filter(Boolean).length;
+  if (selectionFlags > 1) {
+    throw new HttpError(400, 'full, last, and index are mutually exclusive');
+  }
+  if (indexRaw !== null) {
+    const index = Number(indexRaw);
+    if (!Number.isInteger(index) || index < 0) {
+      throw new HttpError(400, `invalid index '${indexRaw}' (non-negative integer)`);
+    }
+    return { mode: 'index', index };
+  }
+  if (full) return { mode: 'full' };
+  return { mode: 'latest' };
 }
 
 /**
@@ -250,11 +271,25 @@ async function dispatch(
       const session = await getSession(params.id!);
       if (!session) throw new HttpError(404, `no session found for '${params.id}'`);
       if (boolParam(url.searchParams.get('raw'))) {
+        if (
+          boolParam(url.searchParams.get('full')) ||
+          boolParam(url.searchParams.get('last')) ||
+          url.searchParams.has('index')
+        ) {
+          throw new HttpError(400, 'raw cannot be combined with full, last, or index');
+        }
         const pane = await session.capture({ scrollback: true });
         return json({ kind: 'raw', id: session.id, pane });
       }
+      const selection = readSelectionFromParams(url.searchParams);
       const turns = await session.readParsed();
-      if (turns.length > 0) return json({ kind: 'parsed', id: session.id, turns });
+      let selected;
+      try {
+        selected = selectTurns(turns, selection);
+      } catch (e) {
+        throw new HttpError(400, (e as Error).message);
+      }
+      if (turns.length > 0) return json({ kind: 'parsed', id: session.id, turns: selected });
       // Nothing on disk yet — fall back to the live pane (the CLI does the same).
       const pane = await session.capture();
       return json({ kind: 'fallback', id: session.id, pane });

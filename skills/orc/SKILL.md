@@ -40,7 +40,7 @@ orc spawn -p <claude|codex|pi> [--prompt P|-|@file] [--agent NAME] [--worktree] 
 orc send  <id> [PROMPT|-|@file]      # follow-up / steer (multi-line safe)
 orc state <id>                       # starting|running|done|waiting|failed (one shot)
 orc wait  <id> [--for done|settled]  # BLOCK until it settles (debounced — reliable)
-orc read  <id>                       # token-efficient parsed transcript ( --raw for the live pane )
+orc read  <id> [--full|--index N]     # latest parsed turn by default; --full transcript; --raw live pane
 orc list  [--all] [--json]           # what's running ( hygiene: audit before you finish )
 orc kill  <id> [--worktree] [--purge]; orc prune [--worktree]
 orc workflow run <file.ts> [--detach]; orc workflow logs <runId> [--step id]

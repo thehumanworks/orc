@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test';
-import { resolveCommand } from '../src/cli/index.ts';
+import { readSelectionFromFlags, resolveCommand } from '../src/cli/index.ts';
 
 describe('resolveCommand routing', () => {
   test('spawn aliases', () => {
@@ -25,5 +25,21 @@ describe('resolveCommand routing', () => {
   });
   test('unknown command', () => {
     expect(resolveCommand('frobnicate')).toBe('unknown');
+  });
+});
+
+describe('readSelectionFromFlags', () => {
+  test('defaults to latest and accepts explicit modes', () => {
+    expect(readSelectionFromFlags({})).toEqual({ mode: 'latest' });
+    expect(readSelectionFromFlags({ last: true })).toEqual({ mode: 'latest' });
+    expect(readSelectionFromFlags({ full: true })).toEqual({ mode: 'full' });
+    expect(readSelectionFromFlags({ index: '2' })).toEqual({ mode: 'index', index: 2 });
+  });
+
+  test('rejects invalid and conflicting selections', () => {
+    expect(() => readSelectionFromFlags({ index: '-1' })).toThrow(/invalid --index/);
+    expect(() => readSelectionFromFlags({ index: '1.2' })).toThrow(/invalid --index/);
+    expect(() => readSelectionFromFlags({ full: true, index: '0' })).toThrow(/mutually exclusive/);
+    expect(() => readSelectionFromFlags({ raw: true, full: true })).toThrow(/--raw cannot/);
   });
 });

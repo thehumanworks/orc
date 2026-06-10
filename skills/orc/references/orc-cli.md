@@ -10,7 +10,7 @@ Most commands accept `--json` (machine-readable; on error, exit non-zero + `{"er
 | --- | --- |
 | `orc spawn -p <claude\|codex\|pi> [opts]` | launch a session (aliases: `agent`, `new`). `--json` prints the record. |
 | `orc send <id\|name> [PROMPT \| - \| @file]` | send a prompt / slash command (multi-line safe). |
-| `orc read <id\|name> [--raw]` | parsed token-efficient transcript by default; `--raw` = full tmux pane. |
+| `orc read <id\|name> [--last\|--index N\|--full\|--raw]` | latest parsed conversation turn by default; `--full` = full parsed transcript; `--raw` = full tmux pane. |
 | `orc state <id\|name>` | classify once → `starting\|running\|done\|waiting\|failed`. |
 | `orc wait <id\|name> [--for done\|waiting\|failed\|settled] [--timeout SEC]` | block until settled (debounced). default `--for settled`. |
 | `orc list [--workspace W \| --all \| --dead \| --all-hosts]` | list sessions (alias `ps`). |
@@ -81,3 +81,4 @@ use the CLI for quick interactive steering.
 ## State & files
 - Registry + run records under `~/.orc` (override with `ORC_HOME` — use a temp dir for throwaway experiments).
 - A session's on-disk transcript is what `orc read` parses; it persists after `kill` (so post-mortem reads work).
+- `orc read` defaults to the latest parsed conversation turn. Use `--full` for the full parsed transcript, `--index N` for a zero-based conversation turn, and `--raw` for the full live pane.

@@ -9,7 +9,8 @@ import { parseArgs } from 'node:util';
 import type { ParseArgsConfig } from 'node:util';
 import { agent } from '../agent.ts';
 import { listSessions, getSession, pruneSessions } from '../index.ts';
-import { renderTurns } from '../transcript.ts';
+import { renderTurns, selectTurns } from '../transcript.ts';
+import type { TurnSelection } from '../transcript.ts';
 import {
   runWorkflow,
   runnerTmuxName,
@@ -137,6 +138,44 @@ function jsonFlag(values: Parsed['values']): boolean {
   return values.json === true;
 }
 
+export interface ReadFlagValues {
+  raw?: string | boolean;
+  full?: string | boolean;
+  last?: string | boolean;
+  index?: string | boolean;
+}
+
+export function readSelectionFromFlags(values: ReadFlagValues): TurnSelection {
+  const raw = values.raw === true;
+  const full = values.full === true;
+  const last = values.last === true;
+  const hasIndex = values.index !== undefined;
+
+  if (raw && (full || last || hasIndex)) {
+    throw new Error('--raw cannot be combined with --full, --last, or --index');
+  }
+
+  const selectionFlags = [full, last, hasIndex].filter(Boolean).length;
+  if (selectionFlags > 1) {
+    throw new Error('--full, --last, and --index are mutually exclusive');
+  }
+
+  if (hasIndex) {
+    const rawIndex = values.index;
+    if (typeof rawIndex !== 'string') {
+      throw new Error("invalid --index 'true' (non-negative integer)");
+    }
+    const index = Number(rawIndex);
+    if (!Number.isInteger(index) || index < 0) {
+      throw new Error(`invalid --index '${rawIndex}' (non-negative integer)`);
+    }
+    return { mode: 'index', index };
+  }
+
+  if (full) return { mode: 'full' };
+  return { mode: 'latest' };
+}
+
 async function cmdSpawn(args: string[]): Promise<number> {
   const { values } = parse(args, {
     provider: { type: 'string', short: 'p' },
@@ -255,9 +294,19 @@ async function cmdSend(args: string[]): Promise<number> {
 async function cmdRead(args: string[]): Promise<number> {
   const { values, positionals } = parse(args, {
     raw: { type: 'boolean' },
+    full: { type: 'boolean' },
+    last: { type: 'boolean' },
+    index: { type: 'string' },
     json: { type: 'boolean' },
   });
   const json = jsonFlag(values);
+  let selection: TurnSelection;
+  try {
+    selection = readSelectionFromFlags(values);
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
   const idOrName = positionals[0];
   if (!idOrName) {
     printError('read requires <id|name>', json);
@@ -284,11 +333,12 @@ async function cmdRead(args: string[]): Promise<number> {
     // Default: the token-efficient parsed transcript (conversation + one-line tool
     // summaries) read from the provider's on-disk JSONL.
     const turns = await session.readParsed();
+    const selected = selectTurns(turns, selection);
     if (turns.length > 0) {
       if (json) {
-        printJson(turns);
+        printJson(selected);
       } else {
-        process.stdout.write(`${renderTurns(turns)}\n`);
+        process.stdout.write(`${renderTurns(selected)}\n`);
       }
       return 0;
     }
@@ -734,8 +784,8 @@ async function cmdWorkflowAttach(args: string[]): Promise<number> {
 
 /**
  * `orc workflow logs <runId> [--step <id>] [--raw]` — read the actual work each step's
- * agent did. Default: the token-efficient parsed transcript per step (the same view as
- * `orc read`), labeled `### step <id> (<provider>)`. `--raw` shows the live pane capture
+ * agent did. Default: the full token-efficient parsed transcript per step (the same
+ * parsed format as `orc read --full`), labeled `### step <id> (<provider>)`. `--raw` shows the live pane capture
  * instead. `--json` emits `{ step, turns }[]` (parsed) or `{ step, provider, pane }[]` (raw).
  */
 async function cmdWorkflowLogs(args: string[]): Promise<number> {
@@ -1142,16 +1192,26 @@ async function remoteSend(client: DaemonClient, args: string[]): Promise<number>
 async function remoteRead(client: DaemonClient, args: string[]): Promise<number> {
   const { values, positionals } = parse(args, {
     raw: { type: 'boolean' },
+    full: { type: 'boolean' },
+    last: { type: 'boolean' },
+    index: { type: 'string' },
     json: { type: 'boolean' },
   });
   const json = jsonFlag(values);
+  let selection: TurnSelection;
+  try {
+    selection = readSelectionFromFlags(values);
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
   const id = positionals[0];
   if (!id) {
     printError('read requires <id|name>', json);
     return 1;
   }
   try {
-    const res = await client.read(id, { raw: values.raw === true });
+    const res = await client.read(id, { raw: values.raw === true, selection });
     if (res.kind === 'raw') {
       if (json) printJson({ id: res.id, pane: res.pane });
       else process.stdout.write(res.pane.endsWith('\n') ? res.pane : `${res.pane}\n`);

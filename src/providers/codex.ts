@@ -104,7 +104,7 @@ export class CodexAdapter implements ProviderAdapter {
     const targetCwd = rec.cwd;
 
     const glob = new Bun.Glob('*/*/*/rollout-*.jsonl');
-    const candidates: { file: string; mtimeMs: number }[] = [];
+    const candidates: { file: string; sortMs: number; priority: number }[] = [];
     for await (const file of glob.scan({ cwd: base, absolute: true })) {
       let st: Awaited<ReturnType<typeof fs.stat>>;
       try {
@@ -112,25 +112,49 @@ export class CodexAdapter implements ProviderAdapter {
       } catch {
         continue;
       }
-      if (Number.isFinite(createdAtMs) && st.mtimeMs <= createdAtMs - 2000) continue;
-      candidates.push({ file, mtimeMs: st.mtimeMs });
-    }
-    // Newest first.
-    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
-
-    for (const { file } of candidates) {
       const meta = await readSessionMeta(file);
       if (!meta) continue;
-      if (meta.cwd === targetCwd) {
+      if (meta.cwd !== targetCwd) continue;
+
+      if (rec.transcriptSessionId && meta.id === rec.transcriptSessionId) {
         return file;
       }
+
+      const startedAtMs = Date.parse(meta.timestamp ?? '');
+      if (Number.isFinite(createdAtMs) && Number.isFinite(startedAtMs)) {
+        // Multiple codex sessions can share a cwd; mtime then points at whichever
+        // session wrote most recently. The session_meta timestamp is the stable launch
+        // time, so prefer the transcript whose launch is nearest this orc spawn.
+        if (startedAtMs < createdAtMs - 5000) continue;
+        candidates.push({ file, sortMs: startedAtMs, priority: 0 });
+        continue;
+      }
+
+      // Older rollout shapes may not have a timestamp; keep the historical mtime guard
+      // as a fallback, but rank it behind timestamped candidates.
+      if (Number.isFinite(createdAtMs) && st.mtimeMs <= createdAtMs - 2000) continue;
+      candidates.push({ file, sortMs: st.mtimeMs, priority: 1 });
+    }
+
+    candidates.sort((a, b) => {
+      if (a.priority !== b.priority) return a.priority - b.priority;
+      if (Number.isFinite(createdAtMs)) {
+        return Math.abs(a.sortMs - createdAtMs) - Math.abs(b.sortMs - createdAtMs);
+      }
+      return b.sortMs - a.sortMs;
+    });
+
+    if (candidates[0]) {
+      return candidates[0].file;
     }
     return null;
   }
 }
 
 /** Read the first JSONL line of a codex rollout and extract session_meta payload. */
-async function readSessionMeta(file: string): Promise<{ id?: string; cwd?: string } | null> {
+async function readSessionMeta(
+  file: string,
+): Promise<{ id?: string; cwd?: string; timestamp?: string } | null> {
   let text: string;
   try {
     text = await Bun.file(file).text();
@@ -142,10 +166,10 @@ async function readSessionMeta(file: string): Promise<{ id?: string; cwd?: strin
   try {
     const obj = JSON.parse(firstLine) as {
       type?: string;
-      payload?: { id?: string; cwd?: string };
+      payload?: { id?: string; cwd?: string; timestamp?: string };
     };
     if (obj.type === 'session_meta' && obj.payload) {
-      return { id: obj.payload.id, cwd: obj.payload.cwd };
+      return { id: obj.payload.id, cwd: obj.payload.cwd, timestamp: obj.payload.timestamp };
     }
   } catch {
     return null;

@@ -14,8 +14,8 @@ export { Session } from './session.ts';
 export type { WaitForOptions } from './session.ts';
 export { classifyState, reduceWait, isSettled } from './state.ts';
 export type { StateMatchers, WaitTracking } from './state.ts';
-export { parseTranscript, renderTurns } from './transcript.ts';
-export type { Turn, TurnRole } from './transcript.ts';
+export { conversationTurns, parseTranscript, renderTurns, selectTurns } from './transcript.ts';
+export type { Turn, TurnRole, TurnSelection } from './transcript.ts';
 export {
   defineWorkflow,
   runWorkflow,

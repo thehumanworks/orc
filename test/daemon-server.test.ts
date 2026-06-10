@@ -3,7 +3,9 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { serveDaemon } from '../src/daemon/server.ts';
+import { writeRegistry } from '../src/registry.ts';
 import type { Identity } from '../src/daemon/trust.ts';
+import type { SessionRecord } from '../src/types.ts';
 
 /**
  * Live-socket integration: a real `Bun.serve` on 127.0.0.1, started/stopped in-process,
@@ -120,5 +122,70 @@ describe('daemon over a live loopback socket', () => {
       headers: { 'x-orc-secret': 'topsecret' },
     });
     expect(res.status).toBe(404);
+  });
+
+  test('/sessions/:id/read applies cursor selection to parsed transcripts', async () => {
+    const transcript = path.join(home, 'claude-read.jsonl');
+    await fs.writeFile(
+      transcript,
+      [
+        JSON.stringify({ type: 'user', message: { content: 'first' } }),
+        JSON.stringify({ type: 'assistant', message: { content: 'first done' } }),
+        JSON.stringify({ type: 'user', message: { content: 'second' } }),
+        JSON.stringify({
+          type: 'assistant',
+          message: { content: [{ type: 'tool_use', name: 'Read', input: { file_path: 'src/x.ts' } }] },
+        }),
+        JSON.stringify({ type: 'assistant', message: { content: 'second done' } }),
+      ].join('\n'),
+    );
+    const rec: SessionRecord = {
+      id: 'readtest',
+      sessionId: 'readtest-0000-0000-0000-000000000000',
+      provider: 'claude',
+      tmuxName: 'orc-claude-readtest',
+      cwd: home,
+      workspace: home,
+      createdAt: new Date().toISOString(),
+      transcriptPath: transcript,
+    };
+    await writeRegistry([rec]);
+
+    const s = start({ secret: 'topsecret', allowlist: ['mini'], whois: async () => null });
+    const headers = { 'x-orc-secret': 'topsecret' };
+
+    const latest = await fetch(url(s, '/sessions/readtest/read'), { headers });
+    expect(latest.status).toBe(200);
+    expect(await latest.json()).toMatchObject({
+      kind: 'parsed',
+      id: 'readtest',
+      turns: [
+        { role: 'user', text: 'second' },
+        { role: 'tool', text: 'Read src/x.ts' },
+        { role: 'assistant', text: 'second done' },
+      ],
+    });
+
+    const first = await fetch(url(s, '/sessions/readtest/read?index=0'), { headers });
+    expect(first.status).toBe(200);
+    expect(await first.json()).toMatchObject({
+      turns: [
+        { role: 'user', text: 'first' },
+        { role: 'assistant', text: 'first done' },
+      ],
+    });
+
+    const full = await fetch(url(s, '/sessions/readtest/read?full=1'), { headers });
+    expect(full.status).toBe(200);
+    const fullBody = (await full.json()) as { turns: unknown[] };
+    expect(fullBody.turns).toHaveLength(5);
+
+    const badIndex = await fetch(url(s, '/sessions/readtest/read?index=99'), { headers });
+    expect(badIndex.status).toBe(400);
+    const badIndexBody = (await badIndex.json()) as { error?: string };
+    expect(badIndexBody.error).toMatch(/turn index 99 out of range/);
+
+    const rawConflict = await fetch(url(s, '/sessions/readtest/read?raw=1&full=1'), { headers });
+    expect(rawConflict.status).toBe(400);
   });
 });

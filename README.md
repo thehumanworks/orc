@@ -38,7 +38,7 @@ orc <command> ...
 ```
 orc spawn  --provider <claude|codex|pi> [options]   Launch a new agent session (aliases: agent, new)
 orc send   <id|name> [PROMPT | - | @file]           Send a prompt (multi-line safe)
-orc read   <id|name> [--raw]                        Parsed transcript (default); --raw = full tmux pane
+orc read   <id|name> [--last|--index N|--full|--raw]  Latest parsed turn by default; --full = full transcript; --raw = full tmux pane
 orc state  <id|name>                                Classify state once: starting|running|done|waiting|failed
 orc wait   <id|name> [--for done|waiting|failed|settled] [--timeout <sec>]
                                                     Block until the agent settles (default --for settled)
@@ -85,8 +85,12 @@ ID=$(orc spawn -p claude --json | bun -e 'console.log(JSON.parse(await Bun.stdin
 # Send a multi-line prompt from a file (delivered as ONE message).
 orc send "$ID" @prompt.txt
 
-# Read the token-efficient parsed transcript; --raw for the full tmux pane.
+# Read the latest token-efficient parsed conversation turn.
 orc read "$ID"
+# Read the full parsed transcript or a zero-based conversation turn.
+orc read "$ID" --full
+orc read "$ID" --index 0
+# Escape hatch: read the full tmux pane.
 orc read "$ID" --raw
 
 # Reattach as a human (read-only view).
@@ -127,8 +131,8 @@ await session.kill({ removeWorktree: true });
   `--system-prompt` (replace). Transcript resolved by globbing the session id.
   **Note:** an orc-launched *interactive* claude session DOES write its real
   `user`/`assistant` turns to `~/.claude/projects/*/<sid>.jsonl` as the conversation
-  progresses (verified against claude 2.1.170). So the default parsed `orc read` reads
-  the actual conversation from disk; `orc read --raw` is the live-pane escape hatch.
+  progresses (verified against claude 2.1.170). So parsed `orc read` reads the actual
+  conversation from disk; `orc read --raw` is the live-pane escape hatch.
   (An earlier note claimed the file was title-only — that was wrong.)
 - **codex** — no launch-time `--agent` flag and no `--session-id`. A persona/system prompt (or a
   resolved `agentName` body) is written to `AGENTS.md` in the cwd. Transcript discovered by matching
@@ -247,8 +251,8 @@ foreground inside the tmux session; that `--run-id` entrypoint is how both sides
 ### Inspecting the work — `orc workflow logs`
 
 Workflow steps leave their sessions **alive** (the v1 choice), so you can read exactly what each
-step's agent did. `orc workflow logs <runId>` prints every step's **token-efficient parsed
-transcript** (the same view as `orc read`), labeled `### step <id> (<provider>)`; `--step <id>`
+step's agent did. `orc workflow logs <runId>` prints every step's full **token-efficient parsed
+transcript** (the same parsed format as `orc read --full`), labeled `### step <id> (<provider>)`; `--step <id>`
 narrows to one step, `--raw` shows the live pane capture instead, and `--json` emits
 `{ step, turns }[]` (or `{ step, provider, pane }[]` with `--raw`).
 
