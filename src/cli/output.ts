@@ -44,7 +44,7 @@ export function renderSessionDetail(rec: SessionView): string {
     rec.branch ? `branch:      ${rec.branch}` : null,
     `workspace:   ${rec.workspace}`,
     `createdAt:   ${rec.createdAt}`,
-    `attach:      tmux attach -t ${rec.tmuxName}`,
+    `attach:      orc attach ${rec.id}`,
   ].filter((l): l is string => l !== null);
   return lines.join('\n');
 }
@@ -126,7 +126,7 @@ Usage:
   orc state  <id|name>                                Classify state once: starting|running|done|waiting|failed
   orc wait   <id|name> [--for S] [--timeout SEC]      Block until the agent settles (S: done|waiting|failed|settled)
   orc list   [--workspace W | --all | --dead | --all-hosts]  List sessions (alias: ps)
-  orc attach <id|name> [--read-only]                  Print the tmux attach command
+  orc attach <id|name> [--read-only]                  Attach to the tmux session
   orc kill   <id|name> [--worktree] [--purge]         Kill session (mark dead; --purge removes record)
   orc prune  [--worktree]                             Drop all dead records (+ optional worktrees)
   orc workflow <run|list|status|attach|logs> ...      Run/inspect multi-step workflows (alias: wf)
@@ -193,7 +193,7 @@ Global:
 read --json emits the parsed turn array ([{role,text},...]); --raw --json emits
 {id,pane}; if no transcript exists yet it falls back to {id,fallback:true,pane}.
 state --json emits {id,state}. wait --json emits {id,state,elapsedMs,timedOut};
-exit 0 iff the reached state is in the requested set, non-zero on timeout.
+exit 0 iff the requested state actually settled after debounce, non-zero on timeout.
 
 State meaning: 'done' = the composer is idle and ready for YOUR input (NOT "succeeded"
 — it also covers an agent that asked a clarifying question, which is pane-identical to

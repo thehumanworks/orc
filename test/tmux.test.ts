@@ -2,6 +2,7 @@ import { describe, test, expect } from 'bun:test';
 import {
   sanitizeTmuxName,
   buildSpawnArgs,
+  buildAttachArgs,
   PANE_WIDTH,
   PANE_HEIGHT,
 } from '../src/drivers/tmux.ts';
@@ -71,5 +72,24 @@ describe('buildSpawnArgs', () => {
     expect(ei).toBeGreaterThanOrEqual(0);
     expect(args[ei + 1]).toBe('ORC_HOME=/tmp/h');
     expect(ei).toBeLessThan(sep);
+  });
+});
+
+describe('buildAttachArgs', () => {
+  test('builds a read-write attach command', () => {
+    expect(buildAttachArgs('orc-claude-abcd1234')).toEqual([
+      'attach',
+      '-t',
+      'orc-claude-abcd1234',
+    ]);
+  });
+
+  test('adds tmux read-only mode when requested', () => {
+    expect(buildAttachArgs('orc-claude-abcd1234', { readOnly: true })).toEqual([
+      'attach',
+      '-r',
+      '-t',
+      'orc-claude-abcd1234',
+    ]);
   });
 });

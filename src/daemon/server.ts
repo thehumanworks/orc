@@ -236,10 +236,14 @@ async function dispatch(
         throw new HttpError(400, (e as Error).message);
       }
       const startedAt = Date.now();
-      const state = await session.waitFor(waitOpts);
+      const result = await session.waitForResult(waitOpts);
       const elapsedMs = Date.now() - startedAt;
-      const reached = (waitOpts.until ?? []).includes(state);
-      return json({ id: session.id, state, elapsedMs, timedOut: !reached });
+      return json({
+        id: session.id,
+        state: result.state,
+        elapsedMs,
+        timedOut: !result.settled,
+      });
     }
 
     case 'sessions.read': {

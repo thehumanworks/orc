@@ -391,9 +391,16 @@ async function cmdAttach(args: string[]): Promise<number> {
     return 1;
   }
   const cmd = session.attachCommand({ readOnly: values['read-only'] === true });
-  if (json) printJson({ id: session.id, command: cmd });
-  else process.stdout.write(`${cmd}\n`);
-  return 0;
+  if (json) {
+    printJson({ id: session.id, command: cmd });
+    return 0;
+  }
+  try {
+    return await session.attach({ readOnly: values['read-only'] === true });
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
 }
 
 async function cmdKill(args: string[]): Promise<number> {
@@ -509,16 +516,16 @@ async function cmdWait(args: string[]): Promise<number> {
   }
   const startedAt = Date.now();
   let state: AgentState;
+  let reached: boolean;
   try {
-    state = await session.waitFor({ until, timeoutMs });
+    const result = await session.waitForResult({ until, timeoutMs });
+    state = result.state;
+    reached = result.settled;
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
   }
   const elapsedMs = Date.now() - startedAt;
-  // Reached a state in the requested set ⇒ success; otherwise we hit the timeout and
-  // are reporting the last observed (still-progressing) state.
-  const reached = until.includes(state);
   const timedOut = !reached;
   if (json) {
     printJson({ id: session.id, state, elapsedMs, timedOut });

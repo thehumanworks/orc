@@ -33,6 +33,13 @@ export interface WaitForOptions {
   pollMs?: number;
 }
 
+export interface WaitForResult {
+  /** The state that settled, or the last observed state on timeout. */
+  state: AgentState;
+  /** True only when the debounce actually observed a requested state long enough. */
+  settled: boolean;
+}
+
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export class Session {
@@ -102,10 +109,15 @@ export class Session {
    * reads `done` — from being misread as end-of-turn. A `running`/`starting` reading
    * resets the debounce.
    *
-   * On timeout, returns the LAST observed state (does not throw). The returned state is
-   * in `until` iff it genuinely settled; on timeout it is typically still progressing.
+   * On timeout, returns the LAST observed state (does not throw). Use `waitForResult`
+   * when the caller needs to distinguish "last observed terminal-looking state" from
+   * "debounced terminal state actually reached".
    */
   async waitFor(opts?: WaitForOptions): Promise<AgentState> {
+    return (await this.waitForResult(opts)).state;
+  }
+
+  async waitForResult(opts?: WaitForOptions): Promise<WaitForResult> {
     const until = opts?.until ?? DEFAULT_WAIT_UNTIL;
     const timeoutMs = opts?.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
     const pollMs = opts?.pollMs ?? DEFAULT_WAIT_POLL_MS;
@@ -116,16 +128,19 @@ export class Session {
     {
       const r = reduceWait(tracking, last, until);
       tracking = r.tracking;
-      if (r.settled) return r.settled;
+      if (r.settled) return { state: r.settled, settled: true };
     }
-    while (Date.now() < deadline) {
-      await sleep(pollMs);
+    while (true) {
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) break;
+      await sleep(Math.min(pollMs, remainingMs));
       last = await this.state();
+      if (Date.now() >= deadline) break;
       const r = reduceWait(tracking, last, until);
       tracking = r.tracking;
-      if (r.settled) return r.settled;
+      if (r.settled) return { state: r.settled, settled: true };
     }
-    return last;
+    return { state: last, settled: false };
   }
 
   /** Whether the input box is rendered (boot complete). */
@@ -270,6 +285,10 @@ export class Session {
 
   attachCommand(opts?: { readOnly?: boolean }): string {
     return this.driver.attachCommand(this.tmuxName, opts);
+  }
+
+  attach(opts?: { readOnly?: boolean }): Promise<number> {
+    return this.driver.attach(this.tmuxName, opts);
   }
 
   /**

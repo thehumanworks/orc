@@ -43,7 +43,7 @@ orc state  <id|name>                                Classify state once: startin
 orc wait   <id|name> [--for done|waiting|failed|settled] [--timeout <sec>]
                                                     Block until the agent settles (default --for settled)
 orc list   [--workspace W | --all | --dead]         List sessions for a workspace (alias: ps)
-orc attach <id|name> [--read-only]                  Print the `tmux attach` command (does not exec)
+orc attach <id|name> [--read-only]                  Attach to the tmux session
 orc kill   <id|name> [--worktree] [--purge]         Kill the session (mark dead; --purge removes record)
 orc prune  [--worktree]                             Drop all dead records (+ optionally their worktrees)
 orc workflow run|list|status|logs|attach …          Run/inspect multi-step workflows (see Workflows)
@@ -90,7 +90,7 @@ orc read "$ID"
 orc read "$ID" --raw
 
 # Reattach as a human (read-only view).
-eval "$(orc attach "$ID" --read-only)"
+orc attach "$ID" --read-only
 
 # Tear down.
 orc kill "$ID" --worktree
@@ -188,7 +188,7 @@ non-progressing state must hold for **2 consecutive polls** before it's returned
 between an agent's tool calls is never misread as end-of-turn. `--for` selects the target set
 (`done` | `waiting` | `failed` | `settled`, where `settled` = any of the three; default `settled`).
 On timeout it returns the last observed state (it does not throw); exit code is `0` iff the reached
-state is in the requested set, non-zero on timeout.
+state actually settled after debounce, non-zero on timeout.
 
 ```sh
 orc wait "$ID" --json                       # {"id","state","elapsedMs","timedOut"}

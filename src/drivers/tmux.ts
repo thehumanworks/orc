@@ -92,6 +92,11 @@ export function buildSpawnArgs(a: SpawnArgs): string[] {
   return args;
 }
 
+/** Build the `tmux attach` argv. Pure so read-only behavior is unit-testable. */
+export function buildAttachArgs(name: string, o?: { readOnly?: boolean }): string[] {
+  return o?.readOnly ? ['attach', '-r', '-t', name] : ['attach', '-t', name];
+}
+
 export class TmuxDriver implements Driver {
   readonly name = 'tmux';
   private static serverPrepared = false;
@@ -192,6 +197,15 @@ export class TmuxDriver implements Driver {
       if (/can't find session|no server running/i.test(r.stderr)) return;
       throw new Error(`tmux kill-session failed: ${r.stderr.trim()}`);
     }
+  }
+
+  async attach(name: string, o?: { readOnly?: boolean }): Promise<number> {
+    const proc = Bun.spawn(['tmux', ...buildAttachArgs(name, o)], {
+      stdin: 'inherit',
+      stdout: 'inherit',
+      stderr: 'inherit',
+    });
+    return proc.exited;
   }
 
   attachCommand(name: string, o?: { readOnly?: boolean }): string {

@@ -100,7 +100,8 @@ class Session {
   transcript(): Promise<string | null>;              // path to on-disk JSONL (provider-resolved)
   readTranscript(): Promise<string | null>;          // raw JSONL contents
   readParsed(): Promise<Turn[]>;                      // token-efficient parsed turns (default `orc read`)
-  attachCommand(opts?: { readOnly?: boolean }): string;       // `tmux attach [-r] -t <name>`
+  attach(opts?: { readOnly?: boolean }): Promise<number>;     // exec `tmux attach [-r] -t <name>`
+  attachCommand(opts?: { readOnly?: boolean }): string;       // command string for JSON/script output
   kill(opts?: { removeWorktree?: boolean }): Promise<void>;   // kill tmux session (+ optional worktree)
   toJSON(): SessionRecord;
 }
@@ -173,6 +174,7 @@ interface Driver {
   list(prefix?: string): Promise<PaneInfo[]>;
   isAlive(name: string): Promise<boolean>;
   kill(name: string): Promise<void>;
+  attach(name: string, o?: { readOnly?: boolean }): Promise<number>;
   attachCommand(name: string, o?: { readOnly?: boolean }): string;
 }
 ```
@@ -204,7 +206,7 @@ orc spawn  --provider <p> [--model M] [--agent NAME | --system-prompt P] [--prom
 orc send   <id|name> [PROMPT | - | @file] [--json]      # multi-line safe; piped stdin or '-' if PROMPT omitted
 orc read   <id|name> [--raw] [--json]                   # parsed transcript (default) or full pane (--raw)
 orc list   [--workspace W | --all | --dead] [--json]    # active sessions for a workspace. Alias: `orc ps`.
-orc attach <id|name> [--read-only] [--json]             # prints `tmux attach ...` (does not exec by default)
+orc attach <id|name> [--read-only] [--json]             # attaches locally; --json prints `tmux attach ...`
 orc kill   <id|name> [--worktree] [--purge] [--json]    # mark session dead (keep record); --purge removes record
 orc prune  [--worktree] [--json]                        # drop all dead records (+ optional worktree removal)
 orc help

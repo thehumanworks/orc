@@ -23,6 +23,7 @@ export interface Driver {
   list(prefix?: string): Promise<PaneInfo[]>;
   isAlive(name: string): Promise<boolean>;
   kill(name: string): Promise<void>;
+  attach(name: string, o?: { readOnly?: boolean }): Promise<number>;
   attachCommand(name: string, o?: { readOnly?: boolean }): string;
 }
 
