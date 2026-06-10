@@ -2,7 +2,7 @@
  * Token-efficient transcript parsing. Each provider writes a JSONL message log to
  * disk; we normalize it into a flat list of `Turn`s — the conversation text plus
  * ONE-LINE tool-call summaries — dropping raw tool output, reasoning/thinking, and
- * all UI chrome. This is what `agi read` shows by default (the raw tmux pane is the
+ * all UI chrome. This is what `orc read` shows by default (the raw tmux pane is the
  * `--raw` escape hatch).
  */
 import type { Provider } from './types.ts';

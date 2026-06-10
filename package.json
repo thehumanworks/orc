@@ -1,13 +1,13 @@
 {
   "name": "orc",
   "version": "0.1.0",
-  "description": "Multi-agent orchestration tool — launch claude/codex/pi coding agents as detached, reattachable, readable tmux sessions. SDK + `agi` CLI.",
+  "description": "Multi-agent orchestration tool — launch claude/codex/pi coding agents as detached, reattachable, readable tmux sessions. SDK + `orc` CLI.",
   "type": "module",
   "module": "src/index.ts",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "bin": {
-    "agi": "./src/cli/index.ts"
+    "orc": "./src/cli/index.ts"
   },
   "exports": {
     ".": "./src/index.ts"

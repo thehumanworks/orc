@@ -1,7 +1,7 @@
 # Design: orc workflows (goal-feature 2)
 
 Status: DRAFT — depends on the `wait`/state primitive (goal-feature 1, in progress). API specifics
-marked _(pending F1)_ will be pinned once `Session.waitFor()` / `agi wait` land.
+marked _(pending F1)_ will be pinned once `Session.waitFor()` / `orc wait` land.
 
 ## Requirement (from the user's goal)
 Workflows must be **easy to define**, **versioned**, **reliable**, and **backgroundable**. They are
@@ -61,18 +61,18 @@ workflow (or a `onFail` branch).
   recoverable/inspectable.
 
 ### Backgroundable
-`agi workflow run <name> [--detach]`. Foreground streams step progress. `--detach` runs it as a
-tracked background process whose live state is queryable (`agi workflow status <run-id>`,
-`agi workflow logs <run-id>`) — the run record lives in `~/.orc/runs/<id>.json`. This is the natural
+`orc workflow run <name> [--detach]`. Foreground streams step progress. `--detach` runs it as a
+tracked background process whose live state is queryable (`orc workflow status <run-id>`,
+`orc workflow logs <run-id>`) — the run record lives in `~/.orc/runs/<id>.json`. This is the natural
 bridge to goal-feature 3 (the daemon): a detached workflow run is exactly what a remote orc server
 would host and expose.
 
 ### CLI surface (proposed)
 ```
-agi workflow list                       # versioned workflows discovered in orc.workflows/
-agi workflow run <name> [--detach]      # run; --json streams step events
-agi workflow status <run-id>            # state of each step
-agi workflow logs <run-id> [--step s]   # per-step transcript (token-efficient `read`, reused)
+orc workflow list                       # versioned workflows discovered in orc.workflows/
+orc workflow run <name> [--detach]      # run; --json streams step events
+orc workflow status <run-id>            # state of each step
+orc workflow logs <run-id> [--step s]   # per-step transcript (token-efficient `read`, reused)
 ```
 
 ## Open questions (resolve after F1)

@@ -8,7 +8,7 @@ describe('resolveCommand routing for state/wait', () => {
   });
 });
 
-describe('resolveUntil (agi wait --for)', () => {
+describe('resolveUntil (orc wait --for)', () => {
   test('settled = any non-progressing state', () => {
     expect(resolveUntil('settled')).toEqual(['done', 'waiting', 'failed']);
   });

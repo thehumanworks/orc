@@ -1,7 +1,7 @@
 /**
  * The orc daemon — a thin HTTP/JSON layer over the existing SDK plus the trust gate. It
  * adds NO orchestration logic: every route maps 1:1 to a `Session`/`agent`/`runWorkflow`
- * call against the SAME `~/.orc` the local `agi` uses.
+ * call against the SAME `~/.orc` the local `orc` uses.
  *
  * SECURITY: every route EXCEPT `/health` is behind the fail-closed trust gate
  * (`decideTrust`). The bind address is decided by `resolveBind` (never `0.0.0.0` by
@@ -50,7 +50,7 @@ export interface DaemonOptions {
   secret?: string | null;
   /**
    * Static allowlist of trusted host names. When omitted, the gate reads `peers.json`
-   * fresh per request (so `agi remote add` takes effect without a restart). Tests pass a
+   * fresh per request (so `orc remote add` takes effect without a restart). Tests pass a
    * static list.
    */
   allowlist?: string[];
@@ -320,7 +320,7 @@ async function dispatch(
  * `POST /workflows/run {file?, def?, detach?}`. Foreground: run a def (inline `def`, or
  * imported from the host-local `file`) to completion and return the `WorkflowRun`. Detach:
  * mint a runId, write an initial `running` record, and launch a detached
- * `agi workflow run <file> --run-id <id>` runner (mirrors the CLI `--detach` path) —
+ * `orc workflow run <file> --run-id <id>` runner (mirrors the CLI `--detach` path) —
  * returns `{ runId, runnerTmux }` immediately. Detach requires `file`.
  */
 async function runWorkflowRoute(req: Request): Promise<Response> {

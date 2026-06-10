@@ -87,7 +87,7 @@ export function matchRoute(method: string, pathname: string): RouteMatch | null 
   return null;
 }
 
-/** The body shape `POST /sessions` accepts (mirrors `agi spawn` flags). */
+/** The body shape `POST /sessions` accepts (mirrors `orc spawn` flags). */
 export interface SpawnRequest {
   provider?: string;
   model?: string;
@@ -99,7 +99,7 @@ export interface SpawnRequest {
   workspace?: string;
   worktree?: boolean | { branch?: string };
   branch?: string;
-  /** `agi spawn --no-wait`: skip the boot wait AND the initial-prompt send. */
+  /** `orc spawn --no-wait`: skip the boot wait AND the initial-prompt send. */
   noWait?: boolean;
 }
 

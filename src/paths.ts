@@ -16,7 +16,7 @@ export function registryPath(): string {
   return path.join(orcHome(), 'registry.json');
 }
 
-/** Path to the trusted-peer file (`agi remote` list + the daemon's allowlist). */
+/** Path to the trusted-peer file (`orc remote` list + the daemon's allowlist). */
 export function peersPath(): string {
   return path.join(orcHome(), 'peers.json');
 }

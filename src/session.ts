@@ -259,7 +259,7 @@ export class Session {
   /**
    * Parse the on-disk transcript into token-efficient turns (conversation text plus
    * one-line tool-call summaries; no raw tool output, reasoning, or UI chrome). This
-   * is the SDK mirror of the default `agi read`. Returns `[]` when no transcript is
+   * is the SDK mirror of the default `orc read`. Returns `[]` when no transcript is
    * on disk yet (e.g. just booted) — callers wanting a live view should `capture()`.
    */
   async readParsed(): Promise<Turn[]> {

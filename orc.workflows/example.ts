@@ -1,16 +1,16 @@
 /**
  * Example orc workflow — a real 2-step smoke test of step-to-step handoff.
  *
- *   agi workflow run orc.workflows/example.ts            # stream step events
- *   agi workflow run orc.workflows/example.ts --json     # final WorkflowRun as JSON
+ *   orc workflow run orc.workflows/example.ts            # stream step events
+ *   orc workflow run orc.workflows/example.ts --json     # final WorkflowRun as JSON
  *
  * Step `a` (claude) writes a token to handoff.txt in the shared cwd; step `b` (codex)
  * reads that file and echoes the token back. Because the steps omit `cwd`, they share
- * the directory you invoke `agi workflow run` from — run it from a fresh/empty dir so
+ * the directory you invoke `orc workflow run` from — run it from a fresh/empty dir so
  * the handoff is unambiguous (b's transcript echoing the token proves b read a's file).
  *
  * NOTE ON THE IMPORT STORY: a WorkflowDef is just a PLAIN object `default`-exported, so
- * this file needs NO runtime import to run — `agi workflow run` imports it and the runner
+ * this file needs NO runtime import to run — `orc workflow run` imports it and the runner
  * validates the shape. The `import type` below is erased at runtime (it only gives an
  * editor the `satisfies WorkflowDef` check); an author who wants the `defineWorkflow`
  * helper may import it via a relative path, but it is never required.

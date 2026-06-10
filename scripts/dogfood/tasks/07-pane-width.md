@@ -10,7 +10,7 @@ Isolated git worktree of `orc`. `bun install`, then read `src/drivers/tmux.ts` (
 A detached tmux session inherits a NARROW width (observed **48 columns**). At that width the providers'
 bottom status line WRAPS, so the busy marker `esc to interrupt` (claude/codex) lands on a wrapped
 continuation that `capture-pane` truncates. `busyMatch` then returns false for an agent that is
-actively working, so `classifyState` returns **`done`** instead of `running` — and `agi wait` / `agi
+actively working, so `classifyState` returns **`done`** instead of `running` — and `orc wait` / `orc
 state` / any orchestration on top mis-fire. Verified: a 48-col session reported `state=done` while
 mid-turn; `tmux resize-window -x 120` made `state` correctly report `running` again. So state
 detection is **width-fragile**, which undermines F1's reliability.
@@ -19,7 +19,7 @@ detection is **width-fragile**, which undermines F1's reliability.
 Make orc's sessions render at a stable, wide size so a status line never wraps:
 1. In `tmux.ts spawn`, create the session at a fixed wide size — add `-x <W> -y <H>` to `new-session`
    (e.g. `-x 200 -y 50`). Pick W comfortably wider than the longest status line.
-2. Keep it stable so a later (e.g. read-only) `agi attach` from a narrow terminal can't shrink the
+2. Keep it stable so a later (e.g. read-only) `orc attach` from a narrow terminal can't shrink the
    window and reintroduce the bug for subsequent `capture`s: set the session's `window-size` to
    `manual` (e.g. `tmux set-option -t <name> window-size manual`, or `new-session`'s equivalent), OR
    document why it isn't needed. Pin a single source-of-truth constant for the width.
@@ -39,10 +39,10 @@ always present.
 Throwaway `ORC_HOME`. For claude AND codex:
 1. Spawn a session; assert its pane width (`tmux display -p -t <name> '#{pane_width}'` or
    `list-panes`) is the wide value (≥120), NOT a narrow inherited width.
-2. Send a ~12s tool-run (`for i in $(seq 1 12); do echo t$i; sleep 1; done`). Assert `agi state` reads
-   `running` DURING it (this is the case that was broken at 48 cols) and `agi wait --for done` returns
+2. Send a ~12s tool-run (`for i in $(seq 1 12); do echo t$i; sleep 1; done`). Assert `orc state` reads
+   `running` DURING it (this is the case that was broken at 48 cols) and `orc wait --for done` returns
    `done` only after it finishes.
-3. (Regression nicety) confirm `agi read` of the session is not wrapped mid-word for the status line.
+3. (Regression nicety) confirm `orc read` of the session is not wrapped mid-word for the status line.
 4. Clean up: kill sessions, remove throwaway ORC_HOME, restore `~/.codex/config.toml`. Inside tmux;
    prefix nested spawns with `TMUX= ` if needed.
 

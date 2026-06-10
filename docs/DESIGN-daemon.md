@@ -17,19 +17,19 @@ per node. So:
   `0.0.0.0`. A misconfig that exposed it publicly is the main risk to prevent — bind explicitly.
 - Caller identity comes from tailscale: resolve the source IP with `tailscale whois` (subprocess) to a
   tailnet node/user, and check it against a **peer allowlist** (`~/.orc/peers.json`: tailnet hostnames
-  the user has trusted via `agi remote add <host>`). No passwords/tokens to manage; identity is the
+  the user has trusted via `orc remote add <host>`). No passwords/tokens to manage; identity is the
   tailnet membership + the explicit allowlist.
 - Defense in depth: also accept a per-tailnet shared secret header as a fallback for environments
   where `tailscale whois` isn't available. Recommend whois-first.
 
 ## Architecture
-- **Server**: `agi daemon [--port 8787]` runs `Bun.serve` bound to the tailscale IP, exposing a small
+- **Server**: `orc daemon [--port 8787]` runs `Bun.serve` bound to the tailscale IP, exposing a small
   JSON/HTTP API that is a 1:1 mapping of the SDK. It operates on the SAME `~/.orc` registry the local
-  `agi` uses, so local and remote views are consistent.
-- **Client**: `agi --host <tailnet-host> <command>` makes the existing CLI a thin client — when
+  `orc` uses, so local and remote views are consistent.
+- **Client**: `orc --host <tailnet-host> <command>` makes the existing CLI a thin client — when
   `--host` is set, each command becomes an HTTP call to that host's daemon instead of a local SDK
-  call. `agi remote add|list|rm <host>` manages the trusted-peer list.
-- **Federation**: `agi list --all-hosts` (and `agi ps`) fan out to every trusted peer's daemon +
+  call. `orc remote add|list|rm <host>` manages the trusted-peer list.
+- **Federation**: `orc list --all-hosts` (and `orc ps`) fan out to every trusted peer's daemon +
   local, aggregating sessions with a `host` column. This is the "manage the fleet" view.
 
 ## API surface (all JSON; mirrors the SDK + CLI)
@@ -64,7 +64,7 @@ request from a non-allowlisted identity is refused. (On the user's real tailnet,
 
 ## Open questions (resolve before building)
 1. whois-based identity vs shared-secret vs both — recommend whois + allowlist, secret as fallback.
-2. Does `agi --host` proxy EVERY command, or only read-ish ones initially? (Recommend all; spawn/kill
+2. Does `orc --host` proxy EVERY command, or only read-ish ones initially? (Recommend all; spawn/kill
    are the point.)
 3. Worktrees are host-local paths — remote `read --raw`/`attach` only make sense ON that host;
    `attach` should print the host + `tailscale ssh <host>` hint rather than a bare local tmux command.

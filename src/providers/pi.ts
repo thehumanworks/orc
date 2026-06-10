@@ -57,7 +57,7 @@ export class PiAdapter implements ProviderAdapter {
 
   readyMatch(pane: string): boolean {
     // BUG: the old check (`pane.includes('│') || '❯' || '>'`) did NOT match pi's
-    // composer — it has none of those chars — so `agi send` threw "not ready" and
+    // composer — it has none of those chars — so `orc send` threw "not ready" and
     // prompts were lost. The reliable marker is the bottom budget-meter line.
     return BUDGET_METER_RE.test(pane);
   }

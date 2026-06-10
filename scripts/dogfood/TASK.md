@@ -1,9 +1,9 @@
-# Task: make `agi read` token-efficient (parsed transcript by default; `--raw` = pane)
+# Task: make `orc read` token-efficient (parsed transcript by default; `--raw` = pane)
 
 ## Context
 You are an autonomous coding agent working inside an **isolated git worktree** of the `orc`
 project — a multi-agent orchestration tool that launches coding-agent CLIs (claude/codex/pi) as
-interactive tmux sessions and exposes a Bun/TypeScript SDK plus an `agi` CLI.
+interactive tmux sessions and exposes a Bun/TypeScript SDK plus an `orc` CLI.
 
 First, orient yourself:
 - Run `bun install` (this worktree has NO `node_modules` yet — worktrees don't share it).
@@ -13,19 +13,19 @@ First, orient yourself:
 Your cwd is a worktree on a feature branch — commit here; do NOT touch `main`.
 
 ## Goal
-Today `agi read <id>` captures the raw tmux pane (token-heavy: box-drawing, ANSI, repeated UI
+Today `orc read <id>` captures the raw tmux pane (token-heavy: box-drawing, ANSI, repeated UI
 chrome). Change `read` so:
 
-- **Default** `agi read <id>` renders a **token-efficient parsed transcript** read from the
+- **Default** `orc read <id>` renders a **token-efficient parsed transcript** read from the
   provider's on-disk JSONL message log: the conversation turns PLUS one-line tool-call summaries.
   NO raw tool outputs, NO reasoning/thinking, NO UI chrome.
-- **`agi read <id> --raw`** renders the full tmux pane exactly as tmux shows it (the current
+- **`orc read <id> --raw`** renders the full tmux pane exactly as tmux shows it (the current
   behavior, WITH scrollback). This is the escape hatch when the transcript isn't enough.
 - Keep **`--json`** for the default mode — emit structured parsed turns (an array), not the pane.
 - **Retire `--scrollback` and `--transcript`** (pre-release, breaking is fine): `--raw` supersedes
   `--scrollback`; the parsed default supersedes `--transcript`. These flags are referenced in more
   than one place — update ALL of them or `bun test` will fail on stale references: the `cmdRead`
-  parser, **`HELP_TEXT` in `src/cli/output.ts`**, the **`agi read` line in `README.md`**, and any
+  parser, **`HELP_TEXT` in `src/cli/output.ts`**, the **`orc read` line in `README.md`**, and any
   **tests** that reference the removed flags (e.g. `test/cli.test.ts`).
 - **Fallback:** if no on-disk transcript exists yet (just booted / nothing written), fall back to a
   pane capture and note that, so `read` always shows *something*.

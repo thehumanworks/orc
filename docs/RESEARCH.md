@@ -1,4 +1,4 @@
-# orc / agi — Research Brief (verified)
+# orc / orc — Research Brief (verified)
 
 Every claim below is backed by a command actually run on this machine
 (Bun 1.3.14, node v25.9.0, claude 2.1.169, codex-cli 0.137.0, pi 0.79.0,
@@ -172,7 +172,7 @@ $ tmux list-panes -a -F '#{session_name} pane_pid=#{pane_pid} cwd=#{pane_current
 orctest1 pane_pid=73550 cwd=/private/tmp/orc-test-cwd cmd=bash
 ```
 `pane_pid`, `pane_current_path` (cwd), `pane_current_command`, `session_attached` all available.
-Recommended listing format for `agi`:
+Recommended listing format for `orc`:
 `#{session_name}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{session_attached}`.
 
 ### D.13 MULTI-LINE PROMPT INJECTION — the #1 risk — SOLVED

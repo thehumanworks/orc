@@ -99,7 +99,7 @@ export async function agent(opts: AgentOptions): Promise<Session> {
   // Workspace = opts.workspace ?? git toplevel of baseCwd ?? realpath(baseCwd).
   // Resolve from baseCwd (the ORIGINAL invocation dir), NOT the worktree `cwd`: a linked
   // worktree reports ITSELF as `git --show-toplevel`, so resolving from the worktree would
-  // silo the session under <repo>/.orc/worktrees/<id> and hide it from `agi list` run in
+  // silo the session under <repo>/.orc/worktrees/<id> and hide it from `orc list` run in
   // the parent repo. A worktree always has a git parent (enforced above), and that parent
   // is the project home — so a worktree agent belongs to the same workspace as the repo.
   const workspace = await resolveWorkspace(opts.workspace, baseCwd);
@@ -170,7 +170,7 @@ export async function agent(opts: AgentOptions): Promise<Session> {
  * Resolve the workspace key for a session.
  * BUG 4: when an explicit `workspace` resolves to an existing filesystem path, store its
  * REALPATH so it stays comparable to `defaultWorkspace()` (which realpaths cwd) —
- * otherwise a symlinked/relative `--workspace` becomes invisible to default `agi list`.
+ * otherwise a symlinked/relative `--workspace` becomes invisible to default `orc list`.
  * A logical (non-filesystem) workspace string is kept verbatim. With no explicit
  * workspace, fall back to git toplevel of cwd, else cwd (already realpathed upstream).
  */

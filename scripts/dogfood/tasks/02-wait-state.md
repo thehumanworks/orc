@@ -1,4 +1,4 @@
-# Task: reliable agent state detection + `agi wait`
+# Task: reliable agent state detection + `orc wait`
 
 ## Context
 You are an autonomous coding agent in an **isolated git worktree** of `orc` — a tool that drives
@@ -40,7 +40,7 @@ Meaning (be precise — these definitions are load-bearing for the orchestration
   end-of-turn. Options: `{ until?: AgentState[]; timeoutMs?: number; pollMs?: number }` (default
   `until` = `['done','waiting','failed']`, `timeoutMs` 600000, `pollMs` 1000). On timeout, return the
   last observed state (do not throw).
-- CLI `agi wait <id|name> [--for done|waiting|failed|settled] [--timeout <sec>] [--json]`:
+- CLI `orc wait <id|name> [--for done|waiting|failed|settled] [--timeout <sec>] [--json]`:
   blocks via `waitFor`, prints the reached state. `--for settled` (default) = any of done/waiting/
   failed. With `--json`: `{ id, state, elapsedMs, timedOut }`. Exit code: 0 if the reached state is
   in the requested set, non-zero on timeout. Add it to `HELP_TEXT` and the README CLI table.
@@ -58,12 +58,12 @@ Meaning (be precise — these definitions are load-bearing for the orchestration
 - **pi**: its ready composer is two `────` horizontal borders with an empty line between, and a
   bottom **budget-meter line** like `$0.000 (sub) 0.0%/200k (auto) … grok-composer-2.5-fast`.
   - **BUG to fix:** pi's current `readyMatch` (`pane.includes('│') || '❯' || '>')` does NOT match
-    this composer (it has none of those), so `agi send` to pi throws "not ready" and prompts are
+    this composer (it has none of those), so `orc send` to pi throws "not ready" and prompts are
     lost. Replace pi `readyMatch` with a match on the budget-meter line, e.g. `/\d+(?:\.\d+)?%\/\d+k/`
     (verify it is ABSENT during early boot and PRESENT once the composer is live).
   - **pi `busyMatch`: you must capture this yourself** (it wasn't observed). Method: after fixing
-    readyMatch, spawn a pi session, `agi send` it `run the shell command: for i in $(seq 1 10); do
-    echo p-$i; sleep 1; done` and capture `agi read <id> --raw` mid-run; identify the bottom
+    readyMatch, spawn a pi session, `orc send` it `run the shell command: for i in $(seq 1 10); do
+    echo p-$i; sleep 1; done` and capture `orc read <id> --raw` mid-run; identify the bottom
     indicator pi shows while working (likely an interrupt/"esc" hint) and use it. If you genuinely
     cannot find a reliable pi busy signal, document that clearly and make pi `busyMatch` return false
     (pi then reports done/starting only) — but TRY first.
@@ -78,16 +78,16 @@ Meaning (be precise — these definitions are load-bearing for the orchestration
 ## Verification — REQUIRED, real CLIs (this gates done)
 Throwaway `ORC_HOME="$(mktemp -d)/orc"`. For **claude AND codex AND pi**:
 1. Spawn a session and send a ~12s tool-run (`for i in $(seq 1 12); do echo tick-$i; sleep 1; done`).
-2. Assert `agi wait <id> --json` BLOCKS while running and returns `state:"done"` only after the loop
+2. Assert `orc wait <id> --json` BLOCKS while running and returns `state:"done"` only after the loop
    finishes (measure elapsedMs ≳ the loop duration — proving it didn't return early). Print the JSON.
 2b. **Debounce stress test (this is the reliability check — do NOT skip):** send a prompt that runs
    SEVERAL DISTINCT tool calls in sequence, e.g. "run these as three SEPARATE shell commands, one
-   after another: first `sleep 4`, then `echo mid`, then `sleep 4`". Assert `agi wait` does NOT
+   after another: first `sleep 4`, then `echo mid`, then `sleep 4`". Assert `orc wait` does NOT
    return `done` during the brief gaps BETWEEN those tool calls — it must only return `done` after the
    whole sequence finishes (elapsedMs ≳ 8s). A single sleep-loop keeps the working indicator
    continuously on and so would pass even with a broken debounce; this multi-call case is what
    actually exercises the 2-poll debounce.
-3. Assert `agi state`/`agi wait` on a brand-new session mid-boot is `starting`/`running`, and on a
+3. Assert `orc state`/`orc wait` on a brand-new session mid-boot is `starting`/`running`, and on a
    killed session is `failed`.
 4. For at least one provider, capture a real `waiting` state: spawn codex in a FRESH untrusted dir
    with `--no-wait` (so the boot loop doesn't auto-confirm) and assert `state()` = `waiting` on the

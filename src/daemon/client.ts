@@ -1,5 +1,5 @@
 /**
- * The HTTP client behind `agi --host <h> <command>` and `agi list --all-hosts`. A thin
+ * The HTTP client behind `orc --host <h> <command>` and `orc list --all-hosts`. A thin
  * 1:1 wrapper over the daemon's JSON API: each method makes one request and returns the
  * parsed body. The CLI feeds the results to the SAME renderers as the local path, so the
  * `--host` output is identical to local (`--json` byte-for-byte).

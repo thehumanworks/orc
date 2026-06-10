@@ -15,7 +15,7 @@ import type { PaneInfo } from '../types.ts';
  * working agent misclassifies as `done`. We pin a comfortably WIDE geometry (wider
  * than the longest provider status line) so a status line never wraps and state
  * detection is width-stable. Paired with `window-size manual` (see `spawn`) so a
- * later narrow `agi attach` can't shrink the window and reintroduce the bug.
+ * later narrow `orc attach` can't shrink the window and reintroduce the bug.
  */
 export const PANE_WIDTH = 200;
 export const PANE_HEIGHT = 50;
@@ -113,7 +113,7 @@ export class TmuxDriver implements Driver {
       throw new Error(`tmux new-session failed: ${r.stderr.trim() || r.stdout.trim()}`);
     }
     // Pin the geometry: with the default `window-size latest`, a later (e.g. read-only)
-    // `agi attach` from a narrow terminal would resize the window to the client and
+    // `orc attach` from a narrow terminal would resize the window to the client and
     // re-wrap the status line. `manual` keeps the `-x/-y` size regardless of clients.
     // Best-effort (the -x/-y creation size is the load-bearing part); ignore failures.
     await tmux(['set-option', '-t', a.name, 'window-size', 'manual']).catch(() => {});

@@ -12,7 +12,7 @@ Commit on THIS branch; never `main`.
 A daemon so we can drive agents on OTHER orc hosts over the user's **tailscale** network. The daemon is
 a thin HTTP/JSON layer over the existing SDK + a trust gate — NOT new orchestration logic.
 
-### 1. Server — `agi daemon [--port 8787] [--bind <ip>]`
+### 1. Server — `orc daemon [--port 8787] [--bind <ip>]`
 `Bun.serve` exposing JSON endpoints that map 1:1 to the SDK (operating on the same `~/.orc`):
 ```
 GET  /health                              → { ok, version, host }   (no auth; liveness)
@@ -47,11 +47,11 @@ unresolvable identity is DENY, never allow. Keep the decision a PURE function
 deny cases EXHAUSTIVELY: whois-unavailable + no secret → deny; whois resolves a non-allowlisted node →
 deny; no identity + wrong/absent secret → deny; allowlisted node → allow; valid secret → allow.
 
-### 3. Client mode — `agi --host <host> <command>`
+### 3. Client mode — `orc --host <host> <command>`
 When `--host <h>` is present, the existing CLI commands (`list`, `spawn`, `send`, `read`, `wait`,
 `state`, `kill`, `workflow *`) become HTTP calls to `http://<h>:<port>` instead of local SDK calls
-(thin client; identical output/`--json`). `agi remote add|list|rm <host>` manages `~/.orc/peers.json`.
-`agi list --all-hosts` fans out to every peer + local and aggregates with a `host` column.
+(thin client; identical output/`--json`). `orc remote add|list|rm <host>` manages `~/.orc/peers.json`.
+`orc list --all-hosts` fans out to every peer + local and aggregates with a `host` column.
 - Remote `attach`/`read --raw` are host-local: `attach` should print the host + a
   `tailscale ssh <host>` hint instead of a bare local tmux command.
 
@@ -65,16 +65,16 @@ When `--host <h>` is present, the existing CLI commands (`list`, `spawn`, `send`
 ## Verification — REQUIRED, real (no mocks); gates done
 Bind to `127.0.0.1` (loopback stands in for the tailscale IP locally). Throwaway `ORC_HOME`.
 0. **Bind refusal (the layer-1 safety boundary — locally verifiable, do NOT skip):** assert
-   `agi daemon --bind 0.0.0.0 --port <p>` REFUSES to start (non-zero exit, clear error) WITHOUT
+   `orc daemon --bind 0.0.0.0 --port <p>` REFUSES to start (non-zero exit, clear error) WITHOUT
    `--insecure`, and that `--bind 127.0.0.1` (loopback) is allowed. Binding to the tailscale IP is the
    real security primitive (WireGuard won't route `100.x` from off-tailnet); a stray public bind must
    be impossible by default.
-1. Start `agi daemon --bind 127.0.0.1 --port <p>` (background it). `GET /health` returns ok.
-2. Drive a REAL agent THROUGH the API end to end: `agi --host 127.0.0.1:<p> spawn -p claude --prompt
-   "use your Bash tool to run: echo REMOTE_OK then say done"`, then `agi --host … wait <id>`,
-   `agi --host … read <id>` (assert it shows the Bash summary), `agi --host … kill <id>`. The
+1. Start `orc daemon --bind 127.0.0.1 --port <p>` (background it). `GET /health` returns ok.
+2. Drive a REAL agent THROUGH the API end to end: `orc --host 127.0.0.1:<p> spawn -p claude --prompt
+   "use your Bash tool to run: echo REMOTE_OK then say done"`, then `orc --host … wait <id>`,
+   `orc --host … read <id>` (assert it shows the Bash summary), `orc --host … kill <id>`. The
    remote-driven lifecycle must match a local one.
-3. Run a workflow through the API (`agi --host … workflow run <abs>/orc.workflows/example.ts`) and read
+3. Run a workflow through the API (`orc --host … workflow run <abs>/orc.workflows/example.ts`) and read
    its run via `/workflows/runs/:id`.
 4. Trust gate (fail-closed): a request with no allowlisted identity AND no secret → `403`; with a
    WRONG secret → `403`; with the correct `x-orc-secret` → ok. (On loopback, `tailscale whois` cannot

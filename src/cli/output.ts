@@ -1,5 +1,5 @@
 /**
- * Human + JSON renderers for the agi CLI.
+ * Human + JSON renderers for the orc CLI.
  */
 import type { SessionRecord } from '../types.ts';
 import type { WorkflowEvent, WorkflowRun, StepResult } from '../workflow.ts';
@@ -54,7 +54,7 @@ export function renderSessionList(views: SessionView[]): string {
   return views.map(renderSessionLine).join('\n');
 }
 
-/** A session view tagged with the host it lives on (for `agi list --all-hosts`). */
+/** A session view tagged with the host it lives on (for `orc list --all-hosts`). */
 export interface HostSessionView extends SessionView {
   host: string;
 }
@@ -91,7 +91,7 @@ export function renderWorkflowEvent(e: WorkflowEvent): string {
   }
 }
 
-/** Multi-line detail of a persisted run (for `agi workflow status`). */
+/** Multi-line detail of a persisted run (for `orc workflow status`). */
 export function renderRunDetail(run: WorkflowRun): string {
   const head = [
     `id:         ${run.id}`,
@@ -105,7 +105,7 @@ export function renderRunDetail(run: WorkflowRun): string {
   return [...head, ...steps].join('\n');
 }
 
-/** One line per run for `agi workflow list`. */
+/** One line per run for `orc workflow list`. */
 export function renderRunList(runs: WorkflowRun[]): string {
   if (runs.length === 0) return '(no runs)';
   return runs
@@ -116,23 +116,23 @@ export function renderRunList(runs: WorkflowRun[]): string {
     .join('\n');
 }
 
-export const HELP_TEXT = `agi — orc multi-agent orchestration CLI
+export const HELP_TEXT = `orc — multi-agent orchestration CLI
 
 Usage:
-  agi spawn  --provider <claude|codex|pi> [options]   Launch a new agent session
+  orc spawn  --provider <claude|codex|pi> [options]   Launch a new agent session
              aliases: agent, new
-  agi send   <id|name> [PROMPT | - | @file]           Send a prompt (multi-line safe)
-  agi read   <id|name> [--raw]                        Parsed transcript (default) or full pane (--raw)
-  agi state  <id|name>                                Classify state once: starting|running|done|waiting|failed
-  agi wait   <id|name> [--for S] [--timeout SEC]      Block until the agent settles (S: done|waiting|failed|settled)
-  agi list   [--workspace W | --all | --dead | --all-hosts]  List sessions (alias: ps)
-  agi attach <id|name> [--read-only]                  Print the tmux attach command
-  agi kill   <id|name> [--worktree] [--purge]         Kill session (mark dead; --purge removes record)
-  agi prune  [--worktree]                             Drop all dead records (+ optional worktrees)
-  agi workflow <run|list|status|attach|logs> ...      Run/inspect multi-step workflows (alias: wf)
-  agi daemon [--port 8787] [--bind <ip>] [--insecure] Serve the HTTP API over tailscale
-  agi remote <add|list|rm> <host> [--port P]          Manage trusted peers (~/.orc/peers.json)
-  agi help                                            This help
+  orc send   <id|name> [PROMPT | - | @file]           Send a prompt (multi-line safe)
+  orc read   <id|name> [--raw]                        Parsed transcript (default) or full pane (--raw)
+  orc state  <id|name>                                Classify state once: starting|running|done|waiting|failed
+  orc wait   <id|name> [--for S] [--timeout SEC]      Block until the agent settles (S: done|waiting|failed|settled)
+  orc list   [--workspace W | --all | --dead | --all-hosts]  List sessions (alias: ps)
+  orc attach <id|name> [--read-only]                  Print the tmux attach command
+  orc kill   <id|name> [--worktree] [--purge]         Kill session (mark dead; --purge removes record)
+  orc prune  [--worktree]                             Drop all dead records (+ optional worktrees)
+  orc workflow <run|list|status|attach|logs> ...      Run/inspect multi-step workflows (alias: wf)
+  orc daemon [--port 8787] [--bind <ip>] [--insecure] Serve the HTTP API over tailscale
+  orc remote <add|list|rm> <host> [--port P]          Manage trusted peers (~/.orc/peers.json)
+  orc help                                            This help
 
 spawn options:
   --provider, -p <p>     claude | codex | pi (required)
@@ -152,16 +152,16 @@ wait options:
   --timeout <sec>       give up after SEC seconds (default 600); returns the last observed state
 
 workflow subcommands:
-  agi workflow run <file> [--detach] [--json]   Import the file's default-exported WorkflowDef and
+  orc workflow run <file> [--detach] [--json]   Import the file's default-exported WorkflowDef and
                                       run it, streaming step events (or --json the final WorkflowRun).
                                       Exits non-zero if the run failed. --detach runs it as a
                                       detached tmux session (orc-wf-<runId>) and returns the runId
                                       immediately (--json: {runId,runnerTmux}).
-  agi workflow list [--json]          List persisted runs from ~/.orc/runs/ (newest first)
-  agi workflow status <runId> [--json]  Print a run record (per-step state). A \`running\` record
+  orc workflow list [--json]          List persisted runs from ~/.orc/runs/ (newest first)
+  orc workflow status <runId> [--json]  Print a run record (per-step state). A \`running\` record
                                       whose runner session has died is reported \`orphaned\`.
-  agi workflow attach <runId> [--read-only]  Print the tmux attach command for a --detach run's runner
-  agi workflow logs <runId> [--step <id>] [--raw] [--json]  Per-step transcript ('### step <id>
+  orc workflow attach <runId> [--read-only]  Print the tmux attach command for a --detach run's runner
+  orc workflow logs <runId> [--step <id>] [--raw] [--json]  Per-step transcript ('### step <id>
                                       (<provider>)'). --raw shows the live pane; --json emits
                                       {step,turns}[] (or {step,provider,pane}[] with --raw).
 
@@ -172,19 +172,19 @@ A non-worktree step with no predicate is reported \`unverified\` — a yield is 
 Run status: running | done | failed | orphaned (a --detach runner that died mid-run).
 
 daemon + remote (drive agents on other orc hosts over tailscale):
-  agi daemon            Run Bun.serve exposing the SDK as JSON. Binds to this host's
+  orc daemon            Run Bun.serve exposing the SDK as JSON. Binds to this host's
                         tailscale IP by DEFAULT (never 0.0.0.0); refuses an unsafe --bind
                         unless --insecure. --bind 127.0.0.1 for local testing. Every route
                         except GET /health is behind a FAIL-CLOSED trust gate: a caller is
                         allowed iff tailscale whois resolves its IP to an allowlisted peer
-                        (agi remote add) OR it presents x-orc-secret == \$ORC_DAEMON_SECRET.
-  agi remote add <h>    Trust peer <h> (also the host list for --host / --all-hosts).
-  agi --host <h> <cmd>  Run <cmd> against the daemon on <h> (host or host:port) over HTTP
+                        (orc remote add) OR it presents x-orc-secret == \$ORC_DAEMON_SECRET.
+  orc remote add <h>    Trust peer <h> (also the host list for --host / --all-hosts).
+  orc --host <h> <cmd>  Run <cmd> against the daemon on <h> (host or host:port) over HTTP
                         instead of locally — list/spawn/send/read/wait/state/kill/workflow.
                         Output (and --json) is identical to local. Sends x-orc-secret from
                         \$ORC_DAEMON_SECRET when set. Remote attach prints a tailscale ssh hint
                         (the tmux session is host-local).
-  agi list --all-hosts  Fleet view: aggregate local + every trusted peer, with a host column.
+  orc list --all-hosts  Fleet view: aggregate local + every trusted peer, with a host column.
 
 Global:
   --host <h>            Run the command against the daemon on host <h> (see above)

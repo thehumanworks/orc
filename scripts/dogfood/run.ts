@@ -98,7 +98,7 @@ async function doWatch(id: string): Promise<void> {
     // instruction echo has scrolled out of the visible pane.
     const done = commits >= 1 && pane.includes('DOGFOOD_COMPLETE');
     // BLOCKED is pane-only and time-gated past the initial echo (and only when nothing's
-    // been committed). Lower-stakes: the progress tail lets us intervene with `agi send`.
+    // been committed). Lower-stakes: the progress tail lets us intervene with `orc send`.
     const blocked = poll > 6 && commits === 0 ? pane.match(/DOGFOOD_BLOCKED:[^\n]*/) : null;
     // Idle detection: claude shows "esc to interrupt" only during an active turn. When that
     // vanishes the agent has YIELDED — either finished, or waiting on input (a stall, e.g.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * `agi` — the orc CLI dispatcher. Parses the subcommand first, then parses the
+ * `orc` — the orc CLI dispatcher. Parses the subcommand first, then parses the
  * remainder with that command's own options map (parseArgs is strict on unknowns).
  */
 import path from 'node:path';
@@ -341,7 +341,7 @@ async function cmdList(args: string[]): Promise<number> {
 }
 
 /**
- * `agi list --all-hosts` — the fleet view: aggregate local sessions plus every trusted
+ * `orc list --all-hosts` — the fleet view: aggregate local sessions plus every trusted
  * peer's, tagged with a `host` column. Cross-host workspace filtering is meaningless, so
  * this shows ALL sessions on each host unless an explicit `--workspace` is given. An
  * unreachable peer warns to stderr and is skipped (a down host never breaks the view).
@@ -529,7 +529,7 @@ async function cmdWait(args: string[]): Promise<number> {
 }
 
 /**
- * `agi workflow <sub>` — the only command with a sub-arg. argv[1] is the workflow
+ * `orc workflow <sub>` — the only command with a sub-arg. argv[1] is the workflow
  * subcommand (run|list|status); the remainder is that sub's own args.
  */
 async function cmdWorkflow(args: string[]): Promise<number> {
@@ -726,9 +726,9 @@ async function cmdWorkflowAttach(args: string[]): Promise<number> {
 }
 
 /**
- * `agi workflow logs <runId> [--step <id>] [--raw]` — read the actual work each step's
+ * `orc workflow logs <runId> [--step <id>] [--raw]` — read the actual work each step's
  * agent did. Default: the token-efficient parsed transcript per step (the same view as
- * `agi read`), labeled `### step <id> (<provider>)`. `--raw` shows the live pane capture
+ * `orc read`), labeled `### step <id> (<provider>)`. `--raw` shows the live pane capture
  * instead. `--json` emits `{ step, turns }[]` (parsed) or `{ step, provider, pane }[]` (raw).
  */
 async function cmdWorkflowLogs(args: string[]): Promise<number> {
@@ -815,7 +815,7 @@ async function cmdWorkflowLogs(args: string[]): Promise<number> {
 // ============================================================================
 
 /**
- * `agi daemon [--port 8787] [--bind <ip>] [--insecure]` — run the HTTP daemon. Binds to
+ * `orc daemon [--port 8787] [--bind <ip>] [--insecure]` — run the HTTP daemon. Binds to
  * the host's tailscale IP by default (never 0.0.0.0); `resolveBind` refuses an unsafe bind
  * unless `--insecure`. The process blocks here serving forever (Ctrl-C / SIGTERM stops it).
  */
@@ -884,7 +884,7 @@ async function cmdDaemon(args: string[]): Promise<number> {
     process.stderr.write(
       mechanisms.length > 0
         ? `trust: ${mechanisms.join(' + ')} (whois preferred; loopback whois cannot resolve)\n`
-        : 'trust: NONE configured — every request will 403. Add peers (agi remote add) or set ORC_DAEMON_SECRET.\n',
+        : 'trust: NONE configured — every request will 403. Add peers (orc remote add) or set ORC_DAEMON_SECRET.\n',
     );
   }
 
@@ -900,7 +900,7 @@ async function cmdDaemon(args: string[]): Promise<number> {
   return 0; // unreachable
 }
 
-/** `agi remote add|list|rm <host>` — manage the trusted-peer file (~/.orc/peers.json). */
+/** `orc remote add|list|rm <host>` — manage the trusted-peer file (~/.orc/peers.json). */
 async function cmdRemoteAdmin(args: string[]): Promise<number> {
   const sub = args[0];
   const rest = args.slice(1);

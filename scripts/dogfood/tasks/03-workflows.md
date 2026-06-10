@@ -2,7 +2,7 @@
 
 ## Context
 You are an autonomous coding agent in an **isolated git worktree** of `orc` — a tool that drives
-coding-agent CLIs (claude/codex/pi) as interactive tmux sessions, with an SDK + an `agi` CLI. First:
+coding-agent CLIs (claude/codex/pi) as interactive tmux sessions, with an SDK + an `orc` CLI. First:
 `bun install` (no node_modules in the worktree), then read `README.md`, `docs/DESIGN-workflows.md`
 (the design you are implementing), `src/index.ts`, `src/session.ts` (note `state()`, `waitFor()`,
 `readParsed()`), `src/agent.ts`, `src/state.ts` (`AgentState`), and `scripts/dogfood/run.ts` (a
@@ -77,23 +77,23 @@ export async function runWorkflow(def: WorkflowDef, opts?: { onEvent?: (e: Workf
      v1 you may leave sessions running. Document the choice.
 3. Set `status:'done'` if all steps ok; `finishedAt`; final persist; return the run.
 
-### CLI (`agi workflow <sub>`)
-- `agi workflow run <file> [--json]` — import the file's default export (a `WorkflowDef`), run it,
+### CLI (`orc workflow <sub>`)
+- `orc workflow run <file> [--json]` — import the file's default export (a `WorkflowDef`), run it,
   stream step events to stdout (or `--json` the final `WorkflowRun`). Exit non-zero if the run failed.
-- `agi workflow list [--json]` — list persisted runs from `~/.orc/runs/`.
-- `agi workflow status <runId> [--json]` — print a run record (per-step state).
+- `orc workflow list [--json]` — list persisted runs from `~/.orc/runs/`.
+- `orc workflow status <runId> [--json]` — print a run record (per-step state).
 - Add to `HELP_TEXT` and a README "Workflows" section. Wire `workflow` into the dispatcher in
   `src/cli/index.ts` (note: it has a sub-arg, like nothing else there yet — parse `argv[1]` as the
   workflow subcommand).
 
 ### Versioned workflow location + import story
 Workflows are plain TS files the user commits. Import story (decide and document): a `WorkflowDef` is
-just a **plain object** `default`-exported — `agi workflow run <file>` dynamically imports the file and
+just a **plain object** `default`-exported — `orc workflow run <file>` dynamically imports the file and
 `runWorkflow` VALIDATES the shape, so the file needs NO import to work (`orc` is not a resolvable
-package name; the bin is `agi`). `defineWorkflow` is an OPTIONAL typing helper the author may import
+package name; the bin is `orc`). `defineWorkflow` is an OPTIONAL typing helper the author may import
 via a relative path for editor types; it must not be required. Add an example `orc.workflows/example.ts`
 that `default`-exports a plain 2-step `WorkflowDef` (step `a` claude writes a unique token to a file in
-a shared cwd, step `b` codex reads + echoes it) that actually runs, so `agi workflow run
+a shared cwd, step `b` codex reads + echoes it) that actually runs, so `orc workflow run
 orc.workflows/example.ts` is a real smoke test.
 
 ## Constraints
@@ -105,9 +105,9 @@ orc.workflows/example.ts` is a real smoke test.
 
 ## Verification — REQUIRED, real CLIs (gates done)
 Throwaway `ORC_HOME="$(mktemp -d)/orc"`. Run the real example workflow end-to-end:
-1. `agi workflow run orc.workflows/example.ts --json` — assert both steps reach `ok:true`, run
+1. `orc workflow run orc.workflows/example.ts --json` — assert both steps reach `ok:true`, run
    `status:"done"`, and that step `b`'s agent actually saw step `a`'s output (have `a` write a unique
-   token to a file in a shared cwd and `b` read+echo it; check `b`'s transcript via `agi read`).
+   token to a file in a shared cwd and `b` read+echo it; check `b`'s transcript via `orc read`).
 2. Assert the run record exists at `$ORC_HOME/runs/<id>.json` with both steps recorded.
 3. Assert a deliberately-failing step (a `done` predicate that returns false) sets run `status:"failed"`
    and STOPS subsequent steps (plumbing check).

@@ -28,7 +28,7 @@ function shortLabel(h: string): string {
 }
 
 /**
- * Is the resolved identity's node in the allowlist? Matches flexibly so `agi remote add
+ * Is the resolved identity's node in the allowlist? Matches flexibly so `orc remote add
  * mini` (stored as `mini`) authorizes a whois result of `mini.taila038d5.ts.net`: an
  * allowlist entry matches if, normalized, it equals the node's FQDN OR its short label.
  * An empty allowlist matches nothing (fail closed — the secret path is then the only way in).

@@ -10,7 +10,7 @@ import { gitToplevel, createWorktree } from '../src/worktree.ts';
  *
  * Pitfall this guards: a linked git worktree reports ITSELF as `git --show-toplevel`,
  * so resolving the workspace from the worktree cwd would silo the session under
- * <repo>/.orc/worktrees/<id> and hide it from `agi list` in the parent repo. agent()
+ * <repo>/.orc/worktrees/<id> and hide it from `orc list` in the parent repo. agent()
  * therefore resolves the workspace from baseCwd (the original invocation dir, always
  * inside the parent repo), which collapses to the repo root for both the repo and any
  * of its subdirs.
@@ -63,7 +63,7 @@ describe('worktree session → parent repo workspace', () => {
     const repo = await mkRepo();
     const wt = await createWorktree({ cwd: repo, shortId: 'ee55ff66', agentLabel: 'codex' });
     // Documents the regression: had agent() kept resolving from the worktree `cwd`,
-    // the stored workspace would be the worktree path and `agi list` from the repo
+    // the stored workspace would be the worktree path and `orc list` from the repo
     // (which resolves to `repo`) would never match it.
     const buggy = await resolveWorkspace(undefined, wt.path);
     expect(buggy).toBe(wt.path);

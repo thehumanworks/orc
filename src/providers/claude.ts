@@ -82,8 +82,8 @@ export class ClaudeAdapter implements ProviderAdapter {
     // DOES contain the real `user`/`assistant` turns, appended as the conversation
     // progresses (alongside `ai-title`/bookkeeping events). An earlier comment here
     // claimed the file was title-only and that turns were never on disk for interactive
-    // sessions — that was WRONG. The default parsed `agi read` parses these turns; the
-    // raw pane (`agi read --raw`) remains available as the escape hatch.
+    // sessions — that was WRONG. The default parsed `orc read` parses these turns; the
+    // raw pane (`orc read --raw`) remains available as the escape hatch.
     const base = path.join(os.homedir(), '.claude', 'projects');
     const glob = new Bun.Glob(`*/${rec.sessionId}.jsonl`);
     for await (const match of glob.scan({ cwd: base, absolute: true })) {

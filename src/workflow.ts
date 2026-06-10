@@ -67,7 +67,7 @@ export interface WorkflowDef {
 
 export interface StepResult {
   id: string;
-  /** Short session handle (resolves via `agi read`/`getSession`); '' if spawn failed. */
+  /** Short session handle (resolves via `orc read`/`getSession`); '' if spawn failed. */
   sessionId: string;
   provider: Provider;
   state: AgentState;
@@ -94,7 +94,7 @@ export interface WorkflowRun {
   /**
    * Name of the detached tmux session that owns this run (`orc-wf-<runId>`), when the run
    * was launched with `--detach`. Used by status/list liveness reconcile and by
-   * `agi workflow attach`. Absent for a plain foreground run (nothing to reattach/reconcile).
+   * `orc workflow attach`. Absent for a plain foreground run (nothing to reattach/reconcile).
    */
   runnerTmux?: string;
   steps: StepResult[];
@@ -126,7 +126,7 @@ export interface RunWorkflowOptions {
   execStep?: StepExecutor;
   /**
    * Use this runId INSTEAD of generating one. The entrypoint a detached runner executes
-   * (`agi workflow run <file> --run-id <id>`) passes the id minted by `--detach` so both
+   * (`orc workflow run <file> --run-id <id>`) passes the id minted by `--detach` so both
    * sides agree on the record path.
    */
   runId?: string;
@@ -142,7 +142,7 @@ export interface RunWorkflowOptions {
 /**
  * Validate a workflow def's shape: name + non-empty steps, unique ids, a valid provider,
  * and EXACTLY ONE of taskFile|prompt per step. `runWorkflow` calls this too, so a
- * plain-object def loaded by `agi workflow run` (no `defineWorkflow` import required) is
+ * plain-object def loaded by `orc workflow run` (no `defineWorkflow` import required) is
  * still checked. Throws a clear error on the first problem.
  */
 export function validateWorkflowDef(def: WorkflowDef): void {
@@ -292,8 +292,8 @@ export async function deliverInstructions(
 /**
  * The real step executor: spawn the agent → deliver instructions → `waitFor` settle →
  * compute the hard signals → evaluate. Leaves the session ALIVE on purpose (v1 choice):
- * the record stays in the registry so a human can `agi attach`/`agi read` it and a later
- * `agi workflow logs` can read its transcript. Callers tear sessions down explicitly.
+ * the record stays in the registry so a human can `orc attach`/`orc read` it and a later
+ * `orc workflow logs` can read its transcript. Callers tear sessions down explicitly.
  */
 const defaultExecStep: StepExecutor = async ({ step, runId, emit }) => {
   const session = await agent({
@@ -416,7 +416,7 @@ export function runnerTmuxName(runId: string): string {
 
 /**
  * Reconcile a persisted run status against its runner's liveness — the PURE decision
- * behind `agi workflow status`/`list`. A finalized status (`done`/`failed`/`orphaned`)
+ * behind `orc workflow status`/`list`. A finalized status (`done`/`failed`/`orphaned`)
  * is TRUSTED as-is (the runner, or a prior reconcile, wrote it deliberately). Only a
  * `running` record is suspect: if its runner session is provably NOT alive the runner
  * died mid-run, so the effective status is `orphaned`. `runnerAlive === null` means
@@ -454,7 +454,7 @@ export async function reconcileRun(run: WorkflowRun, driver: Driver = getDriver(
   return run;
 }
 
-/** A single step's transcript, for `agi workflow logs`. */
+/** A single step's transcript, for `orc workflow logs`. */
 export interface StepLog {
   step: string;
   provider: Provider;
@@ -462,7 +462,7 @@ export interface StepLog {
 }
 
 /**
- * Assemble per-step transcripts for `agi workflow logs`. PURE orchestration over an
+ * Assemble per-step transcripts for `orc workflow logs`. PURE orchestration over an
  * injected `readTurns` reader (so it's unit-testable with a fake run record + fake reader
  * — no live session required). With `stepId`, returns just that one step and throws a
  * clear error if the run has no such step.

@@ -83,7 +83,7 @@ export interface SessionRecord {
    * Lifecycle status. Absent (undefined) means alive/active. 'dead' marks a record
    * that was explicitly killed: it is KEPT in the registry (not deleted) so transcript
    * and metadata reads still resolve after kill (ARCHITECTURE: keep dead records for
-   * transcript reads). Hidden from `agi list` by default; shown with --all/--dead.
+   * transcript reads). Hidden from `orc list` by default; shown with --all/--dead.
    */
   status?: SessionStatus;
   /** ISO timestamp set when the record was killed. */

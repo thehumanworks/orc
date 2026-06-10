@@ -2,7 +2,7 @@ import { describe, test, expect } from 'bun:test';
 import { decidePromptSource } from '../src/cli/index.ts';
 
 /**
- * BUG 1 — `agi spawn`/`send` hung forever on non-TTY stdin because the undefined-prompt
+ * BUG 1 — `orc spawn`/`send` hung forever on non-TTY stdin because the undefined-prompt
  * branch read `Bun.stdin.text()` unconditionally. decidePromptSource is the pure decision
  * that fixes it: only reach for stdin when EXPLICITLY '-', or (for required prompts) when
  * stdin is actually piped. spawn (requireStdin=false) never reads stdin opportunistically.

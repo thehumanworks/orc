@@ -1,10 +1,10 @@
-# orc / agi — Architecture (v1)
+# orc / orc — Architecture (v1)
 
 `orc` is a multi-agent orchestration tool. Its core primitive is `agent()`: it launches a
 coding-agent CLI (`claude`, `codex`, or `pi`) as an **interactive TUI** inside a **detached,
 reattachable, readable** session, optionally in a fresh git worktree, in yolo mode by default.
 Subagent sessions outlive the parent and can be reattached/inspected by the human — work is never
-opaque. Ships as a TypeScript SDK (Bun) and a CLI `agi`. Both are consumed mostly by AI agents, so
+opaque. Ships as a TypeScript SDK (Bun) and a CLI `orc`. Both are consumed mostly by AI agents, so
 every surface is scriptable and `--json`-capable.
 
 See `docs/RESEARCH.md` for the verified primitives behind every decision here.
@@ -20,7 +20,7 @@ See `docs/RESEARCH.md` for the verified primitives behind every decision here.
 ## Layout
 ```
 orc/
-  package.json            # type:module, bin: { agi: "./src/cli/index.ts" }, engines bun
+  package.json            # type:module, bin: { orc: "./src/cli/index.ts" }, engines bun
   tsconfig.json
   README.md
   docs/{RESEARCH.md,ARCHITECTURE.md}
@@ -42,7 +42,7 @@ orc/
       codex.ts
       pi.ts
     cli/
-      index.ts            # `agi` dispatcher (parseArgs), --json everywhere, stdin support for prompts
+      index.ts            # `orc` dispatcher (parseArgs), --json everywhere, stdin support for prompts
       output.ts           # human + json renderers
   test/                   # bun:test — unit tests for pure logic (naming, slug/glob, argv build, parsing)
 ```
@@ -99,7 +99,7 @@ class Session {
   capture(opts?: { scrollback?: boolean }): Promise<string>;  // tmux capture-pane
   transcript(): Promise<string | null>;              // path to on-disk JSONL (provider-resolved)
   readTranscript(): Promise<string | null>;          // raw JSONL contents
-  readParsed(): Promise<Turn[]>;                      // token-efficient parsed turns (default `agi read`)
+  readParsed(): Promise<Turn[]>;                      // token-efficient parsed turns (default `orc read`)
   attachCommand(opts?: { readOnly?: boolean }): string;       // `tmux attach [-r] -t <name>`
   kill(opts?: { removeWorktree?: boolean }): Promise<void>;   // kill tmux session (+ optional worktree)
   toJSON(): SessionRecord;
@@ -193,25 +193,25 @@ TmuxDriver implementation notes:
 - **Workspace** = `opts.workspace` ?? git toplevel of cwd ?? realpath(cwd). Stored on the record.
 - `listSessions({workspace, all})`: read registry, reconcile each against `driver.isAlive` /
   `driver.list`; default filter = workspace of process.cwd(); `all` returns every workspace.
-  Prune dead records lazily (mark dead, keep for transcript reads; optionally `agi prune`).
+  Prune dead records lazily (mark dead, keep for transcript reads; optionally `orc prune`).
 
-## CLI `agi` (`src/cli/index.ts`)
+## CLI `orc` (`src/cli/index.ts`)
 Commands (all accept `--json`; prompts accept `-` / stdin / `@file`):
 ```
-agi spawn  --provider <p> [--model M] [--agent NAME | --system-prompt P] [--prompt TXT|-]
+orc spawn  --provider <p> [--model M] [--agent NAME | --system-prompt P] [--prompt TXT|-]
            [--cwd DIR] [--workspace W] [--worktree [--branch B]] [--no-wait] [--json]
-           # prints the SessionRecord (human or json). Alias: `agi agent`, `agi new`.
-agi send   <id|name> [PROMPT | - | @file] [--json]      # multi-line safe; piped stdin or '-' if PROMPT omitted
-agi read   <id|name> [--raw] [--json]                   # parsed transcript (default) or full pane (--raw)
-agi list   [--workspace W | --all | --dead] [--json]    # active sessions for a workspace. Alias: `agi ps`.
-agi attach <id|name> [--read-only] [--json]             # prints `tmux attach ...` (does not exec by default)
-agi kill   <id|name> [--worktree] [--purge] [--json]    # mark session dead (keep record); --purge removes record
-agi prune  [--worktree] [--json]                        # drop all dead records (+ optional worktree removal)
-agi help
+           # prints the SessionRecord (human or json). Alias: `orc agent`, `orc new`.
+orc send   <id|name> [PROMPT | - | @file] [--json]      # multi-line safe; piped stdin or '-' if PROMPT omitted
+orc read   <id|name> [--raw] [--json]                   # parsed transcript (default) or full pane (--raw)
+orc list   [--workspace W | --all | --dead] [--json]    # active sessions for a workspace. Alias: `orc ps`.
+orc attach <id|name> [--read-only] [--json]             # prints `tmux attach ...` (does not exec by default)
+orc kill   <id|name> [--worktree] [--purge] [--json]    # mark session dead (keep record); --purge removes record
+orc prune  [--worktree] [--json]                        # drop all dead records (+ optional worktree removal)
+orc help
 ```
-Notes for AI consumers: non-zero exit on error with a JSON `{error}` when `--json`; `agi list --json`
-returns an array of records with a live `status` field; `agi spawn --json` returns the record so a
-caller can immediately `agi send <id>`.
+Notes for AI consumers: non-zero exit on error with a JSON `{error}` when `--json`; `orc list --json`
+returns an array of records with a live `status` field; `orc spawn --json` returns the record so a
+caller can immediately `orc send <id>`.
 
 ## Verification gate (what "done" means — no mocks substitute)
 A real yolo session launched in tmux for BOTH claude and codex; a **multi-line** prompt delivered and

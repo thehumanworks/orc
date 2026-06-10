@@ -2,9 +2,9 @@
  * The trusted-peer store, `~/.orc/peers.json`. It serves a DUAL role:
  *  - on the SERVER: the allowlist of tailnet hostnames whose `tailscale whois` identity
  *    is permitted (the trust gate's `allowlist`).
- *  - on the CLIENT: the set of remote daemons `agi --host`/`--all-hosts` can talk to.
+ *  - on the CLIENT: the set of remote daemons `orc --host`/`--all-hosts` can talk to.
  *
- * Managed by `agi remote add|list|rm <host>`. Written atomically (tmp + rename), like the
+ * Managed by `orc remote add|list|rm <host>`. Written atomically (tmp + rename), like the
  * session registry. A peer is a tailnet host plus an optional non-default port.
  */
 import fs from 'node:fs/promises';
@@ -12,7 +12,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { orcHome, peersPath } from '../paths.ts';
 
-/** The fixed default daemon port (overridable per peer and via `agi daemon --port`). */
+/** The fixed default daemon port (overridable per peer and via `orc daemon --port`). */
 export const DEFAULT_DAEMON_PORT = 8787;
 
 export interface PeerEntry {

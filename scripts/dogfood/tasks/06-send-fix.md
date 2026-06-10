@@ -36,10 +36,10 @@ multi-KB prompt and everything works around it with a file + short pointer (see 
 Throwaway `ORC_HOME`. For claude AND codex (pi if convenient):
 1. Build a ~5KB multi-line prompt with a UNIQUE token on its FIRST content line (`STARTTOK_<rand>`)
    and a UNIQUE token on its LAST line (`ENDTOK_<rand>`), instructing the agent to "reply with exactly
-   these two tokens separated by a space." Spawn a session and `agi send` (or `agent({prompt})`) it.
+   these two tokens separated by a space." Spawn a session and `orc send` (or `agent({prompt})`) it.
 2. Assert `send()` SUCCEEDS (no throw) and the agent received the **FULL** prompt — its reply/transcript
    contains BOTH `STARTTOK_<rand>` AND `ENDTOK_<rand>` (proves the whole paste landed, not a truncated
-   or tripled copy). Reading via `agi read` (parsed) is the cleanest check.
+   or tripled copy). Reading via `orc read` (parsed) is the cleanest check.
 3. Sanity: a normal short prompt still sends fine.
 4. Clean up: kill sessions, remove throwaway ORC_HOME, restore `~/.codex/config.toml`. Inside tmux;
    prefix nested spawns with `TMUX= ` if needed.
