@@ -128,7 +128,7 @@ Usage:
   orc list   [--workspace W | --all | --dead | --all-hosts]  List sessions (alias: ps)
   orc attach <id|name> [--read-only]                  Attach to the tmux session
   orc kill   <id|name> [--worktree] [--purge]         Kill session (mark dead; --purge removes record)
-  orc prune  [--worktree]                             Drop all dead records (+ optional worktrees)
+  orc prune  [--worktree]                             Drop marked-dead/gone records (+ optional worktrees)
   orc workflow <run|list|status|attach|logs> ...      Run/inspect multi-step workflows (alias: wf)
   orc daemon [--port 8787] [--bind <ip>] [--insecure] Serve the HTTP API over tailscale
   orc remote <add|list|rm> <host> [--port P]          Manage trusted peers (~/.orc/peers.json)

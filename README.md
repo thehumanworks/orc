@@ -45,7 +45,7 @@ orc wait   <id|name> [--for done|waiting|failed|settled] [--timeout <sec>]
 orc list   [--workspace W | --all | --dead]         List sessions for a workspace (alias: ps)
 orc attach <id|name> [--read-only]                  Attach to the tmux session
 orc kill   <id|name> [--worktree] [--purge]         Kill the session (mark dead; --purge removes record)
-orc prune  [--worktree]                             Drop all dead records (+ optionally their worktrees)
+orc prune  [--worktree]                             Drop marked-dead/gone records (+ optionally their worktrees)
 orc workflow run|list|status|logs|attach …          Run/inspect multi-step workflows (see Workflows)
 orc daemon [--port P] [--bind IP] [--insecure]      Serve the HTTP API over tailscale (see Daemon)
 orc remote add|list|rm <host>                       Manage trusted peer hosts (~/.orc/peers.json)
@@ -160,7 +160,7 @@ with `Escape` and never accepted.
 `orc kill` keeps the session record (marked dead) so `orc read` still resolves the transcript after a
 kill — the transcript path is resolved and persisted at kill time. Dead records are hidden from
 `orc list` by default (`--dead`/`--all` to show them). Use `orc kill <id> --purge` to remove a single
-record, or `orc prune` to drop all dead records.
+record, or `orc prune` to drop records that are either marked dead or whose tmux session is gone.
 
 ## Agent state & `wait`
 

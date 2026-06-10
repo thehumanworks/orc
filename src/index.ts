@@ -3,7 +3,8 @@
  */
 import fs from 'node:fs/promises';
 import { getDriver } from './drivers/driver.ts';
-import { readRegistry, writeRegistry, findRecord } from './registry.ts';
+import { readRegistry, findRecord, updateRegistry } from './registry.ts';
+import type { Driver } from './drivers/driver.ts';
 import { gitToplevel, removeWorktree } from './worktree.ts';
 import { resolveWorkspace } from './agent.ts';
 import { Session } from './session.ts';
@@ -89,9 +90,38 @@ export async function listSessions(filter?: {
  * Prune dead records from the registry. Returns the ids removed. With
  * `removeWorktree`, also removes each pruned record's git worktree.
  */
-export async function pruneSessions(opts?: { removeWorktree?: boolean }): Promise<string[]> {
+export async function pruneSessions(opts?: {
+  removeWorktree?: boolean;
+  driver?: Driver;
+}): Promise<string[]> {
+  const driver = opts?.driver ?? getDriver();
   const records = await readRegistry();
-  const dead = records.filter((r) => r.status === 'dead');
+  const deadById = new Map<string, string>();
+  await Promise.all(
+    records.map(async (r) => {
+      if (r.status === 'dead') {
+        deadById.set(r.id, r.tmuxName);
+        return;
+      }
+      try {
+        if (!(await driver.isAlive(r.tmuxName))) deadById.set(r.id, r.tmuxName);
+      } catch {
+        // A liveness backend error is not proof that the session is gone.
+      }
+    }),
+  );
+
+  const dead = await updateRegistry((current) => {
+    const toRemove = new Set<string>();
+    for (const r of current) {
+      const observedTmuxName = deadById.get(r.id);
+      if (r.status === 'dead' || observedTmuxName === r.tmuxName) toRemove.add(r.id);
+    }
+    return {
+      records: current.filter((r) => !toRemove.has(r.id)),
+      value: current.filter((r) => toRemove.has(r.id)),
+    };
+  });
   if (dead.length === 0) return [];
   if (opts?.removeWorktree) {
     for (const r of dead) {
@@ -100,8 +130,6 @@ export async function pruneSessions(opts?: { removeWorktree?: boolean }): Promis
       }
     }
   }
-  const live = records.filter((r) => r.status !== 'dead');
-  await writeRegistry(live);
   return dead.map((r) => r.id);
 }
 

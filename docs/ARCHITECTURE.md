@@ -189,13 +189,15 @@ TmuxDriver implementation notes:
 ## Registry + workspace (`src/registry.ts`, `src/paths.ts`)
 - Home: `~/.orc/` (override `ORC_HOME`). Sessions dir: `~/.orc/sessions/` (per-provider on-disk pi
   transcripts go under `~/.orc/transcripts/pi/<sid>/`). Registry: `~/.orc/registry.json`
-  (array of SessionRecord) — write atomically (tmp + rename).
+  (array of SessionRecord) — registry mutations take a cross-process lock, then write
+  atomically (tmp + rename).
 - `SessionRecord`: { id, sessionId, provider, model?, agentName?, tmuxName, cwd, worktreePath?, branch?,
   workspace, systemPromptMode?, createdAt }.
 - **Workspace** = `opts.workspace` ?? git toplevel of cwd ?? realpath(cwd). Stored on the record.
-- `listSessions({workspace, all})`: read registry, reconcile each against `driver.isAlive` /
-  `driver.list`; default filter = workspace of process.cwd(); `all` returns every workspace.
-  Prune dead records lazily (mark dead, keep for transcript reads; optionally `orc prune`).
+- `listSessions({workspace, all})`: read registry; default filter = workspace of process.cwd();
+  `all` returns every workspace. CLI rendering reconciles each row against `driver.isAlive`.
+  Prune dead records lazily (mark dead, keep for transcript reads); `orc prune` removes both
+  marked-dead records and records whose tmux session is gone.
 
 ## CLI `orc` (`src/cli/index.ts`)
 Commands (all accept `--json`; prompts accept `-` / stdin / `@file`):
@@ -208,7 +210,7 @@ orc read   <id|name> [--last|--index N|--full|--raw] [--json] # latest parsed tu
 orc list   [--workspace W | --all | --dead] [--json]    # active sessions for a workspace. Alias: `orc ps`.
 orc attach <id|name> [--read-only] [--json]             # attaches locally; --json prints `tmux attach ...`
 orc kill   <id|name> [--worktree] [--purge] [--json]    # mark session dead (keep record); --purge removes record
-orc prune  [--worktree] [--json]                        # drop all dead records (+ optional worktree removal)
+orc prune  [--worktree] [--json]                        # drop marked-dead/gone records (+ optional worktree removal)
 orc help
 ```
 Notes for AI consumers: non-zero exit on error with a JSON `{error}` when `--json`; `orc list --json`
