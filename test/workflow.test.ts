@@ -103,6 +103,14 @@ describe('validateWorkflowDef / defineWorkflow', () => {
       }),
     ).toThrow(/invalid provider/);
   });
+  test('rejects invalid step aliases', () => {
+    expect(() =>
+      validateWorkflowDef({
+        name: 'x',
+        steps: [step({ id: 'a', alias: '@bad' })],
+      }),
+    ).toThrow(/invalid alias/);
+  });
 });
 
 describe('interpolate ${stepId.field}', () => {

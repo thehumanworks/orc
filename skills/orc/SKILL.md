@@ -36,13 +36,13 @@ session at any time, and sessions outlive this one. Full command surface: **`ref
 (read it when you need a flag you don't remember). The essentials:
 
 ```
-orc spawn -p <claude|codex|pi> [--prompt P|-|@file] [--agent NAME] [--worktree] [--cwd DIR] --json
-orc send  <id> [PROMPT|-|@file]      # follow-up / steer (multi-line safe)
-orc state <id>                       # starting|running|done|waiting|failed (one shot)
-orc wait  <id> [--for done|settled]  # BLOCK until it settles (debounced — reliable)
-orc read  <id> [--full|--index N]     # latest parsed turn by default; --full transcript; --raw live pane
+orc spawn -p <claude|codex|pi> [--prompt P|-|@file] [--agent NAME] [--alias NAME] [--worktree] [--cwd DIR] --json
+orc send  <id|@alias> [PROMPT|-|@file] # follow-up / steer (multi-line safe)
+orc state <id|@alias>                # starting|running|done|waiting|failed (one shot)
+orc wait  <id|@alias> [--for done|settled] # BLOCK until it settles (debounced — reliable)
+orc read  <id|@alias> [--full|--index N] # latest parsed turn by default; --full transcript; --raw live pane
 orc list  [--all] [--json]           # what's running ( hygiene: audit before you finish )
-orc kill  <id> [--worktree] [--purge]; orc prune [--worktree]
+orc kill  <id|@alias> [--worktree] [--purge]; orc prune [--worktree]
 orc workflow run <file.ts> [--detach]; orc workflow logs <runId> [--step id]
 ```
 

@@ -35,7 +35,7 @@ per node. So:
 ## API surface (all JSON; mirrors the SDK + CLI)
 ```
 GET  /sessions?workspace=&all=&dead=     → list (each record gains a live `state` from F1)
-POST /sessions   {provider,model,agent,systemPrompt,prompt,worktree,cwd,workspace}  → spawn
+POST /sessions   {provider,model,agent,alias,systemPrompt,prompt,worktree,cwd,workspace}  → spawn
 GET  /sessions/:id                       → record + state()
 GET  /sessions/:id/read?raw=&full=&last=&index=  → selected parsed turns (or raw pane) [reuses readParsed]
 POST /sessions/:id/send   {prompt}       → send

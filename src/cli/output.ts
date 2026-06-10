@@ -3,6 +3,7 @@
  */
 import type { SessionRecord } from '../types.ts';
 import type { WorkflowEvent, WorkflowRun, StepResult } from '../workflow.ts';
+import { aliasHandle } from '../registry.ts';
 
 export interface SessionView extends SessionRecord {
   status?: 'running' | 'dead';
@@ -25,8 +26,9 @@ export function renderSessionLine(rec: SessionView): string {
   const status = rec.status ? `[${rec.status}]` : '';
   const wt = rec.worktreePath ? ` wt=${rec.worktreePath}` : '';
   const agent = rec.agentName ? ` agent=${rec.agentName}` : '';
+  const alias = rec.alias ? ` alias=${aliasHandle(rec)}` : '';
   const model = rec.model ? ` model=${rec.model}` : '';
-  return `${rec.id}  ${rec.provider} ${status} ${rec.tmuxName}${model}${agent}  cwd=${rec.cwd}${wt}`.trim();
+  return `${rec.id}  ${rec.provider} ${status} ${rec.tmuxName}${model}${agent}${alias}  cwd=${rec.cwd}${wt}`.trim();
 }
 
 /** Multi-line human detail of a session record. */
@@ -37,6 +39,8 @@ export function renderSessionDetail(rec: SessionView): string {
     `provider:    ${rec.provider}`,
     rec.model ? `model:       ${rec.model}` : null,
     rec.agentName ? `agentName:   ${rec.agentName}` : null,
+    rec.alias ? `alias:       @${rec.alias}` : null,
+    rec.alias ? `aliasKey:    ${aliasHandle(rec)}` : null,
     `tmuxName:    ${rec.tmuxName}`,
     rec.status ? `status:      ${rec.status}` : null,
     `cwd:         ${rec.cwd}`,
@@ -121,13 +125,13 @@ export const HELP_TEXT = `orc — multi-agent orchestration CLI
 Usage:
   orc spawn  --provider <claude|codex|pi> [options]   Launch a new agent session
              aliases: agent, new
-  orc send   <id|name> [PROMPT | - | @file]           Send a prompt (multi-line safe)
-  orc read   <id|name> [--last|--index N|--full|--raw]  Latest parsed turn by default; --full = full transcript; --raw = full pane
-  orc state  <id|name>                                Classify state once: starting|running|done|waiting|failed
-  orc wait   <id|name> [--for S] [--timeout SEC]      Block until the agent settles (S: done|waiting|failed|settled)
+  orc send   <id|@alias> [PROMPT | - | @file]         Send a prompt (multi-line safe)
+  orc read   <id|@alias> [--last|--index N|--full|--raw]  Latest parsed turn by default; --full = full transcript; --raw = full pane
+  orc state  <id|@alias>                              Classify state once: starting|running|done|waiting|failed
+  orc wait   <id|@alias> [--for S] [--timeout SEC]    Block until the agent settles (S: done|waiting|failed|settled)
   orc list   [--workspace W | --all | --dead | --all-hosts]  List sessions (alias: ps)
-  orc attach <id|name> [--read-only]                  Attach to the tmux session
-  orc kill   <id|name> [--worktree] [--purge]         Kill session (mark dead; --purge removes record)
+  orc attach <id|@alias> [--read-only]                Attach to the tmux session
+  orc kill   <id|@alias> [--worktree] [--purge]       Kill session (mark dead; --purge removes record)
   orc prune  [--worktree]                             Drop marked-dead/gone records (+ optional worktrees)
   orc workflow <run|list|status|attach|logs> ...      Run/inspect multi-step workflows (alias: wf)
   orc daemon [--port 8787] [--bind <ip>] [--insecure] Serve the HTTP API over tailscale
@@ -138,6 +142,7 @@ spawn options:
   --provider, -p <p>     claude | codex | pi (required)
   --model, -m <model>    model name
   --agent <name>         named agent definition (codex TOML matched by name; mutually exclusive with --system-prompt)
+  --alias <name>         workspace-scoped session alias; later use @name or @workspace:name
   --system-prompt <txt>  system prompt text
   --system-prompt-mode   append (default) | replace
   --prompt <txt | ->     initial prompt sent after boot (- reads stdin)
@@ -196,6 +201,12 @@ read --json emits the selected parsed turn array ([{role,text},...]); --raw --js
 {id,pane}; if no transcript exists yet it falls back to {id,fallback:true,pane}.
 state --json emits {id,state}. wait --json emits {id,state,elapsedMs,timedOut};
 exit 0 iff the requested state actually settled after debounce, non-zero on timeout.
+
+Session aliases are active-session handles, not agent definitions. Spawn with
+\`--alias debugger\`, then address it as \`@debugger\` from the same workspace or
+\`@orc:debugger\` from outside a workspace named \`orc\`. The same alias cannot be
+used by two active sessions in one workspace, but can be reused after the old session
+is killed or pruned. Dead transcript records remain addressable by id.
 
 State meaning: 'done' = the composer is idle and ready for YOUR input (NOT "succeeded"
 — it also covers an agent that asked a clarifying question, which is pane-identical to

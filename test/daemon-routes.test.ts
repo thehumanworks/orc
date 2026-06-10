@@ -68,12 +68,14 @@ describe('mapSpawnRequest — request → AgentOptions', () => {
     const o = mapSpawnRequest({
       provider: 'codex',
       agent: 'reviewer',
+      alias: 'codex-debugger',
       model: 'gpt-5.5',
       prompt: 'hi',
       cwd: '/tmp/x',
       workspace: 'ws',
     });
     expect(o.agentName).toBe('reviewer');
+    expect(o.alias).toBe('codex-debugger');
     expect(o.model).toBe('gpt-5.5');
     expect(o.prompt).toBe('hi');
     expect(o.cwd).toBe('/tmp/x');

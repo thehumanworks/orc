@@ -34,6 +34,11 @@ export interface AgentOptions {
   model?: string;
   /** Name of an existing agent definition (claude/codex, project- or user-scoped). */
   agentName?: string;
+  /**
+   * Orchestrator-local handle for this session. Distinct from agentName/systemPrompt:
+   * it only affects how orc resolves the session later (`@alias` / `@workspace:alias`).
+   */
+  alias?: string;
   /** System prompt text. INVALID to pass together with agentName (validation error). */
   systemPrompt?: string;
   /** 'append' (default) augments the CLI's built-in prompt; 'replace' overrides it. */
@@ -69,6 +74,10 @@ export interface SessionRecord {
   provider: Provider;
   model?: string;
   agentName?: string;
+  /** Workspace-scoped, reusable active-session alias. */
+  alias?: string;
+  /** Transient pre-spawn reservation used to make alias creation race-resistant. */
+  aliasReservedAt?: string;
   tmuxName: string;
   /** realpath of the launch cwd (== worktree path if worktree). */
   cwd: string;

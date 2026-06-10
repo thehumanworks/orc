@@ -138,6 +138,18 @@ function jsonFlag(values: Parsed['values']): boolean {
   return values.json === true;
 }
 
+async function getSessionForCli(
+  idOrName: string,
+  json: boolean,
+): Promise<Awaited<ReturnType<typeof getSession>> | undefined> {
+  try {
+    return await getSession(idOrName);
+  } catch (e) {
+    printError((e as Error).message, json);
+    return undefined;
+  }
+}
+
 export interface ReadFlagValues {
   raw?: string | boolean;
   full?: string | boolean;
@@ -181,6 +193,7 @@ async function cmdSpawn(args: string[]): Promise<number> {
     provider: { type: 'string', short: 'p' },
     model: { type: 'string', short: 'm' },
     agent: { type: 'string' },
+    alias: { type: 'string' },
     'system-prompt': { type: 'string' },
     'system-prompt-mode': { type: 'string' },
     prompt: { type: 'string' },
@@ -221,6 +234,7 @@ async function cmdSpawn(args: string[]): Promise<number> {
     provider,
     model: values.model as string | undefined,
     agentName: values.agent as string | undefined,
+    alias: values.alias as string | undefined,
     systemPrompt: values['system-prompt'] as string | undefined,
     systemPromptMode: mode,
     prompt,
@@ -256,10 +270,11 @@ async function cmdSend(args: string[]): Promise<number> {
   const json = jsonFlag(values);
   const idOrName = positionals[0];
   if (!idOrName) {
-    printError('send requires <id|name>', json);
+    printError('send requires <id|@alias>', json);
     return 1;
   }
-  const session = await getSession(idOrName);
+  const session = await getSessionForCli(idOrName, json);
+  if (session === undefined) return 1;
   if (!session) {
     printError(`no session found for '${idOrName}'`, json);
     return 1;
@@ -309,10 +324,11 @@ async function cmdRead(args: string[]): Promise<number> {
   }
   const idOrName = positionals[0];
   if (!idOrName) {
-    printError('read requires <id|name>', json);
+    printError('read requires <id|@alias>', json);
     return 1;
   }
-  const session = await getSession(idOrName);
+  const session = await getSessionForCli(idOrName, json);
+  if (session === undefined) return 1;
   if (!session) {
     printError(`no session found for '${idOrName}'`, json);
     return 1;
@@ -432,10 +448,11 @@ async function cmdAttach(args: string[]): Promise<number> {
   const json = jsonFlag(values);
   const idOrName = positionals[0];
   if (!idOrName) {
-    printError('attach requires <id|name>', json);
+    printError('attach requires <id|@alias>', json);
     return 1;
   }
-  const session = await getSession(idOrName);
+  const session = await getSessionForCli(idOrName, json);
+  if (session === undefined) return 1;
   if (!session) {
     printError(`no session found for '${idOrName}'`, json);
     return 1;
@@ -462,10 +479,11 @@ async function cmdKill(args: string[]): Promise<number> {
   const json = jsonFlag(values);
   const idOrName = positionals[0];
   if (!idOrName) {
-    printError('kill requires <id|name>', json);
+    printError('kill requires <id|@alias>', json);
     return 1;
   }
-  const session = await getSession(idOrName);
+  const session = await getSessionForCli(idOrName, json);
+  if (session === undefined) return 1;
   if (!session) {
     printError(`no session found for '${idOrName}'`, json);
     return 1;
@@ -512,10 +530,11 @@ async function cmdState(args: string[]): Promise<number> {
   const json = jsonFlag(values);
   const idOrName = positionals[0];
   if (!idOrName) {
-    printError('state requires <id|name>', json);
+    printError('state requires <id|@alias>', json);
     return 1;
   }
-  const session = await getSession(idOrName);
+  const session = await getSessionForCli(idOrName, json);
+  if (session === undefined) return 1;
   if (!session) {
     printError(`no session found for '${idOrName}'`, json);
     return 1;
@@ -541,7 +560,7 @@ async function cmdWait(args: string[]): Promise<number> {
   const json = jsonFlag(values);
   const idOrName = positionals[0];
   if (!idOrName) {
-    printError('wait requires <id|name>', json);
+    printError('wait requires <id|@alias>', json);
     return 1;
   }
   const forArg = (values.for as string | undefined) ?? 'settled';
@@ -559,7 +578,8 @@ async function cmdWait(args: string[]): Promise<number> {
     }
     timeoutMs = Math.round(sec * 1000);
   }
-  const session = await getSession(idOrName);
+  const session = await getSessionForCli(idOrName, json);
+  if (session === undefined) return 1;
   if (!session) {
     printError(`no session found for '${idOrName}'`, json);
     return 1;
@@ -1107,6 +1127,7 @@ async function remoteSpawn(client: DaemonClient, args: string[]): Promise<number
     provider: { type: 'string', short: 'p' },
     model: { type: 'string', short: 'm' },
     agent: { type: 'string' },
+    alias: { type: 'string' },
     'system-prompt': { type: 'string' },
     'system-prompt-mode': { type: 'string' },
     prompt: { type: 'string' },
@@ -1139,6 +1160,7 @@ async function remoteSpawn(client: DaemonClient, args: string[]): Promise<number
     provider,
     model: values.model,
     agent: values.agent,
+    alias: values.alias,
     systemPrompt: values['system-prompt'],
     systemPromptMode: mode,
     prompt,
@@ -1164,7 +1186,7 @@ async function remoteSend(client: DaemonClient, args: string[]): Promise<number>
   const json = jsonFlag(values);
   const id = positionals[0];
   if (!id) {
-    printError('send requires <id|name>', json);
+    printError('send requires <id|@alias>', json);
     return 1;
   }
   let prompt: string | undefined;
@@ -1207,7 +1229,7 @@ async function remoteRead(client: DaemonClient, args: string[]): Promise<number>
   }
   const id = positionals[0];
   if (!id) {
-    printError('read requires <id|name>', json);
+    printError('read requires <id|@alias>', json);
     return 1;
   }
   try {
@@ -1245,7 +1267,7 @@ async function remoteWait(client: DaemonClient, args: string[]): Promise<number>
   const json = jsonFlag(values);
   const id = positionals[0];
   if (!id) {
-    printError('wait requires <id|name>', json);
+    printError('wait requires <id|@alias>', json);
     return 1;
   }
   const forArg = (values.for as string | undefined) ?? 'settled';
@@ -1278,7 +1300,7 @@ async function remoteState(client: DaemonClient, args: string[]): Promise<number
   const json = jsonFlag(values);
   const id = positionals[0];
   if (!id) {
-    printError('state requires <id|name>', json);
+    printError('state requires <id|@alias>', json);
     return 1;
   }
   try {
@@ -1301,7 +1323,7 @@ async function remoteKill(client: DaemonClient, args: string[]): Promise<number>
   const json = jsonFlag(values);
   const id = positionals[0];
   if (!id) {
-    printError('kill requires <id|name>', json);
+    printError('kill requires <id|@alias>', json);
     return 1;
   }
   const purge = values.purge === true;
@@ -1333,7 +1355,7 @@ async function remoteAttach(
   const json = jsonFlag(values);
   const id = positionals[0];
   if (!id) {
-    printError('attach requires <id|name>', json);
+    printError('attach requires <id|@alias>', json);
     return 1;
   }
   let tmuxName: string | undefined;

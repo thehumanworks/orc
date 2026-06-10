@@ -192,25 +192,29 @@ TmuxDriver implementation notes:
   transcripts go under `~/.orc/transcripts/pi/<sid>/`). Registry: `~/.orc/registry.json`
   (array of SessionRecord) — registry mutations take a cross-process lock, then write
   atomically (tmp + rename).
-- `SessionRecord`: { id, sessionId, provider, model?, agentName?, tmuxName, cwd, worktreePath?, branch?,
-  workspace, systemPromptMode?, createdAt }.
+- `SessionRecord`: { id, sessionId, provider, model?, agentName?, alias?, tmuxName, cwd,
+  worktreePath?, branch?, workspace, systemPromptMode?, createdAt }.
 - **Workspace** = `opts.workspace` ?? git toplevel of cwd ?? realpath(cwd). Stored on the record.
 - `listSessions({workspace, all})`: read registry; default filter = workspace of process.cwd();
   `all` returns every workspace. CLI rendering reconciles each row against `driver.isAlive`.
   Prune dead records lazily (mark dead, keep for transcript reads); `orc prune` removes both
   marked-dead records and records whose tmux session is gone.
+- **Alias** = optional active-session handle stored on the record. It is distinct from `agentName`
+  and never changes provider args or system prompts. `@alias` resolves only within the current
+  workspace; `@workspace:alias` resolves by exact workspace key or workspace basename. Alias lookup
+  is active-only so retained dead records do not block reuse.
 
 ## CLI `orc` (`src/cli/index.ts`)
 Commands (all accept `--json`; prompts accept `-` / stdin / `@file`):
 ```
-orc spawn  --provider <p> [--model M] [--agent NAME | --system-prompt P] [--prompt TXT|-]
+orc spawn  --provider <p> [--model M] [--agent NAME | --system-prompt P] [--alias A] [--prompt TXT|-]
            [--cwd DIR] [--workspace W] [--worktree [--branch B]] [--no-wait] [--json]
            # prints the SessionRecord (human or json). Alias: `orc agent`, `orc new`.
-orc send   <id|name> [PROMPT | - | @file] [--json]      # multi-line safe; piped stdin or '-' if PROMPT omitted
-orc read   <id|name> [--last|--index N|--full|--raw] [--json] # latest parsed turn (default), selected/full transcript, or full pane
+orc send   <id|@alias> [PROMPT | - | @file] [--json]    # multi-line safe; piped stdin or '-' if PROMPT omitted
+orc read   <id|@alias> [--last|--index N|--full|--raw] [--json] # latest parsed turn (default), selected/full transcript, or full pane
 orc list   [--workspace W | --all | --dead] [--json]    # active sessions for a workspace. Alias: `orc ps`.
-orc attach <id|name> [--read-only] [--json]             # attaches locally; --json prints `tmux attach ...`
-orc kill   <id|name> [--worktree] [--purge] [--json]    # mark session dead (keep record); --purge removes record
+orc attach <id|@alias> [--read-only] [--json]           # attaches locally; --json prints `tmux attach ...`
+orc kill   <id|@alias> [--worktree] [--purge] [--json]  # mark session dead (keep record); --purge removes record
 orc prune  [--worktree] [--json]                        # drop marked-dead/gone records (+ optional worktree removal)
 orc help
 ```

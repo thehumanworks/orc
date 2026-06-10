@@ -92,6 +92,7 @@ export interface SpawnRequest {
   provider?: string;
   model?: string;
   agent?: string;
+  alias?: string;
   systemPrompt?: string;
   systemPromptMode?: string;
   prompt?: string;
@@ -133,6 +134,7 @@ export function mapSpawnRequest(body: SpawnRequest): AgentOptions {
     provider,
     model: body.model,
     agentName: body.agent,
+    alias: body.alias,
     systemPrompt: body.systemPrompt,
     systemPromptMode: mode,
     prompt: body.prompt,

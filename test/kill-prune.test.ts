@@ -3,7 +3,19 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { Session } from '../src/session.ts';
-import { readRegistry, upsertRecord, removeRecord, findRecord } from '../src/registry.ts';
+import {
+  aliasHandle,
+  assertAliasAvailable,
+  findRecord,
+  findRecordByAlias,
+  parseAliasSelector,
+  readRegistry,
+  reserveRecord,
+  upsertRecord,
+  validateAlias,
+  workspaceAlias,
+  removeRecord,
+} from '../src/registry.ts';
 import { listSessions, pruneSessions } from '../src/index.ts';
 import type { Driver } from '../src/drivers/driver.ts';
 import type { SessionRecord } from '../src/types.ts';
@@ -141,6 +153,188 @@ describe('list hides dead by default (BUG 3)', () => {
 
     const all = await listSessions({ all: true });
     expect(all.map((s) => s.id).sort()).toEqual(['alive001', 'dead0002']);
+  });
+});
+
+describe('workspace-scoped session aliases', () => {
+  beforeEach(async () => {
+    await freshHome();
+  });
+
+  test('validates alias values and parses CLI selectors', () => {
+    expect(validateAlias('codex-debugger')).toBe('codex-debugger');
+    expect(validateAlias('  claude_1  ')).toBe('claude_1');
+    expect(() => validateAlias('@bad')).toThrow(/invalid alias/);
+    expect(() => validateAlias('orc:debugger')).toThrow(/invalid alias/);
+
+    expect(parseAliasSelector('@debugger')).toEqual({ alias: 'debugger' });
+    expect(parseAliasSelector('@orc:debugger')).toEqual({
+      workspace: 'orc',
+      alias: 'debugger',
+    });
+    expect(parseAliasSelector('dead0001')).toBeNull();
+  });
+
+  test('resolves @alias inside the current workspace', async () => {
+    const ws = '/tmp/projects/orc';
+    const r = rec({
+      id: 'alias001',
+      alias: 'debugger',
+      tmuxName: 'orc-x-alias-live',
+      workspace: ws,
+      cwd: ws,
+    });
+    await upsertRecord(r);
+
+    const found = await findRecordByAlias(parseAliasSelector('@debugger')!, {
+      defaultWorkspace: ws,
+      driver: livenessDriver(['orc-x-alias-live']),
+    });
+
+    expect(found?.id).toBe('alias001');
+    expect(workspaceAlias(ws)).toBe('orc');
+    expect(aliasHandle(r)).toBe('@orc:debugger');
+  });
+
+  test('resolves @workspace:alias by workspace basename from outside the workspace', async () => {
+    const ws = '/tmp/projects/orc';
+    const r = rec({
+      id: 'alias002',
+      alias: 'codex-debugger',
+      tmuxName: 'orc-x-alias-outside',
+      workspace: ws,
+      cwd: ws,
+    });
+    await upsertRecord(r);
+
+    const found = await findRecordByAlias(parseAliasSelector('@orc:codex-debugger')!, {
+      defaultWorkspace: '/tmp/elsewhere',
+      driver: livenessDriver(['orc-x-alias-outside']),
+    });
+
+    expect(found?.id).toBe('alias002');
+  });
+
+  test('namespaced alias lookup prefers exact workspace keys over basename matches', async () => {
+    const logical = rec({
+      id: 'alias009',
+      alias: 'debugger',
+      tmuxName: 'orc-x-alias-logical',
+      workspace: 'orc',
+      cwd: '/tmp/logical',
+    });
+    const basename = rec({
+      id: 'alias010',
+      alias: 'debugger',
+      tmuxName: 'orc-x-alias-basename',
+      workspace: '/tmp/projects/orc',
+      cwd: '/tmp/projects/orc',
+    });
+    await upsertRecord(logical);
+    await upsertRecord(basename);
+
+    const found = await findRecordByAlias(parseAliasSelector('@orc:debugger')!, {
+      defaultWorkspace: '/tmp/elsewhere',
+      driver: livenessDriver(['orc-x-alias-logical', 'orc-x-alias-basename']),
+    });
+
+    expect(found?.id).toBe('alias009');
+  });
+
+  test('alias lookup and conflicts only consider active records', async () => {
+    const ws = '/tmp/projects/orc';
+    const active = rec({
+      id: 'alias003',
+      alias: 'reviewer',
+      tmuxName: 'orc-x-alias-active',
+      workspace: ws,
+      cwd: ws,
+    });
+    const killed = rec({
+      id: 'alias004',
+      alias: 'reviewer',
+      tmuxName: 'orc-x-alias-dead',
+      workspace: ws,
+      cwd: ws,
+      status: 'dead',
+      killedAt: new Date().toISOString(),
+    });
+    await upsertRecord(active);
+    await upsertRecord(killed);
+
+    await expect(
+      assertAliasAvailable('reviewer', {
+        workspace: ws,
+        driver: livenessDriver(['orc-x-alias-active']),
+      }),
+    ).rejects.toThrow(/already in use/);
+
+    const found = await findRecordByAlias(parseAliasSelector('@reviewer')!, {
+      defaultWorkspace: ws,
+      driver: livenessDriver(['orc-x-alias-active']),
+    });
+    expect(found?.id).toBe('alias003');
+
+    expect(
+      await findRecordByAlias(parseAliasSelector('@reviewer')!, {
+        defaultWorkspace: ws,
+        driver: livenessDriver([]),
+      }),
+    ).toBeNull();
+    await expect(
+      assertAliasAvailable('reviewer', { workspace: ws, driver: livenessDriver([]) }),
+    ).resolves.toBeUndefined();
+  });
+
+  test('reserveRecord blocks a duplicate fresh alias reservation before tmux is alive', async () => {
+    const ws = '/tmp/projects/orc';
+    const first = rec({
+      id: 'alias005',
+      alias: 'builder',
+      aliasReservedAt: new Date().toISOString(),
+      tmuxName: 'orc-x-alias-reserved-a',
+      workspace: ws,
+      cwd: ws,
+    });
+    const second = rec({
+      id: 'alias006',
+      alias: 'builder',
+      tmuxName: 'orc-x-alias-reserved-b',
+      workspace: ws,
+      cwd: ws,
+    });
+
+    await reserveRecord(first, { driver: livenessDriver([]) });
+    await expect(reserveRecord(second, { driver: livenessDriver([]) })).rejects.toThrow(
+      /already in use/,
+    );
+  });
+
+  test('a young non-reserved dead pane does not block alias reuse', async () => {
+    const ws = '/tmp/projects/orc';
+    await upsertRecord(
+      rec({
+        id: 'alias007',
+        alias: 'builder',
+        tmuxName: 'orc-x-alias-gone',
+        workspace: ws,
+        cwd: ws,
+      }),
+    );
+
+    await expect(
+      reserveRecord(
+        rec({
+          id: 'alias008',
+          alias: 'builder',
+          aliasReservedAt: new Date().toISOString(),
+          tmuxName: 'orc-x-alias-new',
+          workspace: ws,
+          cwd: ws,
+        }),
+        { driver: livenessDriver([]) },
+      ),
+    ).resolves.toBeUndefined();
   });
 });
 

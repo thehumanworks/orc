@@ -19,6 +19,7 @@ import { randomUUID } from 'node:crypto';
 import { agent } from './agent.ts';
 import { Session } from './session.ts';
 import { commitCountVsMain } from './worktree.ts';
+import { validateAlias } from './registry.ts';
 import { writeRun } from './runs.ts';
 import { runInstructionsDir } from './paths.ts';
 import { getDriver } from './drivers/driver.ts';
@@ -35,6 +36,8 @@ export interface WorkflowStep {
   /** Unique within the workflow. */
   id: string;
   provider: Provider;
+  /** Optional workspace-scoped session alias for the spawned step agent. */
+  alias?: string;
   /** Path to a spec file (PREFERRED for long instructions). */
   taskFile?: string;
   /** Inline prompt (small only). Exactly one of taskFile|prompt must be set. */
@@ -169,6 +172,11 @@ export function validateWorkflowDef(def: WorkflowDef): void {
         `workflow '${def.name}' step '${step.id}': invalid provider '${step.provider}' (claude|codex|pi)`,
       );
     }
+    try {
+      validateAlias(step.alias);
+    } catch (e) {
+      throw new Error(`workflow '${def.name}' step '${step.id}': ${(e as Error).message}`);
+    }
     const hasTask = typeof step.taskFile === 'string' && step.taskFile.length > 0;
     const hasPrompt = typeof step.prompt === 'string' && step.prompt.length > 0;
     if (hasTask === hasPrompt) {
@@ -298,6 +306,7 @@ export async function deliverInstructions(
 const defaultExecStep: StepExecutor = async ({ step, runId, emit }) => {
   const session = await agent({
     provider: step.provider,
+    alias: step.alias,
     cwd: step.cwd,
     worktree: step.worktree ? true : undefined,
     // No initial prompt: instructions are delivered via send() (file+pointer when large).

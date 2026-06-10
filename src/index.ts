@@ -3,7 +3,7 @@
  */
 import fs from 'node:fs/promises';
 import { getDriver } from './drivers/driver.ts';
-import { readRegistry, findRecord, updateRegistry } from './registry.ts';
+import { readRegistry, findRecord, findRecordByAlias, parseAliasSelector, updateRegistry } from './registry.ts';
 import type { Driver } from './drivers/driver.ts';
 import { gitToplevel, removeWorktree } from './worktree.ts';
 import { resolveWorkspace } from './agent.ts';
@@ -135,7 +135,13 @@ export async function pruneSessions(opts?: {
 
 /** Get a single session by short id, full sessionId, or tmux name. */
 export async function getSession(idOrName: string): Promise<Session | null> {
-  const rec = await findRecord(idOrName);
+  const alias = parseAliasSelector(idOrName);
+  const rec = alias
+    ? await findRecordByAlias(alias, {
+        defaultWorkspace: await defaultWorkspace(),
+        driver: getDriver(),
+      })
+    : await findRecord(idOrName);
   return rec ? new Session(rec) : null;
 }
 

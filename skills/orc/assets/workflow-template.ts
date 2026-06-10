@@ -20,6 +20,7 @@ export default {
     {
       id: 'implement',
       provider: 'claude',
+      alias: 'implementer',
       worktree: true, // isolated checkout + branch; clean up after merging
       // For a long spec, prefer a file + short pointer over a multi-KB inline prompt:
       //   taskFile: '/abs/path/to/spec.md',
@@ -32,6 +33,7 @@ export default {
     {
       id: 'review',
       provider: 'codex', // a DIFFERENT provider reviews — diversity catches more
+      alias: 'reviewer',
       cwd: '${implement.worktree}', // run in the implementer's worktree to see its diff
       prompt:
         'Adversarially review the diff on this branch for correctness and edge cases. ' +

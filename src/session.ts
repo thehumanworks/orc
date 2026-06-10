@@ -53,6 +53,7 @@ export class Session {
   readonly workspace: string;
   readonly model?: string;
   readonly agentName?: string;
+  readonly alias?: string;
   readonly createdAt: string;
 
   private record: SessionRecord;
@@ -71,6 +72,7 @@ export class Session {
     this.workspace = record.workspace;
     this.model = record.model;
     this.agentName = record.agentName;
+    this.alias = record.alias;
     this.createdAt = record.createdAt;
     this.driver = getDriver(driverName);
     this.adapter = getProvider(record.provider);

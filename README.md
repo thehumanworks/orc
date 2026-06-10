@@ -37,14 +37,14 @@ orc <command> ...
 
 ```
 orc spawn  --provider <claude|codex|pi> [options]   Launch a new agent session (aliases: agent, new)
-orc send   <id|name> [PROMPT | - | @file]           Send a prompt (multi-line safe)
-orc read   <id|name> [--last|--index N|--full|--raw]  Latest parsed turn by default; --full = full transcript; --raw = full tmux pane
-orc state  <id|name>                                Classify state once: starting|running|done|waiting|failed
-orc wait   <id|name> [--for done|waiting|failed|settled] [--timeout <sec>]
+orc send   <id|@alias> [PROMPT | - | @file]         Send a prompt (multi-line safe)
+orc read   <id|@alias> [--last|--index N|--full|--raw]  Latest parsed turn by default; --full = full transcript; --raw = full tmux pane
+orc state  <id|@alias>                              Classify state once: starting|running|done|waiting|failed
+orc wait   <id|@alias> [--for done|waiting|failed|settled] [--timeout <sec>]
                                                     Block until the agent settles (default --for settled)
 orc list   [--workspace W | --all | --dead]         List sessions for a workspace (alias: ps)
-orc attach <id|name> [--read-only]                  Attach to the tmux session
-orc kill   <id|name> [--worktree] [--purge]         Kill the session (mark dead; --purge removes record)
+orc attach <id|@alias> [--read-only]                Attach to the tmux session
+orc kill   <id|@alias> [--worktree] [--purge]       Kill the session (mark dead; --purge removes record)
 orc prune  [--worktree]                             Drop marked-dead/gone records (+ optionally their worktrees)
 orc workflow run|list|status|logs|attach …          Run/inspect multi-step workflows (see Workflows)
 orc daemon [--port P] [--bind IP] [--insecure]      Serve the HTTP API over tailscale (see Daemon)
@@ -64,6 +64,7 @@ be targeted at another host with `orc --host <h> <command>` (see Daemon).
 | `--provider, -p` | `claude` \| `codex` \| `pi` (required) |
 | `--model, -m` | model name |
 | `--agent <name>` | named agent definition (mutually exclusive with `--system-prompt`) |
+| `--alias <name>` | workspace-scoped session handle; does not affect agent behavior |
 | `--system-prompt <txt>` | system prompt text |
 | `--system-prompt-mode` | `append` (default) \| `replace` |
 | `--prompt <txt \| ->` | initial prompt sent after boot (`-` reads stdin) |
@@ -84,6 +85,13 @@ ID=$(orc spawn -p claude --json | bun -e 'console.log(JSON.parse(await Bun.stdin
 
 # Send a multi-line prompt from a file (delivered as ONE message).
 orc send "$ID" @prompt.txt
+
+# Give a session an orchestrator-only alias and address it from the same workspace.
+orc spawn -p codex --alias codex-debugger --prompt "inspect the failing test"
+orc read @codex-debugger
+
+# From another workspace, qualify the alias with the workspace name.
+orc send @orc:codex-debugger "focus on the registry lookup path"
 
 # Read the latest token-efficient parsed conversation turn.
 orc read "$ID"
@@ -288,15 +296,16 @@ export default {
 } satisfies WorkflowDef;
 ```
 
-Each step spawns an agent (`provider`, `prompt` or `taskFile`, optional `worktree`/`cwd`), waits for it
-to settle via the debounced `Session.waitFor`, then evaluates its `done(ctx)` predicate. A step's `cwd`
-(and `prompt`/`taskFile`) may interpolate a prior step's result field with `${stepId.field}` — e.g.
-`${implement.worktree}` to review the diff in the implementer's worktree.
+Each step spawns an agent (`provider`, `prompt` or `taskFile`, optional `alias`/`worktree`/`cwd`),
+waits for it to settle via the debounced `Session.waitFor`, then evaluates its `done(ctx)` predicate.
+A step's `cwd` (and `prompt`/`taskFile`) may interpolate a prior step's result field with
+`${stepId.field}` — e.g. `${implement.worktree}` to review the diff in the implementer's worktree.
 
 | step field | meaning |
 | --- | --- |
 | `id` | unique within the workflow; the key for `${id.field}` interpolation |
 | `provider` | `claude` \| `codex` \| `pi` |
+| `alias` | optional active-session alias for the spawned step agent |
 | `taskFile` / `prompt` | exactly one; long specs use `taskFile` (delivered as a file + pointer) |
 | `worktree` | create a fresh git worktree for this step (default false) |
 | `cwd` | working dir; may interpolate `${stepId.field}` |
@@ -364,6 +373,14 @@ A `--worktree` session belongs to its **parent repo's** workspace (a worktree ca
 git parent, and that parent is the project home), so worktree agents are visible from `orc list` run
 at the repo root. Use `orc list --workspace <W>` to target another workspace, or `--all` to ignore
 the workspace filter entirely.
+
+Aliases are scoped to this workspace key. `--alias debugger` creates an active-session handle
+addressable as `@debugger` inside the same workspace and as `@orc:debugger` from outside a workspace
+whose display name is `orc` (the basename of the workspace path, or the logical workspace string).
+Aliases are not agent definitions and do not change the system prompt, model, worktree label, or
+provider behavior. A second active session in the same workspace cannot reuse an alias; once the old
+session is killed, gone, or pruned, the alias is available again. Retained dead transcript records
+remain addressable by id.
 
 ## State
 

@@ -9,19 +9,20 @@ Most commands accept `--json` (machine-readable; on error, exit non-zero + `{"er
 | command | purpose |
 | --- | --- |
 | `orc spawn -p <claude\|codex\|pi> [opts]` | launch a session (aliases: `agent`, `new`). `--json` prints the record. |
-| `orc send <id\|name> [PROMPT \| - \| @file]` | send a prompt / slash command (multi-line safe). |
-| `orc read <id\|name> [--last\|--index N\|--full\|--raw]` | latest parsed conversation turn by default; `--full` = full parsed transcript; `--raw` = full tmux pane. |
-| `orc state <id\|name>` | classify once → `starting\|running\|done\|waiting\|failed`. |
-| `orc wait <id\|name> [--for done\|waiting\|failed\|settled] [--timeout SEC]` | block until settled (debounced). default `--for settled`. |
+| `orc send <id\|@alias> [PROMPT \| - \| @file]` | send a prompt / slash command (multi-line safe). |
+| `orc read <id\|@alias> [--last\|--index N\|--full\|--raw]` | latest parsed conversation turn by default; `--full` = full parsed transcript; `--raw` = full tmux pane. |
+| `orc state <id\|@alias>` | classify once → `starting\|running\|done\|waiting\|failed`. |
+| `orc wait <id\|@alias> [--for done\|waiting\|failed\|settled] [--timeout SEC]` | block until settled (debounced). default `--for settled`. |
 | `orc list [--workspace W \| --all \| --dead \| --all-hosts]` | list sessions (alias `ps`). |
-| `orc attach <id\|name> [--read-only]` | print the `tmux attach` command (does not exec) — attach to watch live. |
-| `orc kill <id\|name> [--worktree] [--purge]` | kill; keeps the record (still readable) unless `--purge`; `--worktree` removes the worktree. |
+| `orc attach <id\|@alias> [--read-only]` | print the `tmux attach` command (does not exec) — attach to watch live. |
+| `orc kill <id\|@alias> [--worktree] [--purge]` | kill; keeps the record (still readable) unless `--purge`; `--worktree` removes the worktree. |
 | `orc prune [--worktree]` | drop all dead records (and optionally their worktrees). |
 
 ### `spawn` options
 - `--provider, -p` `claude|codex|pi` (required)
 - `--model, -m <name>`
 - `--agent <name>` — named agent definition (mutually exclusive with `--system-prompt`)
+- `--alias <name>` — orchestrator-only active-session handle; use `@name` locally or `@workspace:name` from another workspace
 - `--system-prompt <txt>` / `--system-prompt-mode append|replace`
 - `--prompt <txt | ->` — initial prompt after boot (`-`/`@file`/stdin). Omit for none.
 - `--cwd <dir>` — base working dir (default: cwd)
@@ -40,6 +41,12 @@ state detection is reliable.
 - **pi**: the claude locations (injected via `--append-system-prompt`)
 
 Edit these `.toml` or `.md` files to iterate on a role over time.
+
+## Session aliases
+Aliases are workspace-scoped handles for steering active sessions. They do not alter the agent
+definition, model, system prompt, worktree label, or provider behavior. A duplicate alias is rejected
+only while another session with that alias is active in the same workspace; killed/gone/pruned
+sessions free the alias for reuse. Dead transcript records remain addressable by id.
 
 ## Workflows
 | command | purpose |

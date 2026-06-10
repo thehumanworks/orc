@@ -12,7 +12,7 @@ import { getProvider } from './providers/provider.ts';
 import type { BuildCtx } from './providers/provider.ts';
 import { effectiveAgentModel, resolveAgentDef } from './agentdefs.ts';
 import { createWorktree, gitToplevel, isInsideGitRepo } from './worktree.ts';
-import { upsertRecord } from './registry.ts';
+import { removeRecord, reserveRecord, upsertRecord, validateAlias } from './registry.ts';
 import { piSessionDir } from './paths.ts';
 import { Session } from './session.ts';
 import type { AgentOptions, Provider, SessionRecord, SystemPromptMode } from './types.ts';
@@ -30,6 +30,7 @@ export function validateOptions(opts: AgentOptions): void {
   if (opts.agentName && opts.systemPrompt) {
     throw new Error('agentName and systemPrompt are mutually exclusive — pass only one');
   }
+  validateAlias(opts.alias);
 }
 
 export async function agent(opts: AgentOptions): Promise<Session> {
@@ -39,6 +40,7 @@ export async function agent(opts: AgentOptions): Promise<Session> {
   const adapter = getProvider(provider);
   const driver = getDriver(opts.driver ?? 'tmux');
   const systemPromptMode: SystemPromptMode = opts.systemPromptMode ?? 'append';
+  const alias = validateAlias(opts.alias);
 
   // Base cwd → realpath.
   const baseCwd = await fs.realpath(opts.cwd ?? process.cwd());
@@ -76,67 +78,32 @@ export async function agent(opts: AgentOptions): Promise<Session> {
     }
   }
 
-  // Worktree (optional). Requires cwd inside a git repo.
-  let cwd = baseCwd;
-  let worktreePath: string | undefined;
-  let branch: string | undefined;
-  if (opts.worktree) {
-    if (!(await isInsideGitRepo(baseCwd))) {
-      throw new Error(`worktree requires cwd to be inside a git repo (cwd=${baseCwd})`);
-    }
-    const wtOpts = typeof opts.worktree === 'object' ? opts.worktree : {};
-    const agentLabel = sanitizeTmuxName(opts.agentName ?? provider);
-    const wt = await createWorktree({
-      cwd: baseCwd,
-      shortId,
-      agentLabel,
-      branch: wtOpts.branch,
-      path: wtOpts.path,
-    });
-    cwd = wt.path;
-    worktreePath = wt.path;
-    branch = wt.branch;
-  }
-
   // Workspace = opts.workspace ?? git toplevel of baseCwd ?? realpath(baseCwd).
   // Resolve from baseCwd (the ORIGINAL invocation dir), NOT the worktree `cwd`: a linked
   // worktree reports ITSELF as `git --show-toplevel`, so resolving from the worktree would
   // silo the session under <repo>/.orc/worktrees/<id> and hide it from `orc list` run in
-  // the parent repo. A worktree always has a git parent (enforced above), and that parent
+  // the parent repo. A worktree always has a git parent (enforced below), and that parent
   // is the project home — so a worktree agent belongs to the same workspace as the repo.
   const workspace = await resolveWorkspace(opts.workspace, baseCwd);
 
-  // tmux session name: orc-<agentLabel>-<shortId>.
+  // tmux session name: orc-<agentLabel>-<shortId>. Alias intentionally does not affect it.
   const agentLabel = sanitizeTmuxName(opts.agentName ?? provider);
   const tmuxName = `orc-${agentLabel}-${shortId}`;
 
-  // pi needs a session dir; create it.
+  // pi needs a session dir.
   const sessionDir = piSessionDir(sessionId);
-  if (provider === 'pi') {
-    await fs.mkdir(sessionDir, { recursive: true });
-  }
 
-  const ctx: BuildCtx = {
-    model: effectiveModel,
-    sessionId,
-    systemPrompt: resolvedSystemPrompt,
-    systemPromptMode,
-    agentName: nativeAgentName,
-    cwd,
-    sessionDir,
-  };
-
-  // Provider cwd prep (codex writes AGENTS.md).
-  await adapter.prepare(ctx);
-
-  const argv = adapter.buildArgv(ctx);
-
-  const record: SessionRecord = {
+  let cwd = baseCwd;
+  let worktreePath: string | undefined;
+  let branch: string | undefined;
+  const createdAt = new Date().toISOString();
+  let record: SessionRecord = {
     id: shortId,
     sessionId,
     provider,
     model: effectiveModel,
     agentName: opts.agentName,
+    alias,
     tmuxName,
     cwd,
     worktreePath,
@@ -144,13 +111,68 @@ export async function agent(opts: AgentOptions): Promise<Session> {
     workspace,
     systemPromptMode,
     sessionDir: provider === 'pi' ? sessionDir : undefined,
-    createdAt: new Date().toISOString(),
+    createdAt,
+    aliasReservedAt: alias ? createdAt : undefined,
   };
 
-  // Spawn the detached TUI.
-  await driver.spawn({ name: tmuxName, cwd, argv });
+  // Reserve the alias under the registry lock before worktree/provider prep so two
+  // near-simultaneous spawns cannot claim the same workspace alias.
+  await reserveRecord(record, { driver });
 
-  // Persist immediately so the session is discoverable even if boot is slow.
+  let spawned = false;
+  try {
+    // Worktree (optional). Requires cwd inside a git repo.
+    if (opts.worktree) {
+      if (!(await isInsideGitRepo(baseCwd))) {
+        throw new Error(`worktree requires cwd to be inside a git repo (cwd=${baseCwd})`);
+      }
+      const wtOpts = typeof opts.worktree === 'object' ? opts.worktree : {};
+      const wt = await createWorktree({
+        cwd: baseCwd,
+        shortId,
+        agentLabel,
+        branch: wtOpts.branch,
+        path: wtOpts.path,
+      });
+      cwd = wt.path;
+      worktreePath = wt.path;
+      branch = wt.branch;
+      record = { ...record, cwd, worktreePath, branch };
+      await upsertRecord(record);
+    }
+
+    if (provider === 'pi') {
+      await fs.mkdir(sessionDir, { recursive: true });
+    }
+
+    const ctx: BuildCtx = {
+      model: effectiveModel,
+      sessionId,
+      systemPrompt: resolvedSystemPrompt,
+      systemPromptMode,
+      agentName: nativeAgentName,
+      cwd,
+      sessionDir,
+    };
+
+    // Provider cwd prep (codex writes AGENTS.md).
+    await adapter.prepare(ctx);
+
+    const argv = adapter.buildArgv(ctx);
+
+    // Spawn the detached TUI.
+    await driver.spawn({ name: tmuxName, cwd, argv });
+    spawned = true;
+    if (record.aliasReservedAt) {
+      const { aliasReservedAt: _reserved, ...launched } = record;
+      record = launched;
+    }
+  } catch (e) {
+    if (!spawned) await removeRecord(shortId).catch(() => {});
+    throw e;
+  }
+
+  // Persist the launched record, clearing any transient alias reservation marker.
   await upsertRecord(record);
 
   const session = new Session(record, opts.driver ?? 'tmux');
