@@ -13,19 +13,36 @@ import { renderTurns, selectTurns } from '../transcript.ts';
 import type { TurnSelection } from '../transcript.ts';
 import {
   runWorkflow,
+  resumeWorkflow,
+  retryWorkflow,
+  cancelWorkflow,
+  cleanupWorkflow,
   runnerTmuxName,
   reconcileRun,
   assembleStepLogs,
   validateWorkflowDef,
+  runnerLineageEnv,
+  buildPlan,
+  planDigest,
 } from '../workflow.ts';
+
 import type { WorkflowDef, WorkflowEvent, WorkflowRun, StepResult } from '../workflow.ts';
-import { readRun, listRuns, writeRun } from '../runs.ts';
+import {
+  readRun,
+  listRuns,
+  writeRun,
+  writeRunOwned,
+  WORKFLOW_SCHEMA_VERSION,
+  makeLease,
+} from '../runs.ts';
 import { getDriver } from '../drivers/driver.ts';
 import { orcHome } from '../paths.ts';
 import { resolveUntil } from '../state.ts';
 import { resolveBind } from '../daemon/bind.ts';
 import { tailscaleIp4 } from '../daemon/tailscale.ts';
 import { serveDaemon } from '../daemon/server.ts';
+import { loadDaemonTokensFromEnv } from '../daemon/auth.ts';
+import type { Scope } from '../daemon/auth.ts';
 import { readPeers, addPeer, removePeer, peerHosts, DEFAULT_DAEMON_PORT } from '../daemon/peers.ts';
 import { DaemonClient, parseHostArg } from '../daemon/client.ts';
 import type { RemoteTarget } from '../daemon/client.ts';
@@ -38,6 +55,7 @@ import {
   renderSessionListWithHost,
   renderWorkflowEvent,
   renderRunDetail,
+  publicRunView,
   renderRunList,
   HELP_TEXT,
 } from './output.ts';
@@ -381,16 +399,20 @@ async function cmdList(args: string[]): Promise<number> {
     all: { type: 'boolean' },
     dead: { type: 'boolean' },
     'all-hosts': { type: 'boolean' },
+    run: { type: 'string' },
+    lineage: { type: 'boolean' },
     json: { type: 'boolean' },
   });
   const json = jsonFlag(values);
   if (values['all-hosts'] === true) {
     return cmdListAllHosts(values, json);
   }
+  const runId = typeof values.run === 'string' ? values.run : undefined;
   const sessions = await listSessions({
     workspace: values.workspace as string | undefined,
-    all: values.all === true,
+    all: values.all === true || Boolean(runId),
     dead: values.dead === true,
+    runId,
   });
   const views: SessionView[] = await Promise.all(
     sessions.map(async (s) => {
@@ -398,10 +420,23 @@ async function cmdList(args: string[]): Promise<number> {
       return { ...s.toJSON(), status };
     }),
   );
+  const showLineage = values.lineage === true || Boolean(runId);
   if (json) {
-    printJson(views);
+    printJson(
+      views.map((v) => ({
+        ...v,
+        lineage: {
+          rootRunId: v.rootRunId,
+          parentRunId: v.parentRunId,
+          parentSessionId: v.parentSessionId,
+          stepId: v.stepId,
+          depth: v.depth,
+          owner: v.owner,
+        },
+      })),
+    );
   } else {
-    process.stdout.write(`${renderSessionList(views)}\n`);
+    process.stdout.write(`${renderSessionList(views, { lineage: showLineage })}\n`);
   }
   return 0;
 }
@@ -623,10 +658,38 @@ async function cmdWorkflow(args: string[]): Promise<number> {
       return cmdWorkflowAttach(rest);
     case 'logs':
       return cmdWorkflowLogs(rest);
+    case 'resume':
+      return cmdWorkflowResume(rest);
+    case 'retry':
+      return cmdWorkflowRetry(rest);
+    case 'cancel':
+      return cmdWorkflowCancel(rest);
+    case 'cleanup':
+      return cmdWorkflowCleanup(rest);
     default:
-      printError(`unknown workflow subcommand '${sub ?? ''}' (run|list|status|attach|logs)`, false);
+      printError(
+        `unknown workflow subcommand '${sub ?? ''}' (run|list|status|attach|logs|resume|retry|cancel|cleanup)`,
+        false,
+      );
       return 1;
   }
+}
+
+function parseMaxConcurrencyFlag(
+  raw: string | undefined,
+  json: boolean,
+): { ok: true; value?: number } | { ok: false; code: number } {
+  if (raw === undefined) return { ok: true };
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n < 1) {
+    printError(`--max-concurrency must be a positive integer (>= 1), got '${raw}'`, json);
+    return { ok: false, code: 1 };
+  }
+  if (n > 10_000) {
+    printError(`--max-concurrency must be <= 10000, got '${raw}'`, json);
+    return { ok: false, code: 1 };
+  }
+  return { ok: true, value: n };
 }
 
 async function cmdWorkflowRun(args: string[]): Promise<number> {
@@ -634,6 +697,7 @@ async function cmdWorkflowRun(args: string[]): Promise<number> {
     json: { type: 'boolean' },
     detach: { type: 'boolean' },
     'run-id': { type: 'string' },
+    'max-concurrency': { type: 'string' },
   });
   const json = jsonFlag(values);
   const file = positionals[0];
@@ -641,6 +705,8 @@ async function cmdWorkflowRun(args: string[]): Promise<number> {
     printError('workflow run requires <file> (a TS module default-exporting a WorkflowDef)', json);
     return 1;
   }
+  const conc = parseMaxConcurrencyFlag(values['max-concurrency'] as string | undefined, json);
+  if (!conc.ok) return conc.code;
   const absFile = path.resolve(file);
 
   // Dynamically import the file. A WorkflowDef is a PLAIN object default-export — the
@@ -660,7 +726,7 @@ async function cmdWorkflowRun(args: string[]): Promise<number> {
   }
 
   if (values.detach === true) {
-    return cmdWorkflowRunDetached(absFile, def, json);
+    return cmdWorkflowRunDetached(absFile, def, json, conc.value);
   }
 
   let run: WorkflowRun;
@@ -672,6 +738,8 @@ async function cmdWorkflowRun(args: string[]): Promise<number> {
     run = await runWorkflow(def, {
       runId,
       runnerTmux: runId ? runnerTmuxName(runId) : undefined,
+      sourcePath: absFile,
+      maxConcurrency: conc.value,
       onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
     });
   } catch (e) {
@@ -697,11 +765,14 @@ async function cmdWorkflowRunDetached(
   absFile: string,
   def: WorkflowDef,
   json: boolean,
+  maxConcurrency?: number,
 ): Promise<number> {
   // The parent doesn't call runWorkflow, so validate the def here — a malformed workflow
   // must fail cleanly now, not spawn a doomed runner and hand back a self-orphaning runId.
+  const defForPlan: WorkflowDef =
+    maxConcurrency !== undefined ? { ...def, maxConcurrency } : def;
   try {
-    validateWorkflowDef(def);
+    validateWorkflowDef(defForPlan);
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
@@ -710,26 +781,38 @@ async function cmdWorkflowRunDetached(
   const runId = randomUUID().slice(0, 8);
   const runnerTmux = runnerTmuxName(runId);
 
+  const plan = buildPlan(defForPlan);
   const run: WorkflowRun = {
+    schemaVersion: WORKFLOW_SCHEMA_VERSION,
+    revision: 0,
     id: runId,
     name: def.name,
     startedAt: new Date().toISOString(),
     status: 'running',
     runnerTmux,
     steps: [],
+    plan,
+    definitionDigest: planDigest(plan),
+    sourcePath: absFile,
+    attempts: [],
+    lease: makeLease({ runnerTmux }),
+    rootRunId: runId,
   };
-  await writeRun(run);
+  await writeRunOwned(run);
 
   // process.execPath = the exact bun binary running us → no reliance on the tmux server's
   // PATH resolving `bun`. Thread ORC_HOME so the runner persists to the same runs dir
   // (a new tmux session inherits the server env, not ours).
   const argv = [process.execPath, import.meta.path, 'workflow', 'run', absFile, '--run-id', runId];
+  if (maxConcurrency !== undefined) {
+    argv.push('--max-concurrency', String(maxConcurrency));
+  }
   try {
     await getDriver().spawn({
       name: runnerTmux,
       cwd: process.cwd(),
       argv,
-      env: { ORC_HOME: orcHome() },
+      env: { ORC_HOME: orcHome(), ...runnerLineageEnv(run) },
     });
   } catch (e) {
     // Spawn failed → finalize the record we wrote so it doesn't linger as a phantom run.
@@ -751,7 +834,7 @@ async function cmdWorkflowList(args: string[]): Promise<number> {
   const runs = await listRuns();
   // Reconcile each stale `running` against its runner's liveness (persists the verdict).
   const reconciled = await Promise.all(runs.map((r) => reconcileRun(r)));
-  if (json) printJson(reconciled);
+  if (json) printJson(reconciled.map(publicRunView));
   else process.stdout.write(`${renderRunList(reconciled)}\n`);
   return 0;
 }
@@ -770,9 +853,9 @@ async function cmdWorkflowStatus(args: string[]): Promise<number> {
     return 1;
   }
   // Don't trust a stale `running`: if the runner session is gone, report `orphaned`.
-  await reconcileRun(run);
-  if (json) printJson(run);
-  else process.stdout.write(`${renderRunDetail(run)}\n`);
+  const reconciled = await reconcileRun(run);
+  if (json) printJson(publicRunView(reconciled));
+  else process.stdout.write(`${renderRunDetail(reconciled)}\n`);
   return 0;
 }
 
@@ -896,6 +979,201 @@ async function cmdWorkflowLogs(args: string[]): Promise<number> {
  * the host's tailscale IP by default (never 0.0.0.0); `resolveBind` refuses an unsafe bind
  * unless `--insecure`. The process blocks here serving forever (Ctrl-C / SIGTERM stops it).
  */
+
+/** Detach a resume/retry control action into a named runner tmux session. */
+async function detachWorkflowControl(
+  action: 'resume' | 'retry',
+  runId: string,
+  absFile: string,
+  json: boolean,
+  extraArgs: string[] = [],
+): Promise<number> {
+  const runnerTmux = runnerTmuxName(runId);
+  const argv = [
+    process.execPath,
+    import.meta.path,
+    'workflow',
+    action,
+    runId,
+    absFile,
+    ...extraArgs,
+  ];
+  try {
+    await getDriver().spawn({
+      name: runnerTmux,
+      cwd: process.cwd(),
+      argv,
+      env: { ORC_HOME: orcHome() },
+    });
+  } catch (e) {
+    printError(`failed to launch detached ${action}: ${(e as Error).message}`, json);
+    return 1;
+  }
+  if (json) printJson({ runId, runnerTmux, action });
+  else process.stdout.write(`${runId}\n`);
+  return 0;
+}
+
+async function loadWorkflowDefFromFile(file: string): Promise<{ def: WorkflowDef; absPath: string }> {
+  const absPath = path.resolve(file);
+  const mod = (await import(absPath)) as { default?: WorkflowDef };
+  if (!mod.default) throw new Error(`workflow file '${file}' has no default export`);
+  validateWorkflowDef(mod.default);
+  return { def: mod.default, absPath };
+}
+
+/** `orc workflow resume <runId> [workflowFile] [--detach]` */
+
+/** Refuse resume/retry when reconcile still reports running (owner not proven dead). */
+async function assertNoLiveOwner(runId: string, json: boolean): Promise<WorkflowRun | null> {
+  const existing = await readRun(runId);
+  if (!existing) {
+    printError(`no run found for '${runId}'`, json);
+    return null;
+  }
+  const live = await reconcileRun(existing);
+  if (live.status === 'running') {
+    printError(
+      `run '${runId}' still has a live owner; wait for it to finish/expire or cancel first`,
+      json,
+    );
+    return null;
+  }
+  return live;
+}
+
+async function cmdWorkflowResume(args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, {
+    json: { type: 'boolean' },
+    detach: { type: 'boolean' },
+  });
+  const json = jsonFlag(values);
+  const runId = positionals[0];
+  const file = positionals[1];
+  if (!runId) {
+    printError('workflow resume requires <runId> [workflowFile]', json);
+    return 1;
+  }
+  if (!(await assertNoLiveOwner(runId, json))) return 1;
+  if (!file) {
+    printError(
+      'workflow resume requires the original workflow file (function predicates remain non-portable; prefer verify descriptors)',
+      json,
+    );
+    return 1;
+  }
+  try {
+    const { def, absPath } = await loadWorkflowDefFromFile(file);
+    if (values.detach === true) {
+      return detachWorkflowControl('resume', runId, absPath, json);
+    }
+    const run = await resumeWorkflow(runId, def, {
+      sourcePath: absPath,
+      onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
+    });
+    if (json) printJson(run);
+    return run.status === 'done' ? 0 : 1;
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
+}
+
+/** `orc workflow retry <runId> [--step <id>] [workflowFile] [--detach]` */
+async function cmdWorkflowRetry(args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, {
+    json: { type: 'boolean' },
+    detach: { type: 'boolean' },
+    step: { type: 'string' },
+  });
+  const json = jsonFlag(values);
+  const runId = positionals[0];
+  const file = positionals[1];
+  if (!runId) {
+    printError('workflow retry requires <runId> [--step <id>] [workflowFile]', json);
+    return 1;
+  }
+  if (!(await assertNoLiveOwner(runId, json))) return 1;
+  if (!file) {
+    printError(
+      'workflow retry requires the original workflow file (function predicates remain non-portable; prefer verify descriptors)',
+      json,
+    );
+    return 1;
+  }
+  try {
+    const { def, absPath } = await loadWorkflowDefFromFile(file);
+    const stepId = values.step as string | undefined;
+    if (values.detach === true) {
+      return detachWorkflowControl('retry', runId, absPath, json, stepId ? ['--step', stepId] : []);
+    }
+    const run = await retryWorkflow(runId, def, {
+      sourcePath: absPath,
+      stepId,
+      onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
+    });
+    if (json) printJson(run);
+    return run.status === 'done' ? 0 : 1;
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
+}
+
+/** `orc workflow cancel <runId> [--cascade]` */
+async function cmdWorkflowCancel(args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, {
+    json: { type: 'boolean' },
+    cascade: { type: 'boolean' },
+  });
+  const json = jsonFlag(values);
+  const runId = positionals[0];
+  if (!runId) {
+    printError('workflow cancel requires <runId>', json);
+    return 1;
+  }
+  try {
+    const run = await cancelWorkflow(runId, { cascade: values.cascade === true });
+    if (json) printJson(run);
+    else process.stdout.write(`cancelled ${run.id}${values.cascade ? ' (cascade)' : ''}\n`);
+    return 0;
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
+}
+
+/** `orc workflow cleanup <runId> [--sessions] [--worktrees]` */
+async function cmdWorkflowCleanup(args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, {
+    json: { type: 'boolean' },
+    sessions: { type: 'boolean' },
+    worktrees: { type: 'boolean' },
+  });
+  const json = jsonFlag(values);
+  const runId = positionals[0];
+  if (!runId) {
+    printError('workflow cleanup requires <runId> [--sessions] [--worktrees]', json);
+    return 1;
+  }
+  try {
+    const result = await cleanupWorkflow(runId, {
+      sessions: values.sessions === true,
+      worktrees: values.worktrees === true,
+    });
+    if (json) printJson(result);
+    else {
+      process.stdout.write(
+        `cleanup ${result.runId}: sessions=${result.sessions.length} worktrees=${result.worktrees.length}\n`,
+      );
+    }
+    return 0;
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
+}
+
 async function cmdDaemon(args: string[]): Promise<number> {
   const { values } = parse(args, {
     port: { type: 'string' },
@@ -928,11 +1206,18 @@ async function cmdDaemon(args: string[]): Promise<number> {
 
   const envSecret = process.env.ORC_DAEMON_SECRET;
   const secret = envSecret && envSecret.length > 0 ? envSecret : null;
+  let tokens: Map<string, Scope[]>;
+  try {
+    tokens = loadDaemonTokensFromEnv();
+  } catch (e) {
+    printError(`invalid ORC_DAEMON_TOKENS: ${(e as Error).message}`, json);
+    return 1;
+  }
   const allowlist = await peerHosts();
 
   let server: Bun.Server<undefined>;
   try {
-    server = serveDaemon({ hostname: decision.address, port, secret });
+    server = serveDaemon({ hostname: decision.address, port, secret, tokens });
   } catch (e) {
     printError(`failed to start daemon: ${(e as Error).message}`, json);
     return 1;
@@ -945,6 +1230,7 @@ async function cmdDaemon(args: string[]): Promise<number> {
     insecure: values.insecure === true,
     allowlistedPeers: allowlist.length,
     secretConfigured: secret !== null,
+    tokensConfigured: tokens.size,
   };
   if (json) {
     printJson(startup);
@@ -957,11 +1243,12 @@ async function cmdDaemon(args: string[]): Promise<number> {
     }
     const mechanisms: string[] = [];
     if (allowlist.length > 0) mechanisms.push(`${allowlist.length} allowlisted peer(s)`);
-    if (secret) mechanisms.push('shared secret (x-orc-secret)');
+    if (tokens.size > 0) mechanisms.push(`${tokens.size} scoped bearer token(s)`);
+    if (secret) mechanisms.push('legacy shared secret (x-orc-secret, all scopes)');
     process.stderr.write(
       mechanisms.length > 0
-        ? `trust: ${mechanisms.join(' + ')} (whois preferred; loopback whois cannot resolve)\n`
-        : 'trust: NONE configured — every request will 403. Add peers (orc remote add) or set ORC_DAEMON_SECRET.\n',
+        ? `auth: ${mechanisms.join(' + ')} (whois preferred; loopback whois cannot resolve)\n`
+        : 'auth: NONE configured — every request will 401. Add peers (orc remote add), set ORC_DAEMON_TOKENS, or ORC_DAEMON_SECRET.\n',
     );
   }
 
@@ -1379,6 +1666,20 @@ async function remoteAttach(
   return 0;
 }
 
+
+/** Type guard: detach launch returns {runId,runnerTmux}; foreground returns WorkflowRun. */
+function isDetachedWorkflowLaunch(
+  res: WorkflowRun | { runId: string; runnerTmux: string },
+): res is { runId: string; runnerTmux: string } {
+  return (
+    typeof res === 'object' &&
+    res !== null &&
+    'runId' in res &&
+    typeof (res as { runId?: unknown }).runId === 'string' &&
+    !('status' in res)
+  );
+}
+
 async function remoteWorkflow(
   client: DaemonClient,
   args: string[],
@@ -1397,8 +1698,19 @@ async function remoteWorkflow(
       return remoteWorkflowLogs(client, rest);
     case 'attach':
       return remoteWorkflowAttach(client, rest, target);
+    case 'resume':
+      return remoteWorkflowResume(client, rest);
+    case 'retry':
+      return remoteWorkflowRetry(client, rest);
+    case 'cancel':
+      return remoteWorkflowCancel(client, rest);
+    case 'cleanup':
+      return remoteWorkflowCleanup(client, rest);
     default:
-      printError(`unknown workflow subcommand '${sub ?? ''}' (run|list|status|attach|logs)`, false);
+      printError(
+        `unknown workflow subcommand '${sub ?? ''}' (run|list|status|attach|logs|resume|retry|cancel|cleanup)`,
+        false,
+      );
       return 1;
   }
 }
@@ -1407,6 +1719,7 @@ async function remoteWorkflowRun(client: DaemonClient, args: string[]): Promise<
   const { values, positionals } = parse(args, {
     json: { type: 'boolean' },
     detach: { type: 'boolean' },
+    'max-concurrency': { type: 'string' },
   });
   const json = jsonFlag(values);
   const file = positionals[0];
@@ -1414,18 +1727,22 @@ async function remoteWorkflowRun(client: DaemonClient, args: string[]): Promise<
     printError('workflow run requires <file> (an ABSOLUTE path on the remote host)', json);
     return 1;
   }
+  const conc = parseMaxConcurrencyFlag(values['max-concurrency'] as string | undefined, json);
+  if (!conc.ok) return conc.code;
   try {
-    const res = await client.runWorkflow({ file, detach: values.detach === true });
-    if (values.detach === true) {
-      const r = res as { runId: string; runnerTmux: string };
-      if (json) printJson(r);
-      else process.stdout.write(`${r.runId}\n`);
+    const res = await client.runWorkflow({
+      file,
+      detach: values.detach === true,
+      maxConcurrency: conc.value,
+    });
+    if (isDetachedWorkflowLaunch(res)) {
+      if (json) printJson(res);
+      else process.stdout.write(`${res.runId}\n`);
       return 0;
     }
-    const run = res as WorkflowRun;
-    if (json) printJson(run);
-    else process.stdout.write(`${renderRunDetail(run)}\n`);
-    return run.status === 'done' ? 0 : 1;
+    if (json) printJson(res);
+    else process.stdout.write(`${renderRunDetail(res)}\n`);
+    return res.status === 'done' ? 0 : 1;
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
@@ -1552,6 +1869,120 @@ async function remoteWorkflowAttach(
 }
 
 /** Map a raw subcommand (with aliases) to a canonical name. */
+
+async function remoteWorkflowResume(client: DaemonClient, args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, {
+    json: { type: 'boolean' },
+  });
+  const json = jsonFlag(values);
+  const runId = positionals[0];
+  const file = positionals[1];
+  if (!runId) {
+    printError('workflow resume requires <runId> [workflowFile]', json);
+    return 1;
+  }
+  try {
+    const res = await client.resumeWorkflow(runId, file ? { file } : undefined);
+    if ('status' in res) {
+      if (json) printJson(res);
+      else process.stdout.write(`${renderRunDetail(res)}\n`);
+      return res.status === 'done' ? 0 : 1;
+    }
+    // Detached: { runId, runnerTmux }
+    if (json) printJson(res);
+    else process.stdout.write(`${res.runId}\n`);
+    return 0;
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
+}
+
+async function remoteWorkflowRetry(client: DaemonClient, args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, {
+    json: { type: 'boolean' },
+    step: { type: 'string' },
+  });
+  const json = jsonFlag(values);
+  const runId = positionals[0];
+  const file = positionals[1];
+  if (!runId) {
+    printError('workflow retry requires <runId> [--step <id>] [workflowFile]', json);
+    return 1;
+  }
+  try {
+    const body: { file?: string; step?: string } = {};
+    if (file) body.file = file;
+    if (values.step) body.step = values.step as string;
+    const res = await client.retryWorkflow(runId, body);
+    if (res && typeof res === 'object' && 'runId' in res && !('status' in res)) {
+      if (json) printJson(res);
+      else process.stdout.write(`${(res as { runId: string }).runId}\n`);
+      return 0;
+    }
+    const run = res as WorkflowRun;
+    if (json) printJson(run);
+    else process.stdout.write(`${renderRunDetail(run)}\n`);
+    return run.status === 'done' ? 0 : 1;
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
+}
+
+async function remoteWorkflowCancel(client: DaemonClient, args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, {
+    json: { type: 'boolean' },
+    cascade: { type: 'boolean' },
+  });
+  const json = jsonFlag(values);
+  const runId = positionals[0];
+  if (!runId) {
+    printError('workflow cancel requires <runId>', json);
+    return 1;
+  }
+  try {
+    const run = await client.cancelWorkflow(runId, { cascade: values.cascade === true });
+    if (json) printJson(run);
+    else process.stdout.write(`${renderRunDetail(run)}\n`);
+    return 0;
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
+}
+
+async function remoteWorkflowCleanup(client: DaemonClient, args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, {
+    json: { type: 'boolean' },
+    sessions: { type: 'boolean' },
+    worktrees: { type: 'boolean' },
+  });
+  const json = jsonFlag(values);
+  const runId = positionals[0];
+  if (!runId) {
+    printError('workflow cleanup requires <runId> [--sessions] [--worktrees]', json);
+    return 1;
+  }
+  try {
+    const result = await client.cleanupWorkflow(runId, {
+      sessions: values.sessions === true,
+      worktrees: values.worktrees === true,
+    });
+    if (json) printJson(result);
+    else {
+      process.stdout.write(
+        `cleaned run ${result.runId}: sessions=${result.sessions.length} worktrees=${result.worktrees.length}\n`,
+      );
+    }
+    return 0;
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
+}
+
+
 export function resolveCommand(raw: string | undefined): string {
   switch (raw) {
     case 'spawn':

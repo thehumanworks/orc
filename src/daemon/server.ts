@@ -3,10 +3,11 @@
  * adds NO orchestration logic: every route maps 1:1 to a `Session`/`agent`/`runWorkflow`
  * call against the SAME `~/.orc` the local `orc` uses.
  *
- * SECURITY: every route EXCEPT `/health` is behind the fail-closed trust gate
- * (`decideTrust`). The bind address is decided by `resolveBind` (never `0.0.0.0` by
- * default). The handler is factored out of `Bun.serve` (`createFetch`) so it can be
- * exercised over a live loopback socket in tests with an injectable whois.
+ * SECURITY: every route EXCEPT `/health` is behind fail-closed authentication and
+ * scoped authorization (`authenticate` + `authorize`). The bind address is decided
+ * by `resolveBind` (never `0.0.0.0` by default). The handler is factored out of
+ * `Bun.serve` (`createFetch`) so it can be exercised over a live loopback socket in
+ * tests with an injectable whois.
  */
 import path from 'node:path';
 import os from 'node:os';
@@ -15,23 +16,96 @@ import { agent } from '../agent.ts';
 import { listSessions, getSession } from '../index.ts';
 import {
   runWorkflow,
+  resumeWorkflow,
+  retryWorkflow,
+  cancelWorkflow,
+  cleanupWorkflow,
   runnerTmuxName,
   reconcileRun,
   assembleStepLogs,
   validateWorkflowDef,
+  resolveContainedWorkflowFile,
+  runnerLineageEnv,
+  buildPlan,
+  planDigest,
 } from '../workflow.ts';
 import type { WorkflowDef, WorkflowRun, StepResult } from '../workflow.ts';
-import { readRun, listRuns, writeRun } from '../runs.ts';
+import { schedulingSummary } from '../workflow-scheduler.ts';
+import { readRun, listRuns, writeRun, writeRunOwned, makeLease, WORKFLOW_SCHEMA_VERSION } from '../runs.ts';
 import { getDriver } from '../drivers/driver.ts';
 import { orcHome } from '../paths.ts';
 import { selectTurns } from '../transcript.ts';
 import type { TurnSelection } from '../transcript.ts';
-import { decideTrust, isAllowlisted } from './trust.ts';
+import { isAllowlisted } from './trust.ts';
 import type { Identity } from './trust.ts';
+import {
+  authenticate,
+  authorize,
+  extractBearerToken,
+  reportPrincipal,
+  routeAuth,
+} from './auth.ts';
+import type { Principal, Scope } from './auth.ts';
 import { whoisIdentity } from './tailscale.ts';
 import { peerHosts } from './peers.ts';
-import { matchRoute, mapSpawnRequest, mapWaitRequest } from './routes.ts';
+import { matchRoute, mapSpawnRequest, mapWaitRequest, mapSendRequest } from './routes.ts';
 import type { RouteName } from './routes.ts';
+
+/**
+ * Daemon list/get projection: expose concurrency + scheduling state without
+ * plan prompts / task bodies that may hold credentials.
+ */
+function publicWorkflowRunView(run: WorkflowRun): Record<string, unknown> {
+  const sched = schedulingSummary(run.plan, run.attempts, run.steps);
+  return {
+    id: run.id,
+    name: run.name,
+    status: run.status,
+    schemaVersion: run.schemaVersion,
+    revision: run.revision,
+    startedAt: run.startedAt,
+    finishedAt: run.finishedAt,
+    rootRunId: run.rootRunId,
+    parentRunId: run.parentRunId,
+    definitionDigest: run.definitionDigest,
+    maxConcurrency: sched?.maxConcurrency ?? run.plan?.maxConcurrency ?? 1,
+    policy: run.policy,
+    runnerTmux: run.runnerTmux,
+    lease: run.lease
+      ? {
+          ownerId: run.lease.ownerId,
+          expiresAt: run.lease.expiresAt,
+          runnerTmux: run.lease.runnerTmux,
+        }
+      : undefined,
+    steps: run.steps.map((s) => ({
+      id: s.id,
+      provider: s.provider,
+      ok: s.ok,
+      state: s.state,
+      outcome: s.outcome,
+      sessionId: s.sessionId,
+      commitsAhead: s.commitsAhead,
+      worktree: s.worktree,
+      branch: s.branch,
+      unverified: s.unverified,
+    })),
+    scheduling: sched
+      ? { maxConcurrency: sched.maxConcurrency, steps: sched.steps }
+      : undefined,
+    attempts: (run.attempts ?? []).map((a) => ({
+      attemptId: a.attemptId,
+      attemptNumber: a.attemptNumber,
+      stepId: a.stepId,
+      phase: a.phase,
+      sessionId: a.sessionId,
+      errorCategory: a.errorCategory,
+      errorMessage: a.errorMessage,
+      startedAt: a.startedAt,
+      finishedAt: a.finishedAt,
+    })),
+  };
+}
 
 /** orc version, for `/health`. Read from package.json (best-effort; informational). */
 async function readVersion(): Promise<string> {
@@ -48,12 +122,21 @@ export interface DaemonOptions {
   /** Resolved bind address (from `resolveBind`). */
   hostname: string;
   port: number;
-  /** Configured shared secret (`ORC_DAEMON_SECRET`); null = no secret configured. */
+  /**
+   * Legacy shared secret (`ORC_DAEMON_SECRET` / `x-orc-secret`); null = not configured.
+   * When presented and valid, grants all scopes (backward-compatible all-access principal).
+   */
   secret?: string | null;
+  /**
+   * Scoped bearer tokens: token string → scopes. Prefer over the legacy secret for
+   * least-privilege clients. Configured via `ORC_DAEMON_TOKENS` JSON at daemon startup.
+   * Token values are never logged or returned.
+   */
+  tokens?: ReadonlyMap<string, readonly Scope[]> | null;
   /**
    * Static allowlist of trusted host names. When omitted, the gate reads `peers.json`
    * fresh per request (so `orc remote add` takes effect without a restart). Tests pass a
-   * static list.
+   * static list. Allowlisted identity is an all-scopes principal.
    */
   allowlist?: string[];
   /** This host's identity for `/health` + `/whoami` (defaults to os.hostname()). */
@@ -131,6 +214,7 @@ export function createFetch(opts: DaemonOptions): (req: Request, server: Bun.Ser
   const whois = opts.whois ?? whoisIdentity;
   const hostName = opts.hostName ?? os.hostname();
   const configuredSecret = opts.secret && opts.secret.length > 0 ? opts.secret : null;
+  const tokens: ReadonlyMap<string, readonly Scope[]> = opts.tokens ?? new Map();
   const versionPromise = opts.version ? Promise.resolve(opts.version) : readVersion();
 
   const getAllowlist = async (): Promise<string[]> =>
@@ -141,22 +225,33 @@ export function createFetch(opts: DaemonOptions): (req: Request, server: Bun.Ser
     const match = matchRoute(req.method, url.pathname);
     if (!match) return jsonError(404, `no route for ${req.method} ${url.pathname}`);
 
+    const authReq = routeAuth(match.name);
+
     // /health is the ONLY unauthenticated route (liveness).
-    if (match.name === 'health') {
+    if (authReq.type === 'public' || match.name === 'health') {
       return json({ ok: true, version: await versionPromise, host: hostName });
     }
 
-    // ---- Trust gate (fail closed) — every other route. ----
+    // ---- Authn + authz (fail closed) — every other route. ----
     const ip = resolveIp(req, server);
     const identity = await whois(ip).catch(() => null);
     const presentedSecret = req.headers.get('x-orc-secret');
+    const presentedBearer = extractBearerToken(req.headers.get('authorization'));
     const allowlist = await getAllowlist();
-    const allowed = decideTrust(identity, allowlist, presentedSecret, configuredSecret);
-    if (!allowed) {
-      return jsonError(
-        403,
-        'forbidden: caller is not an allowlisted tailnet peer and presented no valid secret',
-      );
+    const authn = authenticate({
+      identity,
+      allowlist,
+      presentedSecret,
+      configuredSecret,
+      presentedBearer,
+      tokens,
+    });
+    if (!authn.ok) {
+      return jsonError(authn.status, authn.message);
+    }
+    const authz = authorize(authn.principal, authReq);
+    if (!authz.ok) {
+      return jsonError(authz.status, authz.message);
     }
 
     try {
@@ -164,6 +259,7 @@ export function createFetch(opts: DaemonOptions): (req: Request, server: Bun.Ser
         hostName,
         identity,
         allowlist,
+        principal: authn.principal,
         versionPromise,
       });
     } catch (e) {
@@ -177,6 +273,7 @@ interface DispatchCtx {
   hostName: string;
   identity: Identity | null;
   allowlist: string[];
+  principal: Principal;
   versionPromise: Promise<string>;
 }
 
@@ -197,6 +294,7 @@ async function dispatch(
         host: ctx.hostName,
         peerAllowed: ctx.identity ? isAllowlisted(ctx.identity, ctx.allowlist) : false,
         identity: ctx.identity,
+        principal: reportPrincipal(ctx.principal),
       });
 
     case 'sessions.list': {
@@ -238,12 +336,25 @@ async function dispatch(
       const session = await getSession(params.id!);
       if (!session) throw new HttpError(404, `no session found for '${params.id}'`);
       const body = await readJsonBody(req);
-      const prompt = body.prompt;
-      if (typeof prompt !== 'string' || prompt.length === 0) {
-        throw new HttpError(400, 'send requires a non-empty `prompt` string');
+      let mapped;
+      try {
+        mapped = mapSendRequest(body);
+      } catch (e) {
+        throw new HttpError(400, (e as Error).message);
       }
-      await session.send(prompt);
-      return json({ ok: true, id: session.id });
+      const result = await session.send(
+        mapped.prompt,
+        mapped.messageId ? { messageId: mapped.messageId } : undefined,
+      );
+      return json({
+        ok: true,
+        id: session.id,
+        phase: result.phase,
+        attempts: result.attempts,
+        ...(result.messageId ? { messageId: result.messageId } : {}),
+        ...(result.payloadHash ? { payloadHash: result.payloadHash } : {}),
+        ...(result.replayed ? { replayed: true } : {}),
+      });
     }
 
     case 'sessions.wait': {
@@ -307,14 +418,14 @@ async function dispatch(
     case 'workflows.runs.list': {
       const runs = await listRuns();
       const reconciled = await Promise.all(runs.map((r) => reconcileRun(r)));
-      return json(reconciled);
+      // Public projection: maxConcurrency + scheduling, no plan prompts.
+      return json(reconciled.map(publicWorkflowRunView));
     }
 
     case 'workflows.runs.get': {
       const run = await readRun(params.id!);
       if (!run) throw new HttpError(404, `no run found for '${params.id}'`);
-      await reconcileRun(run);
-      return json(run);
+      return json(publicWorkflowRunView(await reconcileRun(run)));
     }
 
     case 'workflows.runs.logs': {
@@ -352,42 +463,187 @@ async function dispatch(
 
     case 'workflows.run':
       return runWorkflowRoute(req);
+
+    case 'workflows.runs.resume': {
+      const runId = params.id!;
+      const existing = await readRun(runId);
+      if (!existing) throw new HttpError(404, `no run found for '${runId}'`);
+      if (existing.status === 'cancelled') {
+        throw new HttpError(409, `run '${runId}' is cancelled; use retry`);
+      }
+      if (existing.status === 'running') {
+        const live = await reconcileRun(existing);
+        if (live.status === 'running' && live.lease) {
+          throw new HttpError(409, `run '${runId}' still has a live owner; wait or cancel first`);
+        }
+      }
+      const body = await readJsonBody(req);
+      const file =
+        typeof body.file === 'string'
+          ? body.file
+          : existing.sourcePath ?? existing.workflowSourcePath;
+      if (!file) {
+        throw new HttpError(
+          400,
+          'resume requires `file` (original workflow path) or a run with sourcePath',
+        );
+      }
+      const { def, absPath } = await importWorkflowFileWithPath(file);
+      if (body.detach === true) {
+        return detachWorkflowControl('resume', runId, absPath, existing);
+      }
+      try {
+        const run = await resumeWorkflow(runId, def, { sourcePath: absPath });
+        return json(run);
+      } catch (e) {
+        const msg = (e as Error).message;
+        if (/digest mismatch|done predicate|no run found|requires the original/.test(msg)) {
+          throw new HttpError(400, msg);
+        }
+        if (/cancelled|live owner|cannot be safely|require.*retry/i.test(msg)) {
+          throw new HttpError(409, msg);
+        }
+        throw e;
+      }
+    }
+
+    case 'workflows.runs.retry': {
+      const runId = params.id!;
+      const existing = await readRun(runId);
+      if (!existing) throw new HttpError(404, `no run found for '${runId}'`);
+      if (existing.status === 'running') {
+        const live = await reconcileRun(existing);
+        if (live.status === 'running' && live.lease) {
+          throw new HttpError(409, `run '${runId}' still has a live owner; wait or cancel first`);
+        }
+      }
+      const body = await readJsonBody(req);
+      const file =
+        typeof body.file === 'string'
+          ? body.file
+          : existing.sourcePath ?? existing.workflowSourcePath;
+      if (!file) {
+        throw new HttpError(
+          400,
+          'retry requires `file` (original workflow path) or a run with sourcePath',
+        );
+      }
+      const stepId =
+        typeof body.step === 'string'
+          ? body.step
+          : typeof body.stepId === 'string'
+            ? body.stepId
+            : undefined;
+      const { def, absPath } = await importWorkflowFileWithPath(file);
+      if (body.detach === true) {
+        return detachWorkflowControl('retry', runId, absPath, existing, stepId);
+      }
+      try {
+        const run = await retryWorkflow(runId, def, { sourcePath: absPath, stepId });
+        return json(run);
+      } catch (e) {
+        const msg = (e as Error).message;
+        if (/digest mismatch|no step|no run found|requires the original/.test(msg)) {
+          throw new HttpError(400, msg);
+        }
+        if (/live owner|cannot be safely|require.*retry/i.test(msg)) {
+          throw new HttpError(409, msg);
+        }
+        throw e;
+      }
+    }
+
+    case 'workflows.runs.cancel': {
+      const runId = params.id!;
+      const existing = await readRun(runId);
+      if (!existing) throw new HttpError(404, `no run found for '${runId}'`);
+      const body = await readJsonBody(req);
+      const run = await cancelWorkflow(runId, { cascade: body.cascade === true });
+      return json(run);
+    }
+
+    case 'workflows.runs.cleanup': {
+      const runId = params.id!;
+      const existing = await readRun(runId);
+      if (!existing) throw new HttpError(404, `no run found for '${runId}'`);
+      const body = await readJsonBody(req);
+      try {
+        const result = await cleanupWorkflow(runId, {
+          sessions: body.sessions === true,
+          worktrees: body.worktrees === true,
+        });
+        return json(result);
+      } catch (e) {
+        throw new HttpError(400, (e as Error).message);
+      }
+    }
   }
 }
 
 /**
- * `POST /workflows/run {file?, def?, detach?}`. Foreground: run a def (inline `def`, or
- * imported from the host-local `file`) to completion and return the `WorkflowRun`. Detach:
- * mint a runId, write an initial `running` record, and launch a detached
- * `orc workflow run <file> --run-id <id>` runner (mirrors the CLI `--detach` path) —
- * returns `{ runId, runnerTmux }` immediately. Detach requires `file`.
+ * Parse optional `maxConcurrency` from a daemon JSON body. Returns undefined when
+ * absent; throws HttpError(400) on invalid values.
+ */
+function parseBodyMaxConcurrency(body: Record<string, unknown>): number | undefined {
+  if (body.maxConcurrency === undefined && body.max_concurrency === undefined) return undefined;
+  const raw = body.maxConcurrency !== undefined ? body.maxConcurrency : body.max_concurrency;
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || !Number.isInteger(raw) || raw < 1) {
+    throw new HttpError(400, `maxConcurrency must be a positive integer (>= 1), got ${String(raw)}`);
+  }
+  if (raw > 10_000) {
+    throw new HttpError(400, `maxConcurrency must be <= 10000, got ${raw}`);
+  }
+  return raw;
+}
+
+/**
+ * `POST /workflows/run {file?, def?, detach?, maxConcurrency?}`. Foreground: run a def
+ * (inline `def`, or imported from the host-local `file`) to completion and return the
+ * `WorkflowRun`. Detach: mint a runId, write an initial `running` record, and launch a
+ * detached `orc workflow run <file> --run-id <id>` runner (mirrors the CLI `--detach`
+ * path) — returns `{ runId, runnerTmux }` immediately. Detach requires `file`.
  */
 async function runWorkflowRoute(req: Request): Promise<Response> {
   const body = await readJsonBody(req);
   const file = typeof body.file === 'string' ? body.file : undefined;
   const detach = body.detach === true;
+  const maxConcurrency = parseBodyMaxConcurrency(body);
 
   if (detach) {
     if (!file) throw new HttpError(400, 'workflow run --detach requires a `file` (a host-local path)');
     const def = await importWorkflowFile(file);
+    const defForPlan: WorkflowDef =
+      maxConcurrency !== undefined ? { ...def, maxConcurrency } : def;
     try {
-      validateWorkflowDef(def);
+      validateWorkflowDef(defForPlan);
     } catch (e) {
       throw new HttpError(400, (e as Error).message);
     }
     const runId = randomUUID().slice(0, 8);
     const runnerTmux = runnerTmuxName(runId);
+    const plan = buildPlan(defForPlan);
     const run: WorkflowRun = {
+      schemaVersion: WORKFLOW_SCHEMA_VERSION,
+      revision: 0,
       id: runId,
       name: def.name,
       startedAt: new Date().toISOString(),
       status: 'running',
       runnerTmux,
       steps: [],
+      plan,
+      definitionDigest: planDigest(plan),
+      sourcePath: path.resolve(file),
+      attempts: [],
+      lease: makeLease({ runnerTmux }),
+      rootRunId: runId,
     };
     await writeRun(run);
     const cliEntry = path.resolve(import.meta.dir, '../cli/index.ts');
     const argv = [process.execPath, cliEntry, 'workflow', 'run', path.resolve(file), '--run-id', runId];
+    if (maxConcurrency !== undefined) {
+      argv.push('--max-concurrency', String(maxConcurrency));
+    }
     try {
       await getDriver().spawn({ name: runnerTmux, cwd: process.cwd(), argv, env: { ORC_HOME: orcHome() } });
     } catch (e) {
@@ -408,25 +664,98 @@ async function runWorkflowRoute(req: Request): Promise<Response> {
   } else {
     throw new HttpError(400, 'workflow run requires `file` (a host-local path) or `def` (inline)');
   }
+  if (maxConcurrency !== undefined) {
+    def = { ...def, maxConcurrency };
+  }
   try {
     validateWorkflowDef(def);
   } catch (e) {
     throw new HttpError(400, (e as Error).message);
   }
-  const run = await runWorkflow(def);
+  const run = await runWorkflow(def, { maxConcurrency });
   return json(run);
 }
 
 /** Import a host-local workflow file and return its default-exported def (400 on failure). */
 async function importWorkflowFile(file: string): Promise<WorkflowDef> {
-  const abs = path.resolve(file);
+  const { def } = await importWorkflowFileWithPath(file);
+  return def;
+}
+
+async function importWorkflowFileWithPath(
+  file: string,
+): Promise<{ def: WorkflowDef; absPath: string }> {
+  let absPath: string;
   try {
-    const mod = (await import(abs)) as { default?: WorkflowDef };
-    if (!mod.default) throw new Error(`workflow file '${file}' has no default export`);
-    return mod.default;
+    absPath = await resolveContainedWorkflowFile(file);
   } catch (e) {
+    // Fall back to resolve for absolute paths already known on disk (resume sourcePath).
+    absPath = path.resolve(file);
+    if (!(await Bun.file(absPath).exists())) {
+      throw new HttpError(400, (e as Error).message);
+    }
+  }
+  try {
+    const mod = (await import(absPath)) as { default?: WorkflowDef };
+    if (!mod.default) throw new Error(`workflow file '${file}' has no default export`);
+    validateWorkflowDef(mod.default);
+    return { def: mod.default, absPath };
+  } catch (e) {
+    if (e instanceof HttpError) throw e;
     throw new HttpError(400, `failed to import workflow '${file}': ${(e as Error).message}`);
   }
+}
+
+/**
+ * Detached resume/retry: spawn `orc workflow resume|retry <runId> <file>` in tmux.
+ * Returns `{ runId, runnerTmux, action }` immediately.
+ */
+async function detachWorkflowControl(
+  mode: 'resume' | 'retry',
+  runId: string,
+  absPath: string,
+  existing: WorkflowRun,
+  stepId?: string,
+): Promise<Response> {
+  const runnerTmux = existing.runnerTmux ?? runnerTmuxName(runId);
+  const stamped: WorkflowRun = {
+    ...existing,
+    status: 'running',
+    finishedAt: undefined,
+    runnerTmux,
+    lease: makeLease({ runnerTmux }),
+    sourcePath: absPath,
+    workflowSourcePath: absPath,
+  };
+  try {
+    await writeRunOwned(stamped);
+  } catch {
+    await writeRun(stamped);
+  }
+  const cliEntry = path.resolve(import.meta.dir, '../cli/index.ts');
+  const argv = [
+    process.execPath,
+    cliEntry,
+    'workflow',
+    mode,
+    runId,
+    absPath,
+    ...(mode === 'retry' && stepId ? ['--step', stepId] : []),
+  ];
+  try {
+    await getDriver().spawn({
+      name: runnerTmux,
+      cwd: process.cwd(),
+      argv,
+      env: {
+        ORC_HOME: orcHome(),
+        ...runnerLineageEnv({ ...existing, id: runId }),
+      },
+    });
+  } catch (e) {
+    throw new HttpError(500, `failed to launch detached ${mode}: ${(e as Error).message}`);
+  }
+  return json({ runId, runnerTmux, action: mode });
 }
 
 /**

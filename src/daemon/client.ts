@@ -46,19 +46,44 @@ export interface WaitResult {
   timedOut: boolean;
 }
 
+export interface DaemonClientOptions {
+  /** Legacy shared secret → `x-orc-secret` (all-scopes principal when valid). */
+  secret?: string | null;
+  /** Scoped bearer token → `Authorization: Bearer …` (`ORC_DAEMON_TOKEN`). */
+  token?: string | null;
+}
+
 export class DaemonClient {
   readonly base: string;
   readonly host: string;
   private readonly secret?: string;
+  private readonly token?: string;
 
-  constructor(target: RemoteTarget, secret = process.env.ORC_DAEMON_SECRET) {
+  constructor(
+    target: RemoteTarget,
+    secretOrOpts: string | null | undefined | DaemonClientOptions = process.env.ORC_DAEMON_SECRET,
+  ) {
     this.host = target.host;
     this.base = `http://${target.host}:${target.port}`;
-    this.secret = secret && secret.length > 0 ? secret : undefined;
+    // Backward compatible: second arg may still be a secret string (or env default).
+    if (secretOrOpts && typeof secretOrOpts === 'object') {
+      const secret = secretOrOpts.secret ?? process.env.ORC_DAEMON_SECRET;
+      const token = secretOrOpts.token ?? process.env.ORC_DAEMON_TOKEN;
+      this.secret = secret && secret.length > 0 ? secret : undefined;
+      this.token = token && token.length > 0 ? token : undefined;
+    } else {
+      const secret = secretOrOpts ?? undefined;
+      this.secret = secret && secret.length > 0 ? secret : undefined;
+      const token = process.env.ORC_DAEMON_TOKEN;
+      this.token = token && token.length > 0 ? token : undefined;
+    }
   }
 
   private headers(extra?: Record<string, string>): Record<string, string> {
     const h: Record<string, string> = { accept: 'application/json', ...extra };
+    // Prefer bearer token when set; still send legacy secret if also configured
+    // (server accepts either; identity path needs neither).
+    if (this.token) h['authorization'] = `Bearer ${this.token}`;
     if (this.secret) h['x-orc-secret'] = this.secret;
     return h;
   }
@@ -102,8 +127,18 @@ export class DaemonClient {
     return this.get('/health') as Promise<{ ok: boolean; version: string; host: string }>;
   }
 
-  async whoami(): Promise<{ host: string; peerAllowed: boolean; identity: unknown }> {
-    return this.get('/whoami') as Promise<{ host: string; peerAllowed: boolean; identity: unknown }>;
+  async whoami(): Promise<{
+    host: string;
+    peerAllowed: boolean;
+    identity: unknown;
+    principal?: { kind: string; node?: string; scopes: string[] };
+  }> {
+    return this.get('/whoami') as Promise<{
+      host: string;
+      peerAllowed: boolean;
+      identity: unknown;
+      principal?: { kind: string; node?: string; scopes: string[] };
+    }>;
   }
 
   async listSessions(filter?: {
@@ -133,10 +168,29 @@ export class DaemonClient {
     >;
   }
 
-  async send(id: string, prompt: string): Promise<{ ok: boolean; id: string }> {
-    return this.post(`/sessions/${encodeURIComponent(id)}/send`, { prompt }) as Promise<{
+  async send(
+    id: string,
+    prompt: string,
+    opts?: { messageId?: string },
+  ): Promise<{
+    ok: boolean;
+    id: string;
+    phase?: string;
+    attempts?: number;
+    messageId?: string;
+    payloadHash?: string;
+    replayed?: boolean;
+  }> {
+    const body: Record<string, unknown> = { prompt };
+    if (opts?.messageId) body.messageId = opts.messageId;
+    return this.post(`/sessions/${encodeURIComponent(id)}/send`, body) as Promise<{
       ok: boolean;
       id: string;
+      phase?: string;
+      attempts?: number;
+      messageId?: string;
+      payloadHash?: string;
+      replayed?: boolean;
     }>;
   }
 
@@ -192,9 +246,46 @@ export class DaemonClient {
     file?: string;
     def?: unknown;
     detach?: boolean;
+    /** Positive integer; omit for workflow default (1). */
+    maxConcurrency?: number;
   }): Promise<WorkflowRun | { runId: string; runnerTmux: string }> {
     return this.post('/workflows/run', body) as Promise<
       WorkflowRun | { runId: string; runnerTmux: string }
     >;
+  }
+
+  async resumeWorkflow(
+    id: string,
+    body?: { file?: string; detach?: boolean },
+  ): Promise<WorkflowRun | { runId: string; runnerTmux: string; action?: string }> {
+    return this.post(`/workflows/runs/${encodeURIComponent(id)}/resume`, body ?? {}) as Promise<
+      WorkflowRun | { runId: string; runnerTmux: string; action?: string }
+    >;
+  }
+
+  async retryWorkflow(
+    id: string,
+    body?: { file?: string; step?: string; stepId?: string; detach?: boolean },
+  ): Promise<WorkflowRun | { runId: string; runnerTmux: string; action?: string }> {
+    return this.post(`/workflows/runs/${encodeURIComponent(id)}/retry`, body ?? {}) as Promise<
+      WorkflowRun | { runId: string; runnerTmux: string; action?: string }
+    >;
+  }
+
+  async cancelWorkflow(
+    id: string,
+    body?: { cascade?: boolean },
+  ): Promise<WorkflowRun> {
+    return this.post(`/workflows/runs/${encodeURIComponent(id)}/cancel`, body ?? {}) as Promise<WorkflowRun>;
+  }
+
+  async cleanupWorkflow(
+    id: string,
+    body?: { sessions?: boolean; worktrees?: boolean },
+  ): Promise<{ runId: string; sessions: string[]; worktrees: string[] }> {
+    return this.post(
+      `/workflows/runs/${encodeURIComponent(id)}/cleanup`,
+      body ?? {},
+    ) as Promise<{ runId: string; sessions: string[]; worktrees: string[] }>;
   }
 }

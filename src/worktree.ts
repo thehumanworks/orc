@@ -25,6 +25,14 @@ async function git(args: string[], cwd: string): Promise<RunResult> {
   return { code, stdout, stderr };
 }
 
+/** Raw git spawn (array argv only — never shell). Signature: (args, cwd). */
+export async function gitExec(
+  args: string[],
+  cwd: string,
+): Promise<{ code: number; stdout: string; stderr: string }> {
+  return git(args, cwd);
+}
+
 /** git toplevel of a dir, or null if not in a repo. */
 export async function gitToplevel(cwd: string): Promise<string | null> {
   const r = await git(['rev-parse', '--show-toplevel'], cwd);
@@ -40,25 +48,18 @@ export async function isInsideGitRepo(cwd: string): Promise<boolean> {
 }
 
 export interface WorktreeResult {
-  /** realpath of the created worktree (used as cwd). */
   path: string;
   branch: string;
 }
 
 export interface CreateWorktreeArgs {
   cwd: string;
-  /** Short, collision-resistant id (e.g. first chars of the session uuid). */
   shortId: string;
-  /** Label used in the branch name (sanitized provider/agent label). */
   agentLabel: string;
   branch?: string;
   path?: string;
 }
 
-/**
- * Create a fresh worktree. Default path `<repo>/.orc/worktrees/<shortId>`, branch
- * `orc/<agentLabel>/<shortId>`. The path must not pre-exist and the branch must be unique.
- */
 export async function createWorktree(args: CreateWorktreeArgs): Promise<WorktreeResult> {
   const toplevel = await gitToplevel(args.cwd);
   if (!toplevel) {
@@ -66,40 +67,64 @@ export async function createWorktree(args: CreateWorktreeArgs): Promise<Worktree
   }
   const branch = args.branch ?? `orc/${args.agentLabel}/${args.shortId}`;
   const wtPath = args.path ?? path.join(toplevel, '.orc', 'worktrees', args.shortId);
-
-  // Ensure parent dir exists (the worktree path itself must NOT pre-exist).
   await fs.mkdir(path.dirname(wtPath), { recursive: true });
-
   const r = await git(['worktree', 'add', wtPath, '-b', branch], toplevel);
   if (r.code !== 0) {
     throw new Error(`git worktree add failed: ${r.stderr.trim() || r.stdout.trim()}`);
   }
-
-  // realpath of the created worktree (claude slug + codex cwd match need realpath).
   const real = await fs.realpath(wtPath);
   return { path: real, branch };
 }
 
+/** Current HEAD SHA, or null if unavailable. */
+export async function gitHead(cwd: string): Promise<string | null> {
+  const r = await git(['rev-parse', 'HEAD'], cwd);
+  if (r.code !== 0) return null;
+  const sha = r.stdout.trim();
+  return sha.length >= 7 ? sha : null;
+}
+
+/** Alias returning undefined instead of null. */
+export async function gitHeadSha(cwd: string): Promise<string | undefined> {
+  return (await gitHead(cwd)) ?? undefined;
+}
+
 /**
- * Count commits on a worktree's branch ahead of `base` (default `main`):
- * `git -C <worktree> rev-list --count base..HEAD`. This is the HARD success signal a
- * workflow step uses (a commit is evidence the agent did real work — a yield alone is
- * not). Returns 0 when the ref can't be resolved (e.g. no `base` branch) so an
- * unverifiable worktree never falsely reports success. v1 assumes the integration
- * branch is `main`, matching the dogfood harness and DESIGN-workflows.md.
+ * Commits on HEAD since baseline SHA (`baseline..HEAD`).
+ * Prefer this over hard-coded main — works on any branch.
  */
-export async function commitCountVsMain(worktree: string, base = 'main'): Promise<number> {
-  const r = await git(['rev-list', '--count', `${base}..HEAD`], worktree);
+export async function commitCountSince(
+  cwd: string,
+  baselineSha: string | null | undefined,
+): Promise<number> {
+  if (!baselineSha || !baselineSha.trim()) return 0;
+  const r = await git(['rev-list', '--count', `${baselineSha.trim()}..HEAD`], cwd);
   if (r.code !== 0) return 0;
   const n = parseInt(r.stdout.trim(), 10);
   return Number.isFinite(n) ? n : 0;
 }
 
-/**
- * Remove a worktree (force) and optionally delete its branch.
- * Resolves the git toplevel from `wtPath` first so logical `--workspace` strings
- * (non-repo paths) still work when `repoCwd` is not a git directory.
- */
+/** Legacy helper: commits ahead of integration branch (default main). */
+export async function commitCountVsMain(worktree: string, base = 'main'): Promise<number> {
+  return commitCountSince(worktree, base);
+}
+
+export async function hasDiffSince(
+  cwd: string,
+  baselineSha: string | null | undefined,
+): Promise<boolean> {
+  if (!baselineSha) return false;
+  const commits = await commitCountSince(cwd, baselineSha);
+  if (commits > 0) return true;
+  const r = await git(['diff', '--quiet', baselineSha], cwd);
+  return r.code === 1;
+}
+
+export async function hasWorkingTreeChanges(cwd: string): Promise<boolean> {
+  const r = await git(['status', '--porcelain'], cwd);
+  return r.code === 0 && r.stdout.trim().length > 0;
+}
+
 export async function removeWorktree(
   repoCwd: string,
   wtPath: string,
@@ -113,7 +138,10 @@ export async function removeWorktree(
   const branch = opts?.branch?.trim();
   if (branch) {
     const dr = await git(['branch', '-D', branch], toplevel);
-    if (dr.code !== 0 && !/not found|not a valid object name|checked out/i.test(dr.stderr + dr.stdout)) {
+    if (
+      dr.code !== 0 &&
+      !/not found|not a valid object name|checked out/i.test(dr.stderr + dr.stdout)
+    ) {
       throw new Error(`git branch -D failed: ${dr.stderr.trim() || dr.stdout.trim()}`);
     }
   }

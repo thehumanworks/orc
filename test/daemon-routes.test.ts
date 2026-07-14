@@ -3,6 +3,7 @@ import {
   matchRoute,
   mapSpawnRequest,
   mapWaitRequest,
+  mapSendRequest,
 } from '../src/daemon/routes.ts';
 import { extractHostFlag } from '../src/cli/index.ts';
 import { parseHostArg } from '../src/daemon/client.ts';
@@ -15,6 +16,16 @@ describe('matchRoute — the route table', () => {
     expect(matchRoute('POST', '/sessions')?.name).toBe('sessions.spawn');
     expect(matchRoute('GET', '/workflows/runs')?.name).toBe('workflows.runs.list');
     expect(matchRoute('POST', '/workflows/run')?.name).toBe('workflows.run');
+  });
+
+  test('workflow control routes', () => {
+    expect(matchRoute('POST', '/workflows/runs/abc/resume')).toEqual({
+      name: 'workflows.runs.resume',
+      params: { id: 'abc' },
+    });
+    expect(matchRoute('POST', '/workflows/runs/abc/retry')?.name).toBe('workflows.runs.retry');
+    expect(matchRoute('POST', '/workflows/runs/abc/cancel')?.name).toBe('workflows.runs.cancel');
+    expect(matchRoute('POST', '/workflows/runs/abc/cleanup')?.name).toBe('workflows.runs.cleanup');
   });
 
   test('param routes capture :id', () => {
@@ -125,6 +136,51 @@ describe('mapWaitRequest — request → WaitForOptions', () => {
   });
   test('invalid timeoutMs throws', () => {
     expect(() => mapWaitRequest({ timeoutMs: -1 })).toThrow(/invalid timeoutMs/);
+  });
+});
+
+describe('mapSendRequest — prompt + optional idempotency key', () => {
+  test('prompt only (source-compatible shape)', () => {
+    expect(mapSendRequest({ prompt: 'hello' })).toEqual({ prompt: 'hello' });
+  });
+
+  test('messageId maps through', () => {
+    expect(mapSendRequest({ prompt: 'hello', messageId: 'mid-1' })).toEqual({
+      prompt: 'hello',
+      messageId: 'mid-1',
+    });
+  });
+
+  test('idempotencyKey alias maps to messageId', () => {
+    expect(mapSendRequest({ prompt: 'hello', idempotencyKey: 'k-2' })).toEqual({
+      prompt: 'hello',
+      messageId: 'k-2',
+    });
+  });
+
+  test('messageId wins when both provided', () => {
+    expect(
+      mapSendRequest({ prompt: 'p', messageId: 'primary', idempotencyKey: 'alias' }),
+    ).toEqual({ prompt: 'p', messageId: 'primary' });
+  });
+
+  test('rejects missing/empty prompt', () => {
+    expect(() => mapSendRequest({})).toThrow(/non-empty `prompt`/);
+    expect(() => mapSendRequest({ prompt: '' })).toThrow(/non-empty `prompt`/);
+    expect(() => mapSendRequest({ prompt: 1 })).toThrow(/non-empty `prompt`/);
+  });
+
+  test('rejects empty idempotency key when provided', () => {
+    expect(() => mapSendRequest({ prompt: 'p', messageId: '  ' })).toThrow(
+      /messageId\/idempotencyKey/,
+    );
+    expect(() => mapSendRequest({ prompt: 'p', idempotencyKey: '' })).toThrow(
+      /messageId\/idempotencyKey/,
+    );
+  });
+
+  test('rejects unsafe messageId (path traversal) at the request boundary', () => {
+    expect(() => mapSendRequest({ prompt: 'p', messageId: '../evil' })).toThrow(/invalid messageId/);
   });
 });
 

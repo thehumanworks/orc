@@ -17,11 +17,19 @@ export interface BuildCtx {
   cwd: string;
   /** Per-session dir for providers that need one (pi). */
   sessionDir: string;
+  /**
+   * Absolute path under orc-owned state for Codex persona injection
+   * (`experimental_instructions_file`). Outside the repo/worktree.
+   */
+  instructionsPath?: string;
 }
 
 export interface ProviderAdapter {
   name: Provider;
-  /** Prepare cwd before spawn (e.g. codex writes AGENTS.md). */
+  /**
+   * Provider prep before spawn (e.g. codex writes an orc-owned instructions file
+   * outside the cwd — never mutates the user's AGENTS.md).
+   */
   prepare(ctx: BuildCtx): Promise<void>;
   /** yolo interactive argv (NO positional prompt — it's injected post-boot). */
   buildArgv(ctx: BuildCtx): string[];

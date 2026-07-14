@@ -1,8 +1,8 @@
 # Design: orc daemon — connect to orc servers on trusted tailscale hosts (goal-feature 3)
 
-Status: DRAFT — depends on F1 (wait/state, done) and F2 (workflows, in progress). The HTTP surface is
-just the existing SDK (`agent`, `listSessions`, `getSession`, `Session.*`, `runWorkflow`) exposed over
-the network, so this is mostly a transport + trust layer, not new orchestration logic.
+Status: IMPLEMENTED. The HTTP surface is the existing SDK (`agent`, `listSessions`, `getSession`,
+`Session.*`, `runWorkflow`) exposed over the network, so this remains a transport, authorization,
+and trust layer rather than a second orchestration implementation.
 
 ## Requirement (from the user's goal)
 A daemon/server process so we can connect to OTHER `orc` servers running on trusted hosts in the
@@ -10,7 +10,7 @@ user's **tailscale** network — i.e. list/spawn/read/wait/kill agents and run w
 machines, not just locally. The point: drive a fleet of coding agents across several machines from one
 place.
 
-## Trust model — lean on tailscale, don't reinvent auth
+## Trust and authorization model
 tailscale already gives us a private, mutually-authenticated network (WireGuard) and a stable identity
 per node. So:
 - The daemon **binds to the tailscale interface only** (the node's `100.x` / tailnet IP), never
@@ -19,8 +19,13 @@ per node. So:
   tailnet node/user, and check it against a **peer allowlist** (`~/.orc/peers.json`: tailnet hostnames
   the user has trusted via `orc remote add <host>`). No passwords/tokens to manage; identity is the
   tailnet membership + the explicit allowlist.
-- Defense in depth: also accept a per-tailnet shared secret header as a fallback for environments
-  where `tailscale whois` isn't available. Recommend whois-first.
+- Allowlisted tailnet identities receive all scopes. Scoped bearer tokens are configured with
+  `ORC_DAEMON_TOKENS` and presented as `Authorization: Bearer` (client:
+  `ORC_DAEMON_TOKEN`). The legacy `x-orc-secret` / `ORC_DAEMON_SECRET` path remains an
+  all-scopes fallback.
+- Routes require `sessions:read`, `sessions:write`, `workflows:read`, `workflows:write`, or
+  `admin`; `admin` implies all. Missing/invalid credentials return 401 and insufficient scope
+  returns 403. `/health` alone is public. Credentials are never returned by `/whoami`.
 
 ## Architecture
 - **Server**: `orc daemon [--port 8787]` runs `Bun.serve` bound to the tailscale IP, exposing a small
@@ -41,7 +46,7 @@ GET  /sessions/:id/read?raw=&full=&last=&index=  → selected parsed turns (or r
 POST /sessions/:id/send   {prompt}       → send
 POST /sessions/:id/wait   {for,timeoutMs}→ waitFor (long-poll)               [reuses F1]
 POST /sessions/:id/kill   {worktree,purge}
-GET  /workflows/runs , POST /workflows/run {file|def} , GET /workflows/runs/:id   [reuses F2]
+GET  /workflows/runs , POST /workflows/run {file|def,maxConcurrency} , GET /workflows/runs/:id
 GET  /health , GET /whoami               → daemon identity + version (trust handshake)
 ```
 
@@ -62,11 +67,9 @@ real agent THROUGH the HTTP API, `wait` on it via the API, read its parsed trans
 kill it — asserting the remote-driven lifecycle matches a local one. Then test the trust gate: a
 request from a non-allowlisted identity is refused. (On the user's real tailnet, repeat host→host.)
 
-## Open questions (resolve before building)
-1. whois-based identity vs shared-secret vs both — recommend whois + allowlist, secret as fallback.
-2. Does `orc --host` proxy EVERY command, or only read-ish ones initially? (Recommend all; spawn/kill
-   are the point.)
-3. Worktrees are host-local paths — remote `read --raw`/`attach` only make sense ON that host;
+## Decisions and remaining constraints
+1. `orc --host` proxies the supported read and mutation commands; spawn/kill/workflow control are
+   intentionally part of the remote surface.
+2. Worktrees are host-local paths — remote `read --raw`/`attach` only make sense ON that host;
    `attach` should print the host + `tailscale ssh <host>` hint rather than a bare local tmux command.
-4. One daemon per host on a fixed port, or discovery via tailscale MagicDNS names? (Recommend fixed
-   port + MagicDNS hostnames in `peers.json`.)
+3. Discovery uses a fixed port plus MagicDNS hostnames in `peers.json`.

@@ -7,6 +7,7 @@ import { validateOptions } from '../agent.ts';
 import type { AgentOptions, Provider, SystemPromptMode } from '../types.ts';
 import type { WaitForOptions } from '../session.ts';
 import { resolveUntil } from '../state.ts';
+import { assertValidMessageId } from '../paths.ts';
 
 export type RouteName =
   | 'health'
@@ -21,7 +22,11 @@ export type RouteName =
   | 'workflows.runs.list'
   | 'workflows.run'
   | 'workflows.runs.get'
-  | 'workflows.runs.logs';
+  | 'workflows.runs.logs'
+  | 'workflows.runs.resume'
+  | 'workflows.runs.retry'
+  | 'workflows.runs.cancel'
+  | 'workflows.runs.cleanup';
 
 interface Route {
   method: 'GET' | 'POST';
@@ -43,6 +48,10 @@ const ROUTES: Route[] = [
   { method: 'GET', pattern: '/workflows/runs', name: 'workflows.runs.list' },
   { method: 'POST', pattern: '/workflows/run', name: 'workflows.run' },
   { method: 'GET', pattern: '/workflows/runs/:id/logs', name: 'workflows.runs.logs' },
+  { method: 'POST', pattern: '/workflows/runs/:id/resume', name: 'workflows.runs.resume' },
+  { method: 'POST', pattern: '/workflows/runs/:id/retry', name: 'workflows.runs.retry' },
+  { method: 'POST', pattern: '/workflows/runs/:id/cancel', name: 'workflows.runs.cancel' },
+  { method: 'POST', pattern: '/workflows/runs/:id/cleanup', name: 'workflows.runs.cleanup' },
   { method: 'GET', pattern: '/workflows/runs/:id', name: 'workflows.runs.get' },
   { method: 'POST', pattern: '/sessions/:id/send', name: 'sessions.send' },
   { method: 'POST', pattern: '/sessions/:id/wait', name: 'sessions.wait' },
@@ -169,4 +178,40 @@ export function mapWaitRequest(body: WaitRequest): WaitForOptions {
     opts.timeoutMs = ms;
   }
   return opts;
+}
+
+/** The body shape `POST /sessions/:id/send` accepts. */
+export interface SendRequest {
+  prompt?: unknown;
+  /** Idempotency key (maps to Session.send options.messageId). */
+  messageId?: unknown;
+  /** Alias accepted for clients that prefer the HTTP-style name. */
+  idempotencyKey?: unknown;
+}
+
+export interface MappedSendRequest {
+  prompt: string;
+  messageId?: string;
+}
+
+/**
+ * PURE map of a `POST /sessions/:id/send` body. Requires a non-empty prompt string.
+ * Optional idempotency key via `messageId` or `idempotencyKey` (same semantics).
+ * Does not store or log the prompt body — only validates shape.
+ */
+export function mapSendRequest(body: SendRequest): MappedSendRequest {
+  if (typeof body.prompt !== 'string' || body.prompt.length === 0) {
+    throw new Error('send requires a non-empty `prompt` string');
+  }
+  const rawKey = body.messageId ?? body.idempotencyKey;
+  if (rawKey === undefined || rawKey === null) {
+    return { prompt: body.prompt };
+  }
+  if (typeof rawKey !== 'string' || rawKey.trim().length === 0) {
+    throw new Error('messageId/idempotencyKey must be a non-empty string when provided');
+  }
+  const messageId = rawKey.trim();
+  // Validate early so the daemon maps invalid keys to HTTP 400 (not a late 500).
+  assertValidMessageId(messageId);
+  return { prompt: body.prompt, messageId };
 }

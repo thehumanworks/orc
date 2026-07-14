@@ -13,9 +13,17 @@ import type { BuildCtx } from './providers/provider.ts';
 import { effectiveAgentModel, resolveAgentDef } from './agentdefs.ts';
 import { createWorktree, gitToplevel, isInsideGitRepo, removeWorktree } from './worktree.ts';
 import { removeRecord, reserveRecord, upsertRecord, validateAlias } from './registry.ts';
-import { piSessionDir } from './paths.ts';
+import { piSessionDir, sessionInstructionsPath } from './paths.ts';
 import { Session } from './session.ts';
+import { withLock } from './lock.ts';
 import type { AgentOptions, Provider, SessionRecord, SystemPromptMode } from './types.ts';
+import { removeSessionInstructions } from './session-files.ts';
+import {
+  resolveLineage,
+  enforceSpawnPolicy,
+  lineageEnv,
+  validateExecutionPolicy,
+} from './lineage.ts';
 
 const VALID_PROVIDERS: Provider[] = ['claude', 'codex', 'pi'];
 
@@ -31,11 +39,17 @@ export function validateOptions(opts: AgentOptions): void {
     throw new Error('agentName and systemPrompt are mutually exclusive — pass only one');
   }
   validateAlias(opts.alias);
+  if (opts.policy) validateExecutionPolicy(opts.policy, 'agent policy');
+  if (opts.depth !== undefined && (!Number.isFinite(opts.depth) || opts.depth < 0)) {
+    throw new Error('depth must be a non-negative number');
+  }
 }
 
 export async function agent(opts: AgentOptions): Promise<Session> {
   validateOptions(opts);
 
+  // Explicit options override inherited ORC_* environment lineage.
+  const lineage = resolveLineage(opts, process.env);
   const provider = opts.provider;
   const adapter = getProvider(provider);
   const driver = getDriver(opts.driver ?? 'tmux');
@@ -93,6 +107,15 @@ export async function agent(opts: AgentOptions): Promise<Session> {
   // pi needs a session dir.
   const sessionDir = piSessionDir(sessionId);
 
+  // Codex persona lives under orc-owned state (not cwd/AGENTS.md). Path is unique per
+  // sessionId and only allocated when a non-empty system/agent prompt will be injected.
+  const needsCodexInstructions =
+    provider === 'codex' &&
+    Boolean(resolvedSystemPrompt && resolvedSystemPrompt.trim().length > 0);
+  const instructionsPath = needsCodexInstructions
+    ? sessionInstructionsPath(sessionId)
+    : undefined;
+
   let cwd = baseCwd;
   let worktreePath: string | undefined;
   let branch: string | undefined;
@@ -111,13 +134,25 @@ export async function agent(opts: AgentOptions): Promise<Session> {
     workspace,
     systemPromptMode,
     sessionDir: provider === 'pi' ? sessionDir : undefined,
+    ...(instructionsPath ? { instructionsPath } : {}),
     createdAt,
     aliasReservedAt: alias ? createdAt : undefined,
+    ...(lineage.rootRunId ? { rootRunId: lineage.rootRunId } : {}),
+    ...(lineage.parentRunId ? { parentRunId: lineage.parentRunId } : {}),
+    ...(lineage.parentSessionId ? { parentSessionId: lineage.parentSessionId } : {}),
+    ...(lineage.stepId ? { stepId: lineage.stepId } : {}),
+    ...(lineage.depth !== undefined ? { depth: lineage.depth } : {}),
+    ...(lineage.owner ? { owner: lineage.owner } : {}),
+    ...(opts.policy ? { policy: opts.policy } : {}),
   };
 
   // Reserve the alias under the registry lock before worktree/provider prep so two
   // near-simultaneous spawns cannot claim the same workspace alias.
-  await reserveRecord(record, { driver });
+  await reserveSpawnRecord(record, {
+    driver,
+    lineage,
+    policy: opts.policy,
+  });
 
   let spawned = false;
   try {
@@ -153,15 +188,31 @@ export async function agent(opts: AgentOptions): Promise<Session> {
       agentName: nativeAgentName,
       cwd,
       sessionDir,
+      ...(instructionsPath ? { instructionsPath } : {}),
     };
 
-    // Provider cwd prep (codex writes AGENTS.md).
+    // Provider prep (codex writes orc-owned instructions file, not AGENTS.md).
     await adapter.prepare(ctx);
 
     const argv = adapter.buildArgv(ctx);
 
-    // Spawn the detached TUI.
-    await driver.spawn({ name: tmuxName, cwd, argv });
+    // Spawn the detached TUI. Thread ORC_* lineage so nested `orc` CLIs inherit context
+    // (explicit AgentOptions still override env on the next agent() call).
+    const childEnv = {
+      ...lineageEnv({
+        ...lineage,
+        // Child processes that spawn further agents deepen by 1 unless overridden.
+        depth: (lineage.depth ?? 0) + 1,
+        parentSessionId: shortId,
+      }),
+      ...(opts.extraEnv ?? {}),
+    };
+    await driver.spawn({
+      name: tmuxName,
+      cwd,
+      argv,
+      env: Object.keys(childEnv).length > 0 ? childEnv : undefined,
+    });
     spawned = true;
     if (record.aliasReservedAt) {
       const { aliasReservedAt: _reserved, ...launched } = record;
@@ -172,6 +223,8 @@ export async function agent(opts: AgentOptions): Promise<Session> {
       if (worktreePath) {
         await removeWorktree(baseCwd, worktreePath, { branch }).catch(() => {});
       }
+      // Drop orc-owned codex instructions written during prepare; never touch user files.
+      await removeSessionInstructions(record).catch(() => {});
       await removeRecord(shortId).catch(() => {});
     }
     throw e;
@@ -193,6 +246,36 @@ export async function agent(opts: AgentOptions): Promise<Session> {
   // The record is still returned so a caller can poll status / send later.
 
   return session;
+}
+
+/**
+ * Atomically enforce a root execution policy and reserve the new registry record.
+ * The cross-process root lock closes the check-then-reserve race where two agents
+ * could both observe one free maxConcurrentSessions slot and oversubscribe it.
+ */
+export async function reserveSpawnRecord(
+  record: SessionRecord,
+  args: {
+    driver: ReturnType<typeof getDriver>;
+    lineage: ReturnType<typeof resolveLineage>;
+    policy?: AgentOptions['policy'];
+  },
+): Promise<void> {
+  const reserve = async () => {
+    await enforceSpawnPolicy({
+      lineage: args.lineage,
+      policy: args.policy,
+      isDelegation:
+        (args.lineage.depth ?? 0) > 0 || Boolean(args.lineage.parentRunId),
+    });
+    await reserveRecord(record, { driver: args.driver });
+  };
+
+  if (!args.lineage.rootRunId && !args.policy) {
+    await reserve();
+    return;
+  }
+  await withLock(`spawn-policy-${args.lineage.rootRunId ?? 'unrooted'}`, reserve);
 }
 
 /**

@@ -23,7 +23,8 @@ mock.module('../src/drivers/driver.ts', () => ({
   getDriver: () => failingDriver,
 }));
 
-const { agent } = await import('../src/agent.ts');
+const { agent, reserveSpawnRecord } = await import('../src/agent.ts');
+const { readRegistry } = await import('../src/registry.ts');
 
 const tmpDirs: string[] = [];
 
@@ -75,6 +76,43 @@ describe('agent() worktree rollback on pre-spawn failure', () => {
     expect(after).toEqual(before);
   });
 
+  test('policy check and registry reservation are atomic across concurrent spawns', async () => {
+    const base = await fs.mkdtemp(path.join(os.tmpdir(), 'orc-policy-reserve-'));
+    tmpDirs.push(base);
+    const previous = process.env.ORC_HOME;
+    process.env.ORC_HOME = path.join(base, 'orc');
+    await fs.mkdir(process.env.ORC_HOME, { recursive: true });
+    try {
+      const makeRecord = (id: string) => ({
+        id,
+        sessionId: `${id}-session`,
+        provider: 'claude' as const,
+        tmuxName: `orc-${id}`,
+        cwd: base,
+        workspace: base,
+        rootRunId: 'policy-root',
+        createdAt: new Date().toISOString(),
+      });
+      const args = {
+        driver: failingDriver,
+        lineage: { rootRunId: 'policy-root', depth: 1 },
+        policy: { maxConcurrentSessions: 1 },
+      };
+      const settled = await Promise.allSettled([
+        reserveSpawnRecord(makeRecord('spawn001'), args),
+        reserveSpawnRecord(makeRecord('spawn002'), args),
+      ]);
+
+      expect(settled.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+      const rejected = settled.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+      expect(String(rejected.reason)).toMatch(/maxConcurrentSessions=1/);
+      expect(await readRegistry()).toHaveLength(1);
+    } finally {
+      if (previous === undefined) delete process.env.ORC_HOME;
+      else process.env.ORC_HOME = previous;
+    }
+  });
+
   test('removes worktree when workspace is logical (non-repo path)', async () => {
     const repo = await mkRepo();
     const before = await listWorktreePaths(repo);
@@ -90,5 +128,51 @@ describe('agent() worktree rollback on pre-spawn failure', () => {
     ).rejects.toThrow(/spawn failed for test/);
 
     expect(await listWorktreePaths(repo)).toEqual(before);
+  });
+
+  test('removes orc-owned codex instructions when spawn fails (no AGENTS.md mutation)', async () => {
+    const base = await fs.mkdtemp(path.join(os.tmpdir(), 'orc-codex-rb-'));
+    tmpDirs.push(base);
+    const orcHome = path.join(base, 'orc');
+    const repo = path.join(base, 'repo');
+    await fs.mkdir(orcHome, { recursive: true });
+    await fs.mkdir(repo, { recursive: true });
+    await fs.writeFile(path.join(repo, 'AGENTS.md'), 'user agents\n');
+    const prev = process.env.ORC_HOME;
+    process.env.ORC_HOME = orcHome;
+    try {
+      await expect(
+        agent({
+          provider: 'codex',
+          cwd: repo,
+          systemPrompt: 'rollback-persona',
+          waitForReady: false,
+        }),
+      ).rejects.toThrow(/spawn failed for test/);
+
+      expect(await Bun.file(path.join(repo, 'AGENTS.md')).text()).toBe('user agents\n');
+      // No leftover instructions.md under ~/.orc/sessions
+      const sessions = path.join(orcHome, 'sessions');
+      let leftover: string[] = [];
+      try {
+        const walk = async (dir: string): Promise<string[]> => {
+          const out: string[] = [];
+          for (const e of await fs.readdir(dir)) {
+            const p = path.join(dir, e);
+            const st = await fs.stat(p);
+            if (st.isDirectory()) out.push(...(await walk(p)));
+            else if (e === 'instructions.md') out.push(p);
+          }
+          return out;
+        };
+        leftover = await walk(sessions);
+      } catch {
+        leftover = [];
+      }
+      expect(leftover).toEqual([]);
+    } finally {
+      if (prev === undefined) delete process.env.ORC_HOME;
+      else process.env.ORC_HOME = prev;
+    }
   });
 });

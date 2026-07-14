@@ -1,7 +1,10 @@
 /**
  * TmuxDriver — all tmux calls go through Bun.spawn with ARRAY argv. Untrusted prompt
- * text is never string-interpolated into a shell; it travels via `set-buffer -- <text>`.
+ * text is never string-interpolated into a shell; it travels via `set-buffer -b <name> -- <text>`.
+ * Every paste uses a unique named buffer (never the server-global unnamed buffer) so
+ * concurrent pastes cannot clobber each other.
  */
+import { randomUUID } from 'node:crypto';
 import type { Driver, SpawnArgs } from './driver.ts';
 import type { PaneInfo } from '../types.ts';
 
@@ -97,6 +100,55 @@ export function buildAttachArgs(name: string, o?: { readOnly?: boolean }): strin
   return o?.readOnly ? ['attach', '-r', '-t', name] : ['attach', '-t', name];
 }
 
+/**
+ * Unique safe tmux buffer name for one paste. tmux buffer names are free-form but we
+ * keep them [A-Za-z0-9_-] so argv is unambiguous.
+ */
+export function newPasteBufferName(): string {
+  return `orc-paste-${randomUUID().replace(/-/g, '')}`;
+}
+
+/** `tmux set-buffer -b <name> -- <text>` — named buffer, `--` so text may start with '-'. */
+export function buildSetBufferArgs(bufferName: string, text: string): string[] {
+  return ['set-buffer', '-b', bufferName, '--', text];
+}
+
+/**
+ * `tmux paste-buffer -b <name> -p -d -t <pane>` — bracketed paste, delete buffer after
+ * paste so it cannot leak or be reused by a concurrent paste.
+ */
+export function buildPasteBufferArgs(bufferName: string, pane: string): string[] {
+  return ['paste-buffer', '-b', bufferName, '-p', '-d', '-t', pane];
+}
+
+/** Best-effort cleanup when set-buffer succeeded but paste-buffer failed. */
+export function buildDeleteBufferArgs(bufferName: string): string[] {
+  return ['delete-buffer', '-b', bufferName];
+}
+
+/**
+ * Named-buffer paste orchestration (injectable `run` for unit tests). Always uses a
+ * unique buffer name; deletes the buffer if paste fails after a successful set.
+ */
+export async function pasteWithNamedBuffer(
+  run: (args: string[]) => Promise<RunResult>,
+  pane: string,
+  text: string,
+  bufferName: string = newPasteBufferName(),
+): Promise<{ bufferName: string }> {
+  const set = await run(buildSetBufferArgs(bufferName, text));
+  if (set.code !== 0) {
+    throw new Error(`tmux set-buffer failed: ${set.stderr.trim() || set.stdout.trim()}`);
+  }
+  const paste = await run(buildPasteBufferArgs(bufferName, pane));
+  if (paste.code !== 0) {
+    // Best-effort: -d did not run, so remove the named buffer ourselves.
+    await run(buildDeleteBufferArgs(bufferName)).catch(() => {});
+    throw new Error(`tmux paste-buffer failed: ${paste.stderr.trim() || paste.stdout.trim()}`);
+  }
+  return { bufferName };
+}
+
 export class TmuxDriver implements Driver {
   readonly name = 'tmux';
   private static serverPrepared = false;
@@ -144,17 +196,9 @@ export class TmuxDriver implements Driver {
   }
 
   async paste(name: string, text: string): Promise<void> {
-    // set-buffer is server-global (NO -t). Use -- to end option parsing so text
-    // starting with '-' is treated literally.
-    const set = await tmux(['set-buffer', '--', text]);
-    if (set.code !== 0) {
-      throw new Error(`tmux set-buffer failed: ${set.stderr.trim()}`);
-    }
-    // -p = bracketed paste; -t <name> targets this pane.
-    const paste = await tmux(['paste-buffer', '-p', '-t', name]);
-    if (paste.code !== 0) {
-      throw new Error(`tmux paste-buffer failed: ${paste.stderr.trim()}`);
-    }
+    // Named unique buffer + paste-buffer -d so concurrent pastes never share the
+    // server-global unnamed buffer. Cleanup on paste failure is inside pasteWithNamedBuffer.
+    await pasteWithNamedBuffer(tmux, name, text);
   }
 
   async list(prefix = 'orc-'): Promise<PaneInfo[]> {

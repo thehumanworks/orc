@@ -16,6 +16,9 @@ import type { WorkflowDef } from '../src/workflow.ts'; // adjust path, or delete
 
 export default {
   name: 'implement-then-review',
+  // Absent maxConcurrency ⇒ 1 (strict sequential). Use >1 with needs[] for fan-out fleets
+  // (see orc.workflows/fanout-review.ts). CLI: --max-concurrency N
+  maxConcurrency: 1,
   steps: [
     {
       id: 'implement',
@@ -34,6 +37,7 @@ export default {
       id: 'review',
       provider: 'codex', // a DIFFERENT provider reviews — diversity catches more
       alias: 'reviewer',
+      needs: ['implement'], // explicit dep (also inferred from artifact inputs[].fromStep)
       cwd: '${implement.worktree}', // run in the implementer's worktree to see its diff
       prompt:
         'Adversarially review the diff on this branch for correctness and edge cases. ' +

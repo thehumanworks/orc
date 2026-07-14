@@ -37,16 +37,16 @@ orc <command> ...
 
 ```
 orc spawn  --provider <claude|codex|pi> [options]   Launch a new agent session (aliases: agent, new)
-orc send   <id|@alias> [PROMPT | - | @file]         Send a prompt (multi-line safe)
+orc send   <id|@alias> [PROMPT | - | @file] [--idempotency-key K]  Send a prompt (multi-line safe; optional durable idempotency)
 orc read   <id|@alias> [--last|--index N|--full|--raw]  Latest parsed turn by default; --full = full transcript; --raw = full tmux pane
 orc state  <id|@alias>                              Classify state once: starting|running|done|waiting|failed
 orc wait   <id|@alias> [--for done|waiting|failed|settled] [--timeout <sec>]
                                                     Block until the agent settles (default --for settled)
-orc list   [--workspace W | --all | --dead]         List sessions for a workspace (alias: ps)
+orc list   [--workspace W | --all | --dead | --run ID | --lineage]  List sessions (alias: ps)
 orc attach <id|@alias> [--read-only]                Attach to the tmux session
 orc kill   <id|@alias> [--worktree] [--purge]       Kill the session (mark dead; --purge removes record)
 orc prune  [--worktree]                             Drop marked-dead/gone records (+ optionally their worktrees)
-orc workflow run|list|status|logs|attach …          Run/inspect multi-step workflows (see Workflows)
+orc workflow run|list|status|logs|attach|resume|retry|cancel|cleanup …  Multi-step workflows
 orc daemon [--port P] [--bind IP] [--insecure]      Serve the HTTP API over tailscale (see Daemon)
 orc remote add|list|rm <host>                       Manage trusted peer hosts (~/.orc/peers.json)
 orc help
@@ -127,6 +127,8 @@ console.log(await session.readTranscript());   // raw on-disk JSONL
 console.log(await session.readParsed());        // token-efficient parsed turns (Turn[])
 
 await session.send('now do the next thing');    // multi-line safe
+// Optional durable idempotency (SHA-256 of payload only under ~/.orc/messages/):
+// await session.send(prompt, { messageId: 'my-key' });
 
 console.log(await session.state());             // 'starting'|'running'|'done'|'waiting'|'failed'
 const settled = await session.waitFor();        // blocks until done/waiting/failed (debounced)
@@ -146,8 +148,11 @@ await session.kill({ removeWorktree: true });
   conversation from disk; `orc read --raw` is the live-pane escape hatch.
   (An earlier note claimed the file was title-only — that was wrong.)
 - **codex** — no launch-time `--agent` flag and no `--session-id`. A persona/system prompt (or a
-  resolved `agentName` body) is written to `AGENTS.md` in the cwd when that file does **not** already
-  exist; orc **refuses to overwrite** an existing `AGENTS.md` (use another cwd or remove the file).
+  resolved `agentName` body) is written to an **orc-owned** instructions file under
+  `~/.orc/sessions/<sessionId>/instructions.md` (outside the worktree) and passed via
+  `-c experimental_instructions_file=<absolute path>` (append mode, default). The prompt body is
+  **not** put on argv. orc **never creates or modifies** `<cwd>/AGENTS.md`. Replace mode is rejected
+  with a clear error (no file-backed `base_instructions` without stuffing the body into argv).
   Transcript discovered by matching the rollout file's `cwd` with an mtime guard.
 - **pi** — `--append-system-prompt` (or `--system-prompt`); `--session-id` + `--session-dir`.
   Transcript resolved by globbing the session id.
@@ -161,10 +166,11 @@ await session.kill({ removeWorktree: true });
 | pi     | project `.claude/agents/<name>.md` → user `~/.claude/agents/<name>.md` |
 
 For codex/pi the resolved body becomes the injected system prompt (codex TOML uses
-`developer_instructions`; markdown uses the file body; codex → `AGENTS.md`; pi →
-`--append-system-prompt`). If a Codex TOML agent supplies `model`, orc uses it only when
-`--model` was omitted. A bare `agentName` with no resolvable definition throws a clear error
-listing the locations searched. `agentName` and `systemPrompt` are mutually exclusive.
+`developer_instructions`; markdown uses the file body; codex → orc-owned
+`experimental_instructions_file`; pi → `--append-system-prompt`). If a Codex TOML agent
+supplies `model`, orc uses it only when `--model` was omitted. A bare `agentName` with no
+resolvable definition throws a clear error listing the locations searched. `agentName` and
+`systemPrompt` are mutually exclusive.
 
 First-run workspace-trust dialogs (claude/codex) are auto-confirmed with `Enter` at boot — `orc`
 never mutates your CLI config. The boot loop only auto-confirms the trust dialog; any other
@@ -218,18 +224,42 @@ orc state "$ID" --json                       # {"id","state"} — point-in-time,
 
 A **workflow** sequences multiple agent steps reliably — the layer above `agent()` that runs, say,
 `implement → review`. A workflow is a plain TypeScript file you commit (versioned under
-`orc.workflows/`); the core runner executes it and persists a run record to
-`~/.orc/runs/<runId>.json` after every step transition, so a crash leaves an inspectable record. A
-run can be **foreground** or **backgrounded** (`--detach`), is **reconcilable** (a crashed runner is
-detected, not stuck `running`), and is **inspectable** per step (`orc workflow logs`).
+`orc.workflows/`); the core runner executes it and persists a **durable execution tree** to
+`~/.orc/runs/<runId>.json`: a validated plan (with digest) before side effects, per-step attempt
+phases, revision/CAS, and an owner lease (foreground and detached). Crash leave an inspectable
+record that can be **resumed**, **retried**, **cancelled**, or **cleaned up** without silently
+duplicating children. Not exactly-once across process boundaries — durable intent, adoption, and
+compensation. A run can be **foreground** or **backgrounded** (`--detach`), is **reconcilable**
+(expired lease / dead runner → `orphaned`, never downgrading a finalized status), and is
+**inspectable** per step (`orc workflow logs`). Optional `ExecutionPolicy`
+(`maxDepth`, `maxSessions`, `maxConcurrentSessions`, `deadlineMs`, `canDelegate`) is enforced
+fail-closed; token/cost budgets are not measurable and are not enforced.
 
 ```sh
-orc workflow run <file> [--detach] [--json]       # run a WorkflowDef; --detach backgrounds it
+orc workflow run <file> [--detach] [--json] [--max-concurrency N]  # run a WorkflowDef; --detach backgrounds it; N>1 enables DAG concurrency
 orc workflow list [--json]                         # list persisted runs from ~/.orc/runs/ (newest first)
-orc workflow status <runId> [--json]               # print a run record (per-step state)
+orc workflow status <runId> [--json]               # print a run record (per-step state + attempts)
 orc workflow attach <runId> [--read-only]          # print the tmux attach command for a --detach runner
 orc workflow logs <runId> [--step <id>] [--raw]    # per-step transcript of the work each agent did
+orc workflow resume <runId> [file] [--detach] [--json]  # resume incomplete run (skips successes; adopts live sessions)
+orc workflow retry <runId> [--step id] [file] [--detach]  # new attempts for failed/incomplete (preserves history)
+orc workflow cancel <runId> [--cascade]            # idempotent cancel; --cascade kills owned sessions only
+orc workflow cleanup <runId> [--sessions] [--worktrees]  # explicit cleanup of owned resources only
 ```
+
+**Durable execution tree (phase 2).** Each run stores `schemaVersion`/`revision`, a validated plan +
+definition digest **before** step side effects, and full attempt history (phases
+`queued|spawning|dispatched|running|verifying|succeeded|failed|waiting|cancelled|abandoned`).
+Session id is recorded as soon as spawn returns. Owner leases make foreground runs reconcilable;
+stale CAS writers cannot downgrade finalized status. Resume skips successes and adopts live owned
+sessions (never silently duplicates; delivery `unknown` needs explicit retry). Retry creates new
+attempts. Cancel is idempotent; cascade/cleanup only touch sessions proven owned via
+`rootRunId`/`parentRunId`. Optional `ExecutionPolicy` enforces depth/session/concurrency/deadline/
+`canDelegate` (fail closed). Token/cost budgets are not measurable and are **not** enforced.
+Lineage propagates through `ORC_*` env vars; `orc list --run <id>` filters by run tree.
+
+This is durable intent + adoption + compensation — not exactly-once across process/filesystem
+boundaries. Function `done` predicates require the original workflow file on resume until phase 3.
 
 `orc workflow run` streams step events to stdout (`--json` prints only the final `WorkflowRun`) and
 **exits non-zero if the run failed**. There's a runnable example — a 2-step handoff where claude
@@ -308,6 +338,8 @@ A step's `cwd` (and `prompt`/`taskFile`) may interpolate a prior step's result f
 | step field | meaning |
 | --- | --- |
 | `id` | unique within the workflow; the key for `${id.field}` interpolation |
+| `needs` | optional `string[]` of step ids that must **succeed** before this step is ready (DAG). With `maxConcurrency > 1`, independent roots may run concurrently. Artifact `inputs[].fromStep` is auto-inferred into effective needs and persisted on the plan. |
+| `maxConcurrency` (workflow root) | positive integer; **absent ⇒ 1** (strict sequential array-order, backward compatible). CLI `--max-concurrency N` / daemon `maxConcurrency` override for a run; stored in the durable plan/digest. Capped further by `policy.maxConcurrentSessions` when set. |
 | `provider` | `claude` \| `codex` \| `pi` |
 | `alias` | optional active-session alias for the spawned step agent |
 | `taskFile` / `prompt` | exactly one; long specs use `taskFile` (delivered as a file + pointer) |
@@ -364,13 +396,30 @@ The daemon is a thin JSON/HTTP layer over the SDK (`/sessions`, `/sessions/:id/{
 `POST /sessions` without a valid `provider`, invalid `for` on wait, bad workflow `file`) return
 **HTTP 400** with `{"error":"…"}` — the same validation messages the local CLI would print.
 
+`POST /sessions/:id/send` accepts optional `messageId` or `idempotencyKey` (same semantics as CLI
+`--idempotency-key`). Host-local workflow file imports are contained under `$ORC_WORKFLOW_ROOTS`
+(default: the daemon process cwd); paths that escape those roots (including via symlink) are rejected
+before dynamic import. Inline `{ def: … }` workflow definitions are unaffected.
+
 **Security.** The daemon binds to the host's **tailscale interface only** (a `100.x` WireGuard
 address the tailnet won't route from off-net); it **refuses** to bind a public/LAN address without an
-explicit `--insecure`. Every route except `/health` goes through a **fail-closed** trust gate: a
-request is allowed only if `tailscale whois` resolves its source to an **allowlisted** peer
-(`orc remote add`) **or** it presents `x-orc-secret` equal to `$ORC_DAEMON_SECRET` — anything else is
-`403`. (The whois path needs a real two-host tailnet to exercise; the loopback test suite covers the
-secret path, the deny path, and bind-refusal.)
+explicit `--insecure`. Every route except `/health` goes through **fail-closed authentication and
+scoped authorization**:
+
+1. **Allowlisted tailnet identity** (`tailscale whois` + `orc remote add`) → all scopes.
+2. **Bearer token** — `Authorization: Bearer <token>` (client env `ORC_DAEMON_TOKEN`). Configure
+   tokens at daemon startup via `ORC_DAEMON_TOKENS` (JSON object `token → scope[]`). Scopes:
+   `sessions:read`, `sessions:write`, `workflows:read`, `workflows:write`, `admin` (`admin` implies
+   all). Read/list/get/log require `*:read`; spawn/send/wait and run/resume/retry require `*:write`;
+   kill/cancel/cleanup require `admin`. `/whoami` needs any authenticated principal and reports
+   principal/scopes **without** credentials.
+3. **Legacy shared secret** — `x-orc-secret` equal to `$ORC_DAEMON_SECRET` → all scopes (documented
+   fallback).
+
+Missing or invalid credentials when the caller is not a trusted identity → **401**. Authenticated
+principal lacking the route scope → **403**. Token values are never logged or returned. (The whois
+path needs a real two-host tailnet to exercise; the loopback suite covers bearer, legacy secret,
+deny, insufficient scope, `/health`, redaction, and bind-refusal.)
 
 ## Workspaces
 
@@ -402,8 +451,17 @@ All state lives under `~/.orc` (override with `ORC_HOME`):
 
 ```
 ~/.orc/registry.json            # array of SessionRecord, written atomically
+~/.orc/sessions/<sessionId>/instructions.md  # orc-owned Codex persona files (not in worktree)
+~/.orc/messages/<messageId>.json  # durable send delivery records (hash only, no prompt body)
+~/.orc/locks/                   # cross-process locks (send serialization, etc.)
 ~/.orc/transcripts/pi/<sid>/    # per-session pi transcript dirs
+~/.orc/runs/                    # workflow run records + per-run instruction drops
 ```
+
+Optional env:
+
+- `ORC_WORKFLOW_ROOTS` — `path.delimiter`-separated allowlist of roots for **daemon** host-local
+  workflow file imports (default: daemon process cwd only). Inline `def` is unaffected.
 
 ## Development
 

@@ -11,54 +11,69 @@ export function orcHome(): string {
   return path.join(os.homedir(), '.orc');
 }
 
-/** Path to the registry JSON file (array of SessionRecord). */
 export function registryPath(): string {
   return path.join(orcHome(), 'registry.json');
 }
 
-/** Path to the trusted-peer file (`orc remote` list + the daemon's allowlist). */
 export function peersPath(): string {
   return path.join(orcHome(), 'peers.json');
 }
 
-/** Base sessions dir (~/.orc/sessions). */
 export function sessionsDir(): string {
   return path.join(orcHome(), 'sessions');
 }
 
-/** Base transcripts dir (~/.orc/transcripts). */
 export function transcriptsDir(): string {
   return path.join(orcHome(), 'transcripts');
 }
 
-/**
- * Per-session pi transcript dir: ~/.orc/transcripts/pi/<sid>/.
- * pi writes <session-dir>/<ISO>_<sid>.jsonl.
- */
 export function piSessionDir(sessionId: string): string {
   return path.join(transcriptsDir(), 'pi', sessionId);
 }
 
-/** Base workflow-runs dir (~/.orc/runs). One <runId>.json per run + a <runId>/ instr dir. */
+/**
+ * orc-owned per-session state dir under ~/.orc/sessions/<sessionId>/ (outside any
+ * worktree/repo). Used for Codex persona instruction files and similar sidecars.
+ */
+export function sessionStateDir(sessionId: string): string {
+  const id = sessionId.trim();
+  if (id.length === 0 || id.includes('/') || id.includes('\\') || id.includes('\0')) {
+    throw new Error(`invalid sessionId for state dir '${sessionId}'`);
+  }
+  return path.join(sessionsDir(), id);
+}
+
+/**
+ * Absolute path for a Codex persona/system-prompt instructions file owned by orc.
+ * Never written into the agent cwd / worktree (no AGENTS.md mutation).
+ */
+export function sessionInstructionsPath(sessionId: string): string {
+  return path.join(sessionStateDir(sessionId), 'instructions.md');
+}
+
 export function runsDir(): string {
   return path.join(orcHome(), 'runs');
 }
 
+export function messagesDir(): string {
+  return path.join(orcHome(), 'messages');
+}
+
+export function locksDir(): string {
+  return path.join(orcHome(), 'locks');
+}
+
 const RUN_ID_MAX_LEN = 128;
 const RUN_ID_RE = /^[A-Za-z0-9_-]+$/;
+const MESSAGE_ID_MAX_LEN = 128;
+const MESSAGE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const ATTEMPT_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const ARTIFACT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
-/**
- * Reject unsafe workflow run ids (path traversal, empty, overlong). Minted ids and
- * user `--run-id` values must pass before joining under runsDir() or tmux names.
- */
 export function assertValidRunId(runId: string): void {
   const id = runId.trim();
-  if (id.length === 0) {
-    throw new Error(`invalid runId '${runId}' (empty)`);
-  }
-  if (id === '.' || id === '..') {
-    throw new Error(`invalid runId '${runId}'`);
-  }
+  if (id.length === 0) throw new Error(`invalid runId '${runId}' (empty)`);
+  if (id === '.' || id === '..') throw new Error(`invalid runId '${runId}'`);
   if (id.length > RUN_ID_MAX_LEN) {
     throw new Error(`invalid runId '${runId}' (max length ${RUN_ID_MAX_LEN})`);
   }
@@ -70,19 +85,116 @@ export function assertValidRunId(runId: string): void {
   }
 }
 
-/** Path to a single run record: ~/.orc/runs/<runId>.json. */
+export function assertValidMessageId(messageId: string): void {
+  const id = messageId.trim();
+  if (id.length === 0) throw new Error(`invalid messageId '${messageId}' (empty)`);
+  if (id === '.' || id === '..') throw new Error(`invalid messageId '${messageId}'`);
+  if (id.length > MESSAGE_ID_MAX_LEN) {
+    throw new Error(`invalid messageId '${messageId}' (max length ${MESSAGE_ID_MAX_LEN})`);
+  }
+  if (id.includes('/') || id.includes('\\') || id.includes('\0')) {
+    throw new Error(`invalid messageId '${messageId}'`);
+  }
+  if (!MESSAGE_ID_RE.test(id)) {
+    throw new Error(
+      `invalid messageId '${messageId}' (use letters/digits, then letters/digits/._-)`,
+    );
+  }
+}
+
+export function assertValidAttemptId(attemptId: string): string {
+  const id = attemptId.trim();
+  if (!ATTEMPT_ID_RE.test(id)) {
+    throw new Error(`invalid attemptId '${attemptId}'`);
+  }
+  return id;
+}
+
+export function assertValidArtifactName(name: string): string {
+  const n = name.trim();
+  if (!ARTIFACT_NAME_RE.test(n)) {
+    throw new Error(
+      `invalid artifact name '${name}' (1-128 chars: letter/digit then letters/digits/._-)`,
+    );
+  }
+  return n;
+}
+
 export function runPath(runId: string): string {
   assertValidRunId(runId);
   return path.join(runsDir(), `${runId}.json`);
 }
 
-/**
- * Per-run instruction-drop dir: ~/.orc/runs/<runId>/. Step specs (taskFile copies,
- * large prompts) are written here — OUTSIDE any worktree/repo — so the agent reads them
- * by absolute path and can never accidentally commit them (the send() large-paste bug
- * workaround). A directory (not a .json), so it never collides with run records.
- */
+export function messagePath(messageId: string): string {
+  assertValidMessageId(messageId);
+  return path.join(messagesDir(), `${messageId}.json`);
+}
+
+/** Per-run dir (~/.orc/runs/<runId>/): instructions, artifacts, results. */
 export function runInstructionsDir(runId: string): string {
   assertValidRunId(runId);
   return path.join(runsDir(), runId);
+}
+
+export function runDir(runId: string): string {
+  return runInstructionsDir(runId);
+}
+
+/** Per-attempt working dir: ~/.orc/runs/<runId>/attempts/<attemptId>/. */
+export function runAttemptDir(runId: string, attemptId: string): string {
+  assertValidRunId(runId);
+  return path.join(runDir(runId), 'attempts', assertValidAttemptId(attemptId));
+}
+
+/** ORC_RESULT_PATH for an attempt: .../attempts/<attemptId>/result.json */
+export function runResultPath(runId: string, attemptId: string): string {
+  return path.join(runAttemptDir(runId, attemptId), 'result.json');
+}
+
+/** Alternate envelope path under results/ (stepId/attemptId layout). */
+export function runResultEnvelopePath(
+  runId: string,
+  stepIdOrAttemptId: string,
+  attemptId?: string,
+): string {
+  assertValidRunId(runId);
+  if (attemptId !== undefined) {
+    return path.join(runDir(runId), 'results', stepIdOrAttemptId, `${attemptId}.json`);
+  }
+  return runResultPath(runId, stepIdOrAttemptId);
+}
+
+export function runArtifactsDir(runId: string): string {
+  assertValidRunId(runId);
+  return path.join(runDir(runId), 'artifacts');
+}
+
+export function runArtifactBlobsDir(runId: string): string {
+  return path.join(runArtifactsDir(runId), 'blobs');
+}
+
+export function runArtifactManifestsDir(runId: string): string {
+  return path.join(runArtifactsDir(runId), 'manifests');
+}
+
+export function runArtifactBlobPath(runId: string, digest: string): string {
+  const d = digest.trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(d)) {
+    throw new Error(`invalid artifact digest '${digest}' (expected 64-char hex sha256)`);
+  }
+  return path.join(runArtifactBlobsDir(runId), d);
+}
+
+export function runArtifactManifestPath(runId: string, logicalName: string): string {
+  return path.join(runArtifactManifestsDir(runId), `${assertValidArtifactName(logicalName)}.json`);
+}
+
+export function runStepInputsDir(runId: string, stepId: string): string {
+  assertValidRunId(runId);
+  return path.join(runDir(runId), 'inputs', stepId);
+}
+
+/** Shared materialization root: ~/.orc/runs/<runId>/artifacts/inputs/ */
+export function runArtifactInputsDir(runId: string): string {
+  return path.join(runArtifactsDir(runId), 'inputs');
 }

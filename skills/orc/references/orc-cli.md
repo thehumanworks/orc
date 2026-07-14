@@ -37,7 +37,7 @@ state detection is reliable.
 ## Named agents (specialized, reusable subagents)
 `orc spawn --agent <name>` resolves a definition and injects its body as the system prompt:
 - **claude**: native `--agent` — `./.claude/agents/<name>.md` then `~/.claude/agents/<name>.md`
-- **codex**: `./.codex/agents/*.toml` by parsed `name` → `$CODEX_HOME/agents/*.toml` (default `~/.codex/agents`) → `./.codex/prompts/<name>.md` → `$CODEX_HOME/prompts/<name>.md` → the claude locations (injected via `AGENTS.md`)
+- **codex**: `./.codex/agents/*.toml` by parsed `name` → `$CODEX_HOME/agents/*.toml` (default `~/.codex/agents`) → `./.codex/prompts/<name>.md` → `$CODEX_HOME/prompts/<name>.md` → the claude locations (injected via orc-owned `experimental_instructions_file`, not `AGENTS.md`)
 - **pi**: the claude locations (injected via `--append-system-prompt`)
 
 Edit these `.toml` or `.md` files to iterate on a role over time.
@@ -51,11 +51,23 @@ sessions free the alias for reuse. Dead transcript records remain addressable by
 ## Workflows
 | command | purpose |
 | --- | --- |
-| `orc workflow run <file.ts> [--detach] [--json]` | run a TS module default-exporting a `WorkflowDef`. `--detach` runs it in a reattachable `orc-wf-<id>` tmux session and returns immediately. |
+| `orc workflow run <file.ts> [--detach] [--json] [--max-concurrency N]` | run a TS module default-exporting a `WorkflowDef`. `--detach` runs it in a reattachable `orc-wf-<id>` tmux session and returns immediately. `--max-concurrency N` (positive int; default 1) allows dependency-free steps to run concurrently when the workflow uses `needs[]` / artifact `fromStep` edges. Invalid N → clear CLI error. |
 | `orc workflow list [--json]` | list persisted runs (`~/.orc/runs/`). |
-| `orc workflow status <runId> [--json]` | per-step state; a dead detached runner reconciles to `orphaned`. |
+| `orc workflow status <runId> [--json]` | per-step state + attempts; dead runner/expired lease → `orphaned`. |
 | `orc workflow logs <runId> [--step <id>] [--raw] [--json]` | each step's token-efficient transcript. |
 | `orc workflow attach <runId> [--read-only]` | print the tmux attach command for a `--detach` runner. |
+| `orc workflow resume <runId> [file] [--json]` | resume incomplete run; skips successes; adopts live owned sessions; requires original file when plan used `done` predicates. |
+| `orc workflow retry <runId> [--step id] [file] [--json]` | new attempts for failed/incomplete (or `--step` + subsequent); preserves history. |
+| `orc workflow cancel <runId> [--cascade]` | idempotent cancel; `--cascade` kills only sessions proven owned by this run/root. |
+| `orc workflow cleanup <runId> [--sessions] [--worktrees]` | explicit cleanup of owned sessions/worktrees only. |
+| `orc list --run <id> [--lineage]` | filter sessions by run/root lineage. |
+
+**Durable execution (phase 2):** runs persist a validated plan + per-step attempt phases
+(`queued|spawning|dispatched|running|verifying|succeeded|failed|waiting|cancelled|abandoned`)
+with revision/CAS and owner leases. Not exactly-once across process boundaries — durable intent,
+adoption, and compensation. Token/cost budgets are not measurable and are not enforced.
+`ExecutionPolicy` supports `maxDepth`, `maxSessions`, `maxConcurrentSessions`, `deadlineMs`,
+`canDelegate`.
 
 See `assets/workflow-template.ts` for the `WorkflowDef` shape. A `WorkflowDef` is a plain object
 (`{ name, steps: [...] }`) default-exported; the runner validates it (no import required).
@@ -68,8 +80,11 @@ See `assets/workflow-template.ts` for the `WorkflowDef` shape. A `WorkflowDef` i
 | `orc --host <host> <command>` | run a session/workflow command (`list`/`spawn`/`send`/`read`/`wait`/`state`/`kill`/`attach`/`workflow`) against a remote daemon. Host-local-only actions error. |
 | `orc list --all-hosts` | fleet view: aggregate local + every trusted peer. |
 
-Trust is **fail-closed**: a request is allowed only if `tailscale whois` resolves the caller to an
-allowlisted peer, or it presents `x-orc-secret == $ORC_DAEMON_SECRET`; otherwise `403`.
+Auth is **fail-closed** with scopes: allowlisted tailnet identity (all scopes), or
+`Authorization: Bearer` from `ORC_DAEMON_TOKENS` (JSON token→scopes; client `ORC_DAEMON_TOKEN`), or
+legacy `x-orc-secret == $ORC_DAEMON_SECRET` (all scopes). Missing/invalid credentials → `401`;
+authenticated but missing route scope → `403`. Scopes: `sessions:read|write`, `workflows:read|write`,
+`admin` (implies all).
 
 ## SDK (TypeScript, for scripted orchestration)
 ```ts

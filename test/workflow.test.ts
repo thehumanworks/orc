@@ -5,6 +5,7 @@ import path from 'node:path';
 import {
   defineWorkflow,
   validateWorkflowDef,
+  assertValidStepId,
   interpolate,
   evaluateStep,
   stepOutcomeFromWait,
@@ -13,6 +14,10 @@ import {
   runnerTmuxName,
   reconcileRunStatus,
   assembleStepLogs,
+  resolveContainedWorkflowFile,
+  workflowImportRoots,
+  WORKFLOW_ROOTS_ENV,
+  isPathInsideRoot,
 } from '../src/workflow.ts';
 import type {
   WorkflowDef,
@@ -112,6 +117,79 @@ describe('validateWorkflowDef / defineWorkflow', () => {
       }),
     ).toThrow(/invalid alias/);
   });
+  test('rejects unsafe step ids (traversal / dots / empty grammar)', () => {
+    expect(() =>
+      validateWorkflowDef({ name: 'x', steps: [step({ id: '../escape' })] }),
+    ).toThrow(/invalid step id/);
+    expect(() =>
+      validateWorkflowDef({ name: 'x', steps: [step({ id: 'a/b' })] }),
+    ).toThrow(/invalid step id/);
+    expect(() =>
+      validateWorkflowDef({ name: 'x', steps: [step({ id: 'has.dot' })] }),
+    ).toThrow(/invalid step id/);
+    expect(() =>
+      validateWorkflowDef({ name: 'x', steps: [step({ id: '-leading' })] }),
+    ).toThrow(/invalid step id/);
+    expect(() => assertValidStepId('ok-step_1')).not.toThrow();
+  });
+});
+
+describe('workflow import path containment', () => {
+  test('workflowImportRoots defaults to cwd only', () => {
+    const roots = workflowImportRoots({} as NodeJS.ProcessEnv, '/tmp/daemon-cwd');
+    expect(roots).toEqual([path.resolve('/tmp/daemon-cwd')]);
+  });
+
+  test('ORC_WORKFLOW_ROOTS extends the allowlist', () => {
+    const env = {
+      [WORKFLOW_ROOTS_ENV]: ['/allowed/a', '/allowed/b'].join(path.delimiter),
+    } as NodeJS.ProcessEnv;
+    expect(workflowImportRoots(env, '/tmp/cwd')).toEqual([
+      path.resolve('/allowed/a'),
+      path.resolve('/allowed/b'),
+    ]);
+  });
+
+  test('isPathInsideRoot rejects siblings and parents', () => {
+    expect(isPathInsideRoot('/root/a/b', '/root/a')).toBe(true);
+    expect(isPathInsideRoot('/root/a', '/root/a')).toBe(true);
+    expect(isPathInsideRoot('/root/other', '/root/a')).toBe(false);
+    expect(isPathInsideRoot('/root', '/root/a')).toBe(false);
+  });
+
+  test('rejects traversal and absolute paths outside roots before import', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'orc-wfroot-'));
+    tmpHomes.push(root);
+    const inside = path.join(root, 'wf.ts');
+    await Bun.write(inside, 'export default { name: "x", steps: [] };\n');
+
+    await expect(
+      resolveContainedWorkflowFile(inside, { roots: [root] }),
+    ).resolves.toBe(await fs.realpath(inside));
+
+    await expect(
+      resolveContainedWorkflowFile(path.join(root, '..', 'outside.ts'), { roots: [root] }),
+    ).rejects.toThrow(/outside allowed roots/);
+
+    await expect(
+      resolveContainedWorkflowFile('/etc/passwd', { roots: [root] }),
+    ).rejects.toThrow(/outside allowed roots/);
+  });
+
+  test('rejects symlink escape before module import', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'orc-wfsym-'));
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), 'orc-wfout-'));
+    tmpHomes.push(root, outside);
+    const target = path.join(outside, 'evil.ts');
+    await Bun.write(target, 'export default { name: "evil", steps: [] };\n');
+    const link = path.join(root, 'linked.ts');
+    await fs.symlink(target, link);
+
+    // realpath(link) → outside root; must reject without importing.
+    await expect(resolveContainedWorkflowFile(link, { roots: [root] })).rejects.toThrow(
+      /outside allowed roots/,
+    );
+  });
 });
 
 describe('interpolate ${stepId.field}', () => {
@@ -153,47 +231,75 @@ describe('evaluateStep — yield is NOT success', () => {
   const base = { state: 'done' as const, commitsAhead: 0, capture: '' };
 
   test('explicit done predicate decides ok (unverified false)', () => {
-    expect(evaluateStep({ done: () => true }, base)).toEqual({ ok: true, unverified: false });
-    expect(evaluateStep({ done: () => false }, base)).toEqual({ ok: false, unverified: false });
+    expect(evaluateStep({ done: () => true }, base)).toMatchObject({ ok: true, unverified: false });
+    expect(evaluateStep({ done: () => false }, base)).toMatchObject({ ok: false, unverified: false });
   });
   test('worktree default: needs a commit (commitsAhead>=1)', () => {
-    expect(evaluateStep({ worktree: true }, { ...base, commitsAhead: 0 })).toEqual({
-      ok: false,
-      unverified: false,
-    });
-    expect(evaluateStep({ worktree: true }, { ...base, commitsAhead: 1 })).toEqual({
-      ok: true,
-      unverified: false,
-    });
+    expect(evaluateStep({ worktree: true }, { ...base, commitsAhead: 0 })).toMatchObject({ ok: false, unverified: false });
+    expect(evaluateStep({ worktree: true }, { ...base, commitsAhead: 1 })).toMatchObject({ ok: true, unverified: false });
   });
   test('worktree that only yielded (no commit) is ok:false — the 3b reliability case', () => {
     expect(evaluateStep({ worktree: true }, { state: 'done', commitsAhead: 0, capture: '' }).ok).toBe(
       false,
     );
   });
-  test('non-worktree, no predicate: ok from yield but flagged unverified', () => {
-    expect(evaluateStep({}, base)).toEqual({ ok: true, unverified: true });
+  test('non-worktree, no predicate: fail-closed unverified (ok:false)', () => {
+    expect(evaluateStep({}, base)).toMatchObject({
+      ok: false,
+      unverified: true,
+      outcome: 'unverified',
+    });
+  });
+  test('non-worktree allowUnverified: ok:true still flagged unverified', () => {
+    expect(evaluateStep({ allowUnverified: true }, base)).toMatchObject({
+      ok: true,
+      unverified: true,
+      outcome: 'unverified',
+    });
   });
   test('non-worktree, no predicate, non-done state: honest failure (not unverified)', () => {
-    expect(evaluateStep({}, { ...base, state: 'failed' })).toEqual({ ok: false, unverified: false });
+    expect(evaluateStep({}, { ...base, state: 'failed' })).toMatchObject({
+      ok: false,
+      unverified: false,
+      outcome: 'failed',
+    });
   });
 });
 
 describe('stepOutcomeFromWait / wait timeout', () => {
   const ctx = { commitsAhead: 0, capture: '' };
 
-  test('timeout with last state done yields ok:false (no unverified success)', () => {
-    expect(stepOutcomeFromWait({}, { state: 'done', settled: false }, ctx)).toEqual({
+  test('timeout with last state done yields ok:false timed_out', () => {
+    expect(stepOutcomeFromWait({}, { state: 'done', settled: false }, ctx)).toMatchObject({
       state: 'done',
       ok: false,
+      outcome: 'timed_out',
     });
   });
 
-  test('settled done without predicate still uses evaluateStep (unverified when ok)', () => {
-    expect(stepOutcomeFromWait({}, { state: 'done', settled: true }, ctx)).toEqual({
+  test('settled done without predicate is fail-closed unverified', () => {
+    expect(stepOutcomeFromWait({}, { state: 'done', settled: true }, ctx)).toMatchObject({
+      state: 'done',
+      ok: false,
+      unverified: true,
+      outcome: 'unverified',
+    });
+  });
+});
+
+describe('stepOutcomeFromWait / allowUnverified', () => {
+  test('allowUnverified settled done is ok with unverified', () => {
+    expect(
+      stepOutcomeFromWait(
+        { allowUnverified: true },
+        { state: 'done', settled: true },
+        { commitsAhead: 0, capture: '' },
+      ),
+    ).toMatchObject({
       state: 'done',
       ok: true,
       unverified: true,
+      outcome: 'unverified',
     });
   });
 });
@@ -206,7 +312,15 @@ describe('deliverInstructions — large input becomes a SHORT pointer + a file',
   /** Stub session capturing what would be sent to the pane (no live agent). */
   function stubSession(): { session: Pick<Session, 'send'>; sent: string[] } {
     const sent: string[] = [];
-    return { session: { send: async (p: string) => void sent.push(p) }, sent };
+    return {
+      session: {
+        send: async (p: string) => {
+          sent.push(p);
+          return { phase: 'acknowledged' as const, attempts: 1 };
+        },
+      },
+      sent,
+    };
   }
 
   test('small inline prompt is sent verbatim (no file dropped)', async () => {
@@ -290,10 +404,12 @@ describe('runWorkflow with a fake executor', () => {
     const run = await runWorkflow(def, {
       execStep: fakeExec({ b: { ok: false } }, calls),
     });
-    // c never runs.
+    // c never launches (may be durably skipped).
     expect(calls.map((c) => c.id)).toEqual(['a', 'b']);
     expect(run.status).toBe('failed');
-    expect(run.steps.map((s) => s.id)).toEqual(['a', 'b']);
+    expect(run.steps.filter((s) => s.ok).map((s) => s.id)).toEqual(['a']);
+    const cPhase = run.attempts?.filter((a) => a.stepId === 'c').pop()?.phase;
+    expect(cPhase === 'skipped' || cPhase === undefined).toBe(true);
   });
 
   test('continueOnFail keeps going but final status is failed (not all ok)', async () => {

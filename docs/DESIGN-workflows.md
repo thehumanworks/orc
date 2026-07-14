@@ -1,7 +1,19 @@
 # Design: orc workflows (goal-feature 2)
 
-Status: DRAFT — depends on the `wait`/state primitive (goal-feature 1, in progress). API specifics
-marked _(pending F1)_ will be pinned once `Session.waitFor()` / `orc wait` land.
+Status: **Phase 1 + Phase 2 implemented** in the current codebase. Phase 3 (portable predicates /
+declarative plan without function `done` callbacks) is future work.
+
+Phase 2 durable execution tree (summary of implemented semantics):
+- `schemaVersion` + monotonic `revision` with run-scoped lock and CAS writes (`src/runs.ts`)
+- Validated JSON-safe plan + definition digest persisted **before** external side effects
+- Per-step attempt phases: queued|spawning|dispatched|running|verifying|succeeded|failed|waiting|cancelled|abandoned
+- Owner leases for foreground and detached runners; reconcile → orphaned on expired owner
+- Resume / retry / cancel / cleanup CLI + daemon routes; adoption refuses silent duplicates
+- Lineage via `ORC_*` env; `ExecutionPolicy` maxDepth/maxSessions/maxConcurrentSessions/deadlineMs/canDelegate
+- Not exactly-once across process/filesystem boundaries; token/cost budgets not enforced
+- Function `done` predicates require the original workflow file on resume until phase 3
+
+---
 
 ## Requirement (from the user's goal)
 Workflows must be **easy to define**, **versioned**, **reliable**, and **backgroundable**. They are
@@ -67,18 +79,59 @@ tracked background process whose live state is queryable (`orc workflow status <
 bridge to goal-feature 3 (the daemon): a detached workflow run is exactly what a remote orc server
 would host and expose.
 
-### CLI surface (proposed)
+### CLI surface (implemented)
 ```
-orc workflow list                       # versioned workflows discovered in orc.workflows/
-orc workflow run <name> [--detach]      # run; --json streams step events
-orc workflow status <run-id>            # state of each step
-orc workflow logs <run-id> [--step s]   # per-step transcript (token-efficient `read`, reused)
+orc workflow run <file> [--detach] [--json]
+orc workflow list|status|attach|logs …
+orc workflow resume <runId> [file] [--detach]
+orc workflow retry <runId> [--step id] [file] [--detach]
+orc workflow cancel <runId> [--cascade]
+orc workflow cleanup <runId> [--sessions] [--worktrees]
 ```
 
-## Open questions (resolve after F1)
-1. Exact `waitFor`/`state` API shape to bind steps to _(pending F1)_.
-2. Worktree lifecycle across steps: does a multi-step workflow share ONE worktree/branch (review the
-   same diff) or one per step? Likely: a workflow owns a branch; steps share its worktree by default,
-   opt into their own.
-3. Step-to-step handoff of large context — reuse the file-drop + pointer pattern.
-4. Do we need declarative YAML in v1, or is scripted enough? (Recommendation: scripted only for v1.)
+Daemon mirrors control routes: `POST /workflows/runs/:id/{resume,retry,cancel,cleanup}`.
+
+## Open questions (later phases)
+1. ~~Replace function `done` predicates with portable JSON-safe predicates (phase 3).~~ (portable `verify` shipped)
+2. Worktree lifecycle across steps: shared branch vs one per step (currently per-step `worktree?`).
+3. ~~DAG step dependencies~~ — **implemented (phase 5)**: see below.
+4. Declarative YAML front-end (optional; scripted TS remains primary).
+
+## DAG / fleet scheduler (phase 5)
+
+### Contract
+- Steps may declare `needs?: string[]` (JSON-portable hard dependencies).
+- Workflow / run options accept positive integer `maxConcurrency` (CLI: `--max-concurrency N`,
+  daemon body: `maxConcurrency`). **Absent ⇒ 1** — preserves strict array-order sequential
+  execution and existing start/done event behavior.
+- With `maxConcurrency > 1`, dependency-free steps may run concurrently; readiness is derived
+  from `needs` (+ inferred artifact edges). Ready ties break by **definition order**.
+- **Artifact dependency rule:** each `inputs[].fromStep` is **unioned into the effective
+  dependency set** (explicit `needs` optional). Missing / self `fromStep` fail validation.
+  Inferred edges are persisted on the durable plan `needs` and participate in the plan digest.
+- Normalized `maxConcurrency` + effective `needs` are part of the plan/digest so resume/retry
+  cannot silently change scheduling semantics.
+
+### Scheduler
+Pure module `src/workflow-scheduler.ts` derives ready / blocked / running / terminal from
+attempt history. The runner uses a **bounded** launch loop (no unbounded `Promise.all`):
+at most `min(maxConcurrency, policy.maxConcurrentSessions ?? ∞)` in flight; `queued`
+attempts persist before launch; phase transitions persist as today.
+
+### Failure / cancel / resume / retry
+- A step whose required dependency terminally failed/cancelled/timed out/unverified becomes
+  durably **`blocked`** (never launches).
+- **`continueOnFail`:** when a step fails *without* it, stop **new** launches (including
+  independent branches), wait for in-flight, mark remaining unfinished as **`skipped`**.
+  When `continueOnFail` is true, independent branches continue; dependents stay blocked.
+  At `maxConcurrency === 1` this preserves prior sequential stop/continue behavior.
+- **Cancel** stops new launches immediately; in-flight owned sessions settle under existing
+  cascade semantics (`cancel --cascade`).
+- **Resume** skips verified successes; schedules only incomplete / unblocked nodes.
+- **Retry** appends new attempt history for the selected failed/blocked node and its affected
+  descendants (graph descendants; at concurrency 1 also the definition-order tail) without
+  deleting prior attempts.
+
+### Observability
+List/get expose `maxConcurrency` + per-step scheduling state; plan prompts are not returned
+on list/get projections.

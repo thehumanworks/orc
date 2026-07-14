@@ -7,18 +7,35 @@ import type { ProviderAdapter } from './providers/provider.ts';
 import { getDriver } from './drivers/driver.ts';
 import { getProvider } from './providers/provider.ts';
 import { upsertRecord, removeRecord } from './registry.ts';
+import { removeSessionInstructions } from './session-files.ts';
 import { removeWorktree } from './worktree.ts';
 import { parseTranscript } from './transcript.ts';
 import type { Turn } from './transcript.ts';
 import { classifyState, reduceWait, INITIAL_TRACKING } from './state.ts';
 import type { WaitTracking } from './state.ts';
 import { pasteProbe } from './paste.ts';
+import { withLock } from './lock.ts';
+import {
+  evaluateDeliveryReplay,
+  hashPayload,
+  persistDelivery,
+  readDelivery,
+  toSendResult,
+} from './messages.ts';
+import type { DeliveryRecord, SendOptions, SendResult } from './messages.ts';
+import { assertValidMessageId } from './paths.ts';
 import type { AgentState, Provider, SessionRecord, SessionStatus } from './types.ts';
+import { releaseSessionPolicy } from './lineage.ts';
+
+export type { SendOptions, SendResult } from './messages.ts';
 
 const READY_TIMEOUT_MS = 30_000;
 const POLL_INTERVAL_MS = 250;
 const PASTE_SETTLE_MS = 200;
 const SEND_MAX_ATTEMPTS = 3;
+/** Bounded ack wait — provider-neutral evidence only; never spin forever. */
+const ACK_TIMEOUT_MS = 2_000;
+const ACK_POLL_MS = 100;
 
 const DEFAULT_WAIT_UNTIL: AgentState[] = ['done', 'waiting', 'failed'];
 const DEFAULT_WAIT_TIMEOUT_MS = 600_000;
@@ -193,50 +210,187 @@ export class Session {
    * chip — NOT the first line (which scrolls off the top of a multi-KB paste). Before
    * any re-paste we CLEAR the composer (`adapter.clearInputKeys`) so a retry can never
    * stack the prompt 2–3× (the old compounding bug). See `src/paste.ts`.
+   *
+   * CONCURRENCY: the full transaction (ready → paste attempts → Enter → ack) is held
+   * under a cross-process lock keyed by session id so concurrent senders cannot interleave.
+   *
+   * IDEMPOTENCY: optional `options.messageId` records a durable delivery under ORC_HOME
+   * (payload SHA-256 only — never the prompt body). Same key + payload is not re-submitted
+   * once phase is submitted|acknowledged|unknown; a different payload for the same key fails.
+   * Callers that ignore the return value remain valid (source-compatible).
    */
-  async send(prompt: string): Promise<void> {
-    if (!(await this.isReady())) {
-      const ok = await this.waitForReady();
-      if (!ok) {
-        throw new Error(`session ${this.id} is not ready to receive input`);
-      }
-    }
+  async send(prompt: string, options?: SendOptions): Promise<SendResult> {
+    const messageId = options?.messageId;
+    if (messageId !== undefined) assertValidMessageId(messageId);
+
+    return withLock(`send-${this.sessionId}`, async () => {
+      return this.sendLocked(prompt, messageId);
+    });
+  }
+
+  /** Inner send body — must run under the session send lock. */
+  private async sendLocked(prompt: string, messageId: string | undefined): Promise<SendResult> {
     // Strip a single trailing newline to avoid an accidental extra submit.
     const text = prompt.replace(/\n$/, '');
-    // pasteProbe===null marks an empty/whitespace prompt: nothing to verify, treat the
-    // paste as landed (preserves the existing empty-prompt behavior).
-    const isEmpty = pasteProbe(text) === null;
+    const payloadHash = hashPayload(text);
+    let previous: DeliveryRecord | null = null;
+    /** Set true only after Enter is sent — post-Enter errors must not mark `failed` (retryable). */
+    let entered = false;
 
-    let landed = false;
-    for (let attempt = 0; attempt < SEND_MAX_ATTEMPTS; attempt++) {
-      await this.driver.paste(this.tmuxName, text);
-      await sleep(PASTE_SETTLE_MS);
-      if (isEmpty) {
-        landed = true;
-        break;
+    if (messageId !== undefined) {
+      previous = await readDelivery(messageId);
+      if (previous) {
+        const replay = evaluateDeliveryReplay(previous, this.sessionId, payloadHash);
+        if (replay) return replay;
       }
-      const pane = await this.driver.capture(this.tmuxName);
-      if (this.adapter.pasteLanded(pane, text)) {
-        landed = true;
-        break;
-      }
-      // Not confirmed. Clear the composer BEFORE re-pasting so a failed attempt can't
-      // stack the prompt; then give the TUI a moment and retry. (When the paste was
-      // simply dropped, the box is already empty and the clear is a harmless no-op.)
-      if (attempt < SEND_MAX_ATTEMPTS - 1) {
-        for (const key of this.adapter.clearInputKeys?.() ?? []) {
-          await this.driver.sendKeys(this.tmuxName, key);
+      previous = await persistDelivery({
+        messageId,
+        sessionId: this.sessionId,
+        payloadHash,
+        phase: 'prepared',
+        previous,
+      });
+    }
+
+    try {
+      if (!(await this.isReady())) {
+        const ok = await this.waitForReady();
+        if (!ok) {
+          throw new Error(`session ${this.id} is not ready to receive input`);
         }
-        await sleep(POLL_INTERVAL_MS);
       }
-    }
 
-    if (!landed) {
-      throw new Error(
-        `session ${this.id}: prompt did not appear in the input box after ${SEND_MAX_ATTEMPTS} attempts`,
-      );
+      // pasteProbe===null marks an empty/whitespace prompt: nothing to verify, treat the
+      // paste as landed (preserves the existing empty-prompt behavior).
+      const isEmpty = pasteProbe(text) === null;
+
+      let landed = false;
+      let pasteAttempts = 0;
+      for (let attempt = 0; attempt < SEND_MAX_ATTEMPTS; attempt++) {
+        pasteAttempts = attempt + 1;
+        await this.driver.paste(this.tmuxName, text);
+        await sleep(PASTE_SETTLE_MS);
+        if (isEmpty) {
+          landed = true;
+          break;
+        }
+        const pane = await this.driver.capture(this.tmuxName);
+        if (this.adapter.pasteLanded(pane, text)) {
+          landed = true;
+          break;
+        }
+        // Not confirmed. Clear the composer BEFORE re-pasting so a failed attempt can't
+        // stack the prompt; then give the TUI a moment and retry. (When the paste was
+        // simply dropped, the box is already empty and the clear is a harmless no-op.)
+        if (attempt < SEND_MAX_ATTEMPTS - 1) {
+          for (const key of this.adapter.clearInputKeys?.() ?? []) {
+            await this.driver.sendKeys(this.tmuxName, key);
+          }
+          await sleep(POLL_INTERVAL_MS);
+        }
+      }
+
+      if (!landed) {
+        throw new Error(
+          `session ${this.id}: prompt did not appear in the input box after ${SEND_MAX_ATTEMPTS} attempts`,
+        );
+      }
+      await this.driver.sendKeys(this.tmuxName, 'Enter');
+      entered = true;
+
+      if (messageId !== undefined) {
+        previous = await persistDelivery({
+          messageId,
+          sessionId: this.sessionId,
+          payloadHash,
+          phase: 'submitted',
+          bumpAttempts: false,
+          previous,
+        });
+      }
+
+      const ack = await this.tryAcknowledge(text, isEmpty);
+      if (messageId !== undefined) {
+        previous = await persistDelivery({
+          messageId,
+          sessionId: this.sessionId,
+          payloadHash,
+          phase: ack,
+          bumpAttempts: false,
+          previous,
+        });
+        return toSendResult(previous);
+      }
+      return {
+        phase: ack,
+        attempts: pasteAttempts,
+        payloadHash,
+      };
+    } catch (e) {
+      if (messageId !== undefined) {
+        // Never allow auto re-submit after Enter reached the wire. Prefer `unknown` over
+        // `failed` when Enter already ran (even if durable `submitted` write failed).
+        // Never downgrade submitted|acknowledged|unknown.
+        const current = await readDelivery(messageId).catch(() => null);
+        const phase = current?.phase;
+        if (phase === 'submitted' || phase === 'acknowledged' || phase === 'unknown') {
+          // leave sticky post-Enter phases alone
+        } else if (entered) {
+          await persistDelivery({
+            messageId,
+            sessionId: this.sessionId,
+            payloadHash,
+            phase: 'unknown',
+            bumpAttempts: false,
+            previous: current ?? previous,
+          }).catch(() => {});
+        } else if (!phase || phase === 'prepared' || phase === 'failed') {
+          await persistDelivery({
+            messageId,
+            sessionId: this.sessionId,
+            payloadHash,
+            phase: 'failed',
+            bumpAttempts: false,
+            previous: current ?? previous,
+          }).catch(() => {});
+        }
+      }
+      throw e;
     }
-    await this.driver.sendKeys(this.tmuxName, 'Enter');
+  }
+
+  /**
+   * Bounded acknowledgement using provider-neutral evidence already available via
+   * state()/capture/pasteLanded. Proves submit was observed — never invents success.
+   * Returns `unknown` when evidence cannot be established within ACK_TIMEOUT_MS.
+   */
+  private async tryAcknowledge(text: string, isEmpty: boolean): Promise<'acknowledged' | 'unknown'> {
+    // Empty submit has nothing observable in the composer; treat Enter as best-effort ack.
+    if (isEmpty) return 'acknowledged';
+
+    const deadline = Date.now() + ACK_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      let state: AgentState;
+      try {
+        state = await this.state();
+      } catch {
+        state = 'failed';
+      }
+      // Turn in progress or a modal — clear evidence the submit was consumed.
+      if (state === 'running' || state === 'waiting') return 'acknowledged';
+
+      try {
+        const pane = await this.driver.capture(this.tmuxName);
+        // Composer no longer holds the paste we verified before Enter → accepted/cleared.
+        if (!this.adapter.pasteLanded(pane, text)) return 'acknowledged';
+      } catch {
+        // Pane capture failure is not proof of delivery.
+      }
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+      await sleep(Math.min(ACK_POLL_MS, remaining));
+    }
+    return 'unknown';
   }
 
   async capture(opts?: { scrollback?: boolean }): Promise<string> {
@@ -308,6 +462,9 @@ export class Session {
     }
 
     await this.driver.kill(this.tmuxName);
+    // The provider process is gone, so its external Codex instructions are no longer
+    // needed. Remove them for ordinary kills as well as purge/workflow cleanup.
+    await removeSessionInstructions(this.record).catch(() => {});
     if (opts?.removeWorktree && this.record.worktreePath) {
       await removeWorktree(this.record.cwd, this.record.worktreePath, {
         branch: this.record.branch,
@@ -316,12 +473,14 @@ export class Session {
 
     if (opts?.purge) {
       await removeRecord(this.id);
+      await releaseSessionPolicy(this.record.rootRunId).catch(() => {});
       return;
     }
     // Mark dead but keep the record (transcript reads stay resolvable).
     this.record.status = 'dead';
     this.record.killedAt = new Date().toISOString();
     await upsertRecord(this.record);
+    await releaseSessionPolicy(this.record.rootRunId).catch(() => {});
   }
 
   toJSON(): SessionRecord {

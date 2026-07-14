@@ -1,5 +1,6 @@
 /**
- * codex adapter. No --session-id; system prompt via AGENTS.md in cwd; transcript
+ * codex adapter. No --session-id; persona/system prompt via an orc-owned instructions
+ * file under ~/.orc/sessions/<sid>/ (NOT by mutating cwd/AGENTS.md). Transcript
  * discovered by cwd + mtime>createdAt across ~/.codex/sessions/Y/M/D/.
  */
 import os from 'node:os';
@@ -30,26 +31,66 @@ const STATUS_LINE_RE = /\S[ \t]·[ \t][~/]/;
 export class CodexAdapter implements ProviderAdapter {
   readonly name = 'codex' as const;
 
+  /**
+   * Write persona/system prompt to an orc-owned instructions file (outside the
+   * worktree). Never creates or modifies `<cwd>/AGENTS.md`.
+   *
+   * Append mode (default): file is passed via `-c experimental_instructions_file=…`
+   * in `buildArgv` (path only — prompt body is not on argv).
+   *
+   * Replace mode: codex only exposes inline `-c base_instructions=…` (prompt on argv,
+   * not file-backed). Reject with a clear error rather than mutating the repo or
+   * stuffing the body into argv.
+   */
   async prepare(ctx: BuildCtx): Promise<void> {
-    // Inject persona/system prompt as AGENTS.md (auto-loaded, also user-visible).
-    if (ctx.systemPrompt && ctx.systemPrompt.trim().length > 0) {
-      const target = path.join(ctx.cwd, 'AGENTS.md');
-      try {
-        await fs.access(target);
-        throw new Error(
-          `refusing to overwrite existing AGENTS.md in ${ctx.cwd}; orc injects a Codex persona there on spawn — remove the file or use a different cwd`,
-        );
-      } catch (e) {
-        if (e instanceof Error && e.message.startsWith('refusing to overwrite')) throw e;
-        /* ENOENT — safe to write */
-      }
-      await Bun.write(target, `${ctx.systemPrompt.trim()}\n`);
+    if (!ctx.systemPrompt || ctx.systemPrompt.trim().length === 0) return;
+
+    if (ctx.systemPromptMode === 'replace') {
+      throw new Error(
+        'codex systemPromptMode=replace is not supported without putting prompt text on ' +
+          'argv or mutating the repo (no file-backed base_instructions). Use append ' +
+          '(default), which injects via experimental_instructions_file under orc state.',
+      );
     }
+
+    const target = ctx.instructionsPath;
+    if (!target || !path.isAbsolute(target)) {
+      throw new Error(
+        'codex persona injection requires an absolute orc-owned instructionsPath ' +
+          '(session state under ~/.orc/sessions/<id>/)',
+      );
+    }
+    // Refuse to write into the launch cwd / worktree even if a caller mis-sets the path.
+    const cwdReal = path.resolve(ctx.cwd);
+    const targetResolved = path.resolve(target);
+    if (targetResolved === cwdReal || targetResolved.startsWith(cwdReal + path.sep)) {
+      throw new Error(
+        `refusing to write codex instructions under cwd (${cwdReal}); path must be orc-owned state`,
+      );
+    }
+
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    // Session ids make the path unique; exclusive creation prevents a stale file or
+    // symlink from being overwritten. Persona contents are private to the user.
+    await fs.writeFile(target, `${ctx.systemPrompt.trim()}\n`, {
+      encoding: 'utf8',
+      flag: 'wx',
+      mode: 0o600,
+    });
   }
 
   buildArgv(ctx: BuildCtx): string[] {
     const argv = ['codex', '--dangerously-bypass-approvals-and-sandbox'];
     if (ctx.model) argv.push('-m', ctx.model);
+    // Append persona via config override pointing at the external file (path only).
+    if (
+      ctx.systemPrompt &&
+      ctx.systemPrompt.trim().length > 0 &&
+      ctx.systemPromptMode !== 'replace' &&
+      ctx.instructionsPath
+    ) {
+      argv.push('-c', `experimental_instructions_file=${ctx.instructionsPath}`);
+    }
     return argv;
   }
 

@@ -8,11 +8,12 @@ import type { Driver } from './drivers/driver.ts';
 import { gitToplevel, removeWorktree } from './worktree.ts';
 import { resolveWorkspace } from './agent.ts';
 import { Session } from './session.ts';
+import { removeSessionInstructions } from './session-files.ts';
 import type { SessionRecord } from './types.ts';
 
 export { agent, validateOptions } from './agent.ts';
 export { Session } from './session.ts';
-export type { WaitForOptions } from './session.ts';
+export type { WaitForOptions, SendOptions, SendResult } from './session.ts';
 export { classifyState, reduceWait, isSettled } from './state.ts';
 export type { StateMatchers, WaitTracking } from './state.ts';
 export { conversationTurns, parseTranscript, renderTurns, selectTurns } from './transcript.ts';
@@ -20,7 +21,12 @@ export type { Turn, TurnRole, TurnSelection } from './transcript.ts';
 export {
   defineWorkflow,
   runWorkflow,
+  resumeWorkflow,
+  retryWorkflow,
+  cancelWorkflow,
+  cleanupWorkflow,
   validateWorkflowDef,
+  assertValidStepId,
   interpolate,
   evaluateStep,
   stepOutcomeFromWait,
@@ -28,6 +34,39 @@ export {
   reconcileRunStatus,
   reconcileRun,
   assembleStepLogs,
+  resolveContainedWorkflowFile,
+  workflowImportRoots,
+  buildPlan,
+  buildWorkflowPlan,
+  planDigest,
+  digestPlanSteps,
+  adoptionDecision,
+  decideAdoption,
+  createAttempt,
+  transitionAttempt,
+  nextAttemptNumber,
+  projectStepsFromAttempts,
+  latestAttemptForStep,
+  loadWorkflowFile,
+  runnerLineageEnv,
+  resolveLineage,
+  lineageEnv,
+  lineageEnvVars,
+  enforceSpawnPolicy,
+  applyInheritedContext,
+  assertPolicyAllowsSpawn,
+  normalizePolicy,
+  computeDeadlineAt,
+  PolicyViolationError,
+  WORKFLOW_ROOTS_ENV,
+  TERMINAL_ATTEMPT_PHASES,
+  buildNormalizedGraph,
+  deriveSchedulerState,
+  effectiveConcurrency,
+  normalizeMaxConcurrency,
+  validateStepGraph,
+  schedulingSummary,
+  GraphValidationError,
 } from './workflow.ts';
 export type {
   WorkflowStep,
@@ -39,9 +78,122 @@ export type {
   WorkflowEvent,
   RunWorkflowOptions,
   StepExecutor,
+  StepAttempt,
+  AttemptPhase,
+  WorkflowPlan,
+  PlanStep,
+  RunLease,
+  OwnerLease,
+  WorkflowRunStatus,
+  ResumeOptions,
+  RetryOptions,
+  CancelOptions,
+  CleanupOptions,
+  NormalizedStepGraph,
+  SchedulerSnapshot,
+  StepSchedStatus,
 } from './workflow.ts';
-export { assertValidRunId } from './paths.ts';
-export { writeRun, readRun, listRuns } from './runs.ts';
+export {
+  assertValidRunId,
+  assertValidMessageId,
+  assertValidAttemptId,
+  assertValidArtifactName,
+  runArtifactsDir,
+  runResultPath,
+  runAttemptDir,
+} from './paths.ts';
+export {
+  runVerify,
+  executeVerify,
+  assertValidVerifyDescriptor,
+  captureBaselineSha,
+  cloneVerifyDescriptor,
+  mapToStepOutcome,
+  VERIFIER_OUTPUT_BOUND,
+} from './verification.ts';
+export type {
+  VerifyDescriptor,
+  VerifierObservation,
+  StepOutcome as VerifyStepOutcome,
+  OutcomeInputs,
+} from './verification.ts';
+export {
+  collectArtifact,
+  collectOutputArtifact,
+  collectDeclaredOutputs,
+  materializeArtifact,
+  materializeInput,
+  materializeStepInputs,
+  readArtifactManifest,
+  listArtifactManifests,
+  verifyArtifactBlob,
+  verifyStoredBlob,
+  ensureArtifactDirs,
+  resolveContainedPath,
+  sha256Buffer,
+  sha256Hex,
+  sha256File,
+  hashFile,
+  DEFAULT_ARTIFACT_MAX_BYTES,
+  DEFAULT_MAX_ARTIFACT_BYTES,
+  refFromManifest,
+} from './artifacts.ts';
+export type {
+  ArtifactInputDecl,
+  ArtifactOutputDecl,
+  ArtifactRef,
+  ArtifactManifest,
+} from './artifacts.ts';
+export {
+  validateResultEnvelope,
+  readResultEnvelope,
+  writeResultEnvelope,
+  RESULT_ENVELOPE_VERSION,
+  ORC_RESULT_PATH,
+} from './result-envelope.ts';
+export type { ResultEnvelope } from './result-envelope.ts';
+export {
+  gitHead,
+  gitHeadSha,
+  commitCountSince,
+  hasDiffSince,
+  commitCountVsMain,
+  hasWorkingTreeChanges,
+} from './worktree.ts';
+export {
+  hashPayload,
+  evaluateDeliveryReplay,
+  readDelivery,
+  persistDelivery,
+} from './messages.ts';
+export type { DeliveryPhase, DeliveryRecord } from './messages.ts';
+export { withLock, acquireLock } from './lock.ts';
+export {
+  writeRun,
+  readRun,
+  listRuns,
+  writeRunCAS,
+  casWriteRun,
+  writeRunOwned,
+  updateRun,
+  updateRunRetry,
+  makeLease,
+  heartbeatLease,
+  isLeaseLive,
+  isTerminalStatus,
+  isFinalStatus,
+  isActiveAttemptPhase,
+  normalizeRun,
+  projectStepsFromAttempts as projectRunStepsFromAttempts,
+  latestAttempt,
+  patchAttempt,
+  classifyOwnerLiveness,
+  CasConflictError,
+  FinalizedRunError,
+  RUN_SCHEMA_VERSION,
+  WORKFLOW_SCHEMA_VERSION,
+  DEFAULT_LEASE_MS,
+} from './runs.ts';
 export type {
   Provider,
   AgentOptions,
@@ -50,48 +202,49 @@ export type {
   SessionStatus,
   SystemPromptMode,
   PaneInfo,
+  ExecutionPolicy,
+  ExecutionLineage,
 } from './types.ts';
+export { ORC_ENV } from './types.ts';
 
-/** Resolve the default workspace key for filtering (git toplevel of cwd, else realpath cwd). */
 async function defaultWorkspace(): Promise<string> {
   const cwd = await fs.realpath(process.cwd());
   return (await gitToplevel(cwd)) ?? cwd;
 }
 
-/**
- * List sessions. Default filter = the workspace of process.cwd(); `all` returns every
- * workspace. Records explicitly marked dead (killed) are HIDDEN by default and shown
- * only with `all` or `dead` (BUG 3) — dead records are retained so transcript reads
- * still resolve after kill.
- */
 export async function listSessions(filter?: {
   workspace?: string;
   all?: boolean;
   dead?: boolean;
+  runId?: string;
+  rootRunId?: string;
 }): Promise<Session[]> {
   const records = await readRegistry();
   let selected: SessionRecord[] = records;
-  if (!filter?.all) {
-    // Normalize an explicit workspace filter the SAME way agent() normalizes the stored
-    // workspace (realpath an existing path; keep a logical string verbatim) so a caller
-    // passing e.g. /tmp/x (→ /private/tmp/x) still matches. Implicit = workspace of cwd.
+  if (filter?.runId) {
+    selected = selected.filter(
+      (r) => r.parentRunId === filter.runId || r.rootRunId === filter.runId,
+    );
+  }
+  if (filter?.rootRunId) {
+    selected = selected.filter((r) => r.rootRunId === filter.rootRunId);
+  }
+  if (!filter?.all && !filter?.runId && !filter?.rootRunId) {
     const ws =
       filter?.workspace !== undefined
         ? await resolveWorkspace(filter.workspace, process.cwd())
         : await defaultWorkspace();
-    selected = records.filter((r) => r.workspace === ws);
+    selected = selected.filter((r) => r.workspace === ws);
+  } else if (filter?.workspace !== undefined) {
+    const ws = await resolveWorkspace(filter.workspace, process.cwd());
+    selected = selected.filter((r) => r.workspace === ws);
   }
-  // Hide killed (status==='dead') records unless explicitly requested.
   if (!filter?.all && !filter?.dead) {
     selected = selected.filter((r) => r.status !== 'dead');
   }
   return selected.map((r) => new Session(r));
 }
 
-/**
- * Prune dead records from the registry. Returns the ids removed. With
- * `removeWorktree`, also removes each pruned record's git worktree.
- */
 export async function pruneSessions(opts?: {
   removeWorktree?: boolean;
   driver?: Driver;
@@ -108,11 +261,10 @@ export async function pruneSessions(opts?: {
       try {
         if (!(await driver.isAlive(r.tmuxName))) deadById.set(r.id, r.tmuxName);
       } catch {
-        // A liveness backend error is not proof that the session is gone.
+        /* ignore */
       }
     }),
   );
-
   const dead = await updateRegistry((current) => {
     const toRemove = new Set<string>();
     for (const r of current) {
@@ -125,17 +277,16 @@ export async function pruneSessions(opts?: {
     };
   });
   if (dead.length === 0) return [];
-  if (opts?.removeWorktree) {
-    for (const r of dead) {
-      if (r.worktreePath) {
-        await removeWorktree(r.cwd, r.worktreePath, { branch: r.branch }).catch(() => {});
-      }
+  for (const r of dead) {
+    // Drop orc-owned codex instruction sidecars for purged records (not user files).
+    await removeSessionInstructions(r).catch(() => {});
+    if (opts?.removeWorktree && r.worktreePath) {
+      await removeWorktree(r.cwd, r.worktreePath, { branch: r.branch }).catch(() => {});
     }
   }
   return dead.map((r) => r.id);
 }
 
-/** Get a single session by short id, full sessionId, or tmux name. */
 export async function getSession(idOrName: string): Promise<Session | null> {
   const alias = parseAliasSelector(idOrName);
   const rec = alias
@@ -147,7 +298,6 @@ export async function getSession(idOrName: string): Promise<Session | null> {
   return rec ? new Session(rec) : null;
 }
 
-/** Reconcile + return live status for a list of sessions. */
 export async function statusOf(sessions: Session[]): Promise<Map<string, 'running' | 'dead'>> {
   const driver = getDriver();
   const out = new Map<string, 'running' | 'dead'>();

@@ -95,7 +95,7 @@ class Session {
   readonly createdAt: string;
 
   status(): Promise<'running' | 'dead'>;             // reconciled against tmux liveness
-  send(prompt: string): Promise<void>;               // boot-ready guard → paste-buffer -p → 200ms → Enter
+  send(prompt: string, opts?: { messageId?: string }): Promise<SendResult>; // lock → paste → Enter → ack
   capture(opts?: { scrollback?: boolean }): Promise<string>;  // tmux capture-pane
   transcript(): Promise<string | null>;              // path to on-disk JSONL (provider-resolved)
   readTranscript(): Promise<string | null>;          // raw JSONL contents
@@ -124,12 +124,15 @@ class Session {
    - until provider.readyMatch(pane) (input box rendered).
 2. If `opts.prompt`, call `session.send(prompt)`.
 
-`session.send(text)`:
-1. ensure ready (poll readyMatch; cheap re-check).
-2. strip trailing newline from text.
-3. `driver.paste(name, text)` → `tmux set-buffer -- <text>` (server-global, NO -t) then `tmux paste-buffer -p -t <name>`.
-4. wait 200ms.
-5. `driver.sendKeys(name, 'Enter')`.
+`session.send(text, opts?)`:
+1. cross-process lock on session id (entire transaction).
+2. optional durable delivery record (`opts.messageId`) under `~/.orc/messages/` (SHA-256 of payload only).
+3. ensure ready (poll readyMatch; cheap re-check).
+4. strip trailing newline from text.
+5. `driver.paste(name, text)` → unique named `tmux set-buffer -b <name> -- <text>` then
+   `tmux paste-buffer -b <name> -p -d -t <pane>` (never the server-global unnamed buffer).
+6. wait 200ms; verify paste landed; retry with clear on drop (up to 3 attempts).
+7. `driver.sendKeys(name, 'Enter')`; persist `submitted`; bounded ack → `acknowledged`|`unknown`.
 (Never `send-keys` a multi-line string without `-l`; bare newline = C-m = premature submit.)
 
 ## Provider adapters (`src/providers/*`)
@@ -137,10 +140,10 @@ class Session {
 ```ts
 interface BuildCtx { model?: string; sessionId: string; systemPrompt?: string;
                      systemPromptMode: 'append'|'replace'; agentName?: string;
-                     cwd: string; sessionDir: string; }
+                     cwd: string; sessionDir: string; instructionsPath?: string; }
 interface ProviderAdapter {
   name: Provider;
-  /** Prepare cwd (e.g. codex writes AGENTS.md). Runs before spawn. */
+  /** Provider prep before spawn (codex writes orc-owned instructions file). */
   prepare(ctx: BuildCtx): Promise<void>;
   /** yolo interactive argv (NO positional prompt — prompt injected post-boot). */
   buildArgv(ctx: BuildCtx): string[];
@@ -155,9 +158,12 @@ Decided argv (research A.4 / RECOMMENDATIONS):
   - agentName → `--agent <bareName>` (native). systemPrompt → append (default) or `--system-prompt` (replace).
   - readyMatch: pane includes `bypass permissions on` or the `❯` box. trustDialog: includes `trust this folder` / `Is this a project you created`.
   - transcript: glob `~/.claude/projects/*/<sid>.jsonl` (do NOT recompute slug).
-- **codex:** `codex --dangerously-bypass-approvals-and-sandbox [-m M]`
-  - systemPrompt/agentName-body → write `AGENTS.md` into cwd in `prepare()` only if absent; refuse
-    to overwrite an existing file. No --session-id.
+- **codex:** `codex --dangerously-bypass-approvals-and-sandbox [-m M] [-c experimental_instructions_file=<abs>]`
+  - systemPrompt/agentName-body (append) → write orc-owned `~/.orc/sessions/<sid>/instructions.md`
+    (outside the worktree); pass path via `-c experimental_instructions_file=…` (body never on argv).
+    **Never** create/modify `<cwd>/AGENTS.md`. Replace mode rejected (no safe file-backed
+    `base_instructions` without argv stuffing). Path unique per session; removed on pre-spawn
+    failure and purge/cleanup. No --session-id.
   - readyMatch: pane includes the model line / `›` input box. trustDialog: includes `trust the contents of this directory`.
   - transcript: newest `~/.codex/sessions/Y/M/D/rollout-*.jsonl` whose first-line session_meta.payload.cwd == realpath(cwd) AND mtime > createdAt. Never `--ephemeral`.
 - **pi:** `pi -a [--model M] [--append-system-prompt P | --system-prompt P] --session-id SID --session-dir <orc sessions dir>`
@@ -192,7 +198,8 @@ TmuxDriver implementation notes:
 - Home: `~/.orc/` (override `ORC_HOME`). Sessions dir: `~/.orc/sessions/` (per-provider on-disk pi
   transcripts go under `~/.orc/transcripts/pi/<sid>/`). Registry: `~/.orc/registry.json`
   (array of SessionRecord) — registry mutations take a cross-process lock, then write
-  atomically (tmp + rename).
+  atomically (tmp + rename). Delivery records: `~/.orc/messages/<messageId>.json`.
+  Cross-process locks: `~/.orc/locks/`.
 - `SessionRecord`: { id, sessionId, provider, model?, agentName?, alias?, tmuxName, cwd,
   worktreePath?, branch?, workspace, systemPromptMode?, createdAt }.
 - **Workspace** = `opts.workspace` ?? git toplevel of cwd ?? realpath(cwd). Stored on the record.
@@ -211,20 +218,70 @@ Commands (all accept `--json`; prompts accept `-` / stdin / `@file`):
 orc spawn  --provider <p> [--model M] [--agent NAME | --system-prompt P] [--alias A] [--prompt TXT|-]
            [--cwd DIR] [--workspace W] [--worktree [--branch B]] [--no-wait] [--json]
            # prints the SessionRecord (human or json). Alias: `orc agent`, `orc new`.
-orc send   <id|@alias> [PROMPT | - | @file] [--json]    # multi-line safe; piped stdin or '-' if PROMPT omitted
+orc send   <id|@alias> [PROMPT | - | @file] [--idempotency-key K] [--json]  # multi-line safe; optional durable key
 orc read   <id|@alias> [--last|--index N|--full|--raw] [--json] # latest parsed turn (default), selected/full transcript, or full pane
-orc list   [--workspace W | --all | --dead] [--json]    # active sessions for a workspace. Alias: `orc ps`.
+orc list   [--workspace W | --all | --dead | --run ID | --lineage] [--json]  # sessions; --run filters by lineage
 orc attach <id|@alias> [--read-only] [--json]           # attaches locally; --json prints `tmux attach ...`
 orc kill   <id|@alias> [--worktree] [--purge] [--json]  # mark session dead (keep record); --purge removes record
 orc prune  [--worktree] [--json]                        # drop marked-dead/gone records (+ optional worktree removal)
+orc workflow <run|list|status|attach|logs|resume|retry|cancel|cleanup> ...
 orc help
 ```
 Notes for AI consumers: non-zero exit on error with a JSON `{error}` when `--json`; `orc list --json`
 returns an array of records with a live `status` field; `orc spawn --json` returns the record so a
 caller can immediately `orc send <id>`.
 
+## Durable workflows (phase 2 + phase 5 DAG)
+- **Schema:** `WorkflowRun` has `schemaVersion` (2+), monotonic `revision`, JSON-safe `plan` +
+  `definitionDigest`, optional `sourcePath`, `attempts[]`, `lease`, `policy`, lineage ids.
+  Plan carries `maxConcurrency` (default 1) and per-step `needs[]`. Legacy records without these
+  fields still normalize and render (concurrency defaults to 1).
+- **Attempts:** phases `queued|spawning|dispatched|running|verifying|succeeded|failed|waiting|
+  cancelled|abandoned|blocked|skipped`. Transitions persist under a run-scoped lock with CAS;
+  spawn-success then send-failure retains the live `sessionId`. Scheduler-owned `blocked`/
+  `skipped` never launch a session.
+- **DAG scheduler:** pure `workflow-scheduler.ts` derives ready/blocked/running from attempts.
+  Bounded launch loop respects `min(plan.maxConcurrency, policy.maxConcurrentSessions)`.
+  Artifact `inputs[].fromStep` is inferred into effective `needs` and the plan digest.
+- **Leases:** foreground and detached runs stamp an owner lease (`ownerId`, `pid`, optional
+  `runnerTmux`, expiry). Reconcile distinguishes live lease/runner, expired owner (`orphaned`),
+  and finalized status (never downgraded). Parallel step completions serialize through the
+  owner write path (no lost attempt/event updates).
+- **Control:** `resume` skips successes and adopts live owned sessions when safe; unknown delivery
+  requires explicit `retry`. `retry` creates new attempts for the node + affected descendants;
+  `cancel` is idempotent and stops new launches (`--cascade` kills only sessions proven owned
+  by the run/root); `cleanup` is explicit.
+- **Policy:** optional `ExecutionPolicy` (`maxDepth`, `maxSessions`, `maxConcurrentSessions`,
+  `deadlineMs`, `canDelegate`) fail-closed. Token/cost budgets are not enforced.
+- **Lineage:** `ORC_*` env vars + `AgentOptions`/`SessionRecord` fields; explicit options override
+  inherited env. Not exactly-once across FS/process boundaries — durable intent + adoption.
+
 ## Verification gate (what "done" means — no mocks substitute)
 A real yolo session launched in tmux for BOTH claude and codex; a **multi-line** prompt delivered and
 acted on (pane shows it submitted as one message); session listed/filtered by workspace; attach command
 valid; worktree created and used as cwd; transcript resolves to a real on-disk JSONL. Unit tests cover
 pure logic only (naming, argv build, parsing, glob/match) — they do NOT replace the live runs.
+
+## Durable workflow execution tree (phase 2)
+
+Workflow runs (`~/.orc/runs/<runId>.json`) are revisioned (`schemaVersion`, monotonic `revision`)
+and written under a run-scoped cross-process lock with CAS. A complete portable plan (plus
+definition digest and optional absolute `sourcePath`) is persisted **before** any step side effect.
+Per-step **attempts** record phases around spawn/send/wait/verify; `steps[]` remains a
+compatibility projection of the latest attempt per step.
+
+Owner leases (owner id, pid, optional runner tmux, expiresAt) make both foreground and detached
+runners reconcilable. Reconcile distinguishes live lease, expired owner, and finalized status —
+never downgrades `done`/`failed`/`cancelled`/`orphaned`.
+
+Resume/retry validate digest; function `done` predicates remain non-portable and require the
+original workflow module (portable `verify` descriptors are the preferred replacement). Adoption
+reuses live owned sessions; delivery phase `unknown` refuses auto-resubmit.
+Cancel is idempotent; cascade kill and cleanup only affect sessions with proven
+`rootRunId`/`parentRunId` ownership.
+
+`ExecutionPolicy` (`maxDepth`, `maxSessions`, `maxConcurrentSessions`, `deadlineMs`, `canDelegate`)
+is enforced fail-closed before spawn via registry counts, with policy check + reservation serialized
+under a cross-process root lock. Token/cost
+budgets are intentionally not enforced (not measurable today). Lineage fields on sessions and
+`ORC_*` env vars thread context into nested `orc` processes; explicit AgentOptions win.

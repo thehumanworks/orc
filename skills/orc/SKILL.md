@@ -43,7 +43,8 @@ orc wait  <id|@alias> [--for done|settled] # BLOCK until it settles (debounced â
 orc read  <id|@alias> [--full|--index N] # latest parsed turn by default; --full transcript; --raw live pane
 orc list  [--all] [--json]           # what's running ( hygiene: audit before you finish )
 orc kill  <id|@alias> [--worktree] [--purge]; orc prune [--worktree]
-orc workflow run <file.ts> [--detach]; orc workflow logs <runId> [--step id]
+orc workflow (run|list|status|logs|attach|resume|retry|cancel|cleanup) run <file.ts> [--detach] [--max-concurrency N]; orc workflow logs <runId> [--step id]
+# DAG fleet: steps may set needs:['depId']; maxConcurrency>1 runs ready roots concurrently (default 1 = sequential)
 ```
 
 Prefer `--json` everywhere (you're a machine consumer). `orc spawn --json` returns the record so you

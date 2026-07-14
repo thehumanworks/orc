@@ -29,7 +29,40 @@ export type SessionStatus = 'running' | 'dead';
  */
 export type AgentState = 'starting' | 'running' | 'done' | 'waiting' | 'failed';
 
-export interface AgentOptions {
+/**
+ * Enforceable bounds for recursive delegation. Token/cost budgets are NOT measurable
+ * today and are intentionally omitted — do not invent enforcement for them.
+ */
+export interface ExecutionPolicy {
+  /** Max nesting depth of workflow/agent delegation (root = 0). */
+  maxDepth?: number;
+  /** Max total sessions ever spawned under this root (lifetime count). */
+  maxSessions?: number;
+  /** Max concurrently live sessions under this root. */
+  maxConcurrentSessions?: number;
+  /** Wall-clock deadline from root start (ms). */
+  deadlineMs?: number;
+  /** When false, child spawns that would deepen delegation fail closed. Default true. */
+  canDelegate?: boolean;
+}
+
+/** Optional execution lineage attached to a session or agent spawn. */
+export interface ExecutionLineage {
+  /** Root workflow run id for the whole tree (equals parentRunId when depth=0). */
+  rootRunId?: string;
+  /** Immediate parent workflow run id. */
+  parentRunId?: string;
+  /** Immediate parent session short id / sessionId. */
+  parentSessionId?: string;
+  /** Step id within the parent run that spawned this session. */
+  stepId?: string;
+  /** Nesting depth (root workflow sessions = 0 or 1 depending on spawn site). */
+  depth?: number;
+  /** Owner / principal label for audit (e.g. run owner id). */
+  owner?: string;
+}
+
+export interface AgentOptions extends ExecutionLineage {
   provider: Provider;
   model?: string;
   /** Name of an existing agent definition (claude/codex, project- or user-scoped). */
@@ -55,12 +88,20 @@ export interface AgentOptions {
   driver?: string;
   /** Wait for boot before resolving (default true). */
   waitForReady?: boolean;
+  /** Optional execution policy (merged with inherited root policy when lineage is set). */
+  policy?: ExecutionPolicy;
+  /**
+   * Extra environment variables threaded into the detached TUI process
+   * (e.g. ORC_RESULT_PATH). Merged after lineage env; does not override empty keys.
+   */
+  extraEnv?: Record<string, string>;
 }
 
 /**
  * Persisted record for a launched session. Stored as an array in ~/.orc/registry.json.
+ * Optional lineage fields are absent on pre-phase-2 records (still valid).
  */
-export interface SessionRecord {
+export interface SessionRecord extends ExecutionLineage {
   /** Short handle (first 8 chars of sessionId). Used as the CLI handle. */
   id: string;
   /** The uuid we generate at spawn (claude/pi --session-id; also the handle source). */
@@ -87,6 +128,12 @@ export interface SessionRecord {
   systemPromptMode?: SystemPromptMode;
   /** For pi: the session-dir passed at launch, used to glob the transcript. */
   sessionDir?: string;
+  /**
+   * Absolute path to an orc-owned Codex persona instructions file (outside the
+   * worktree). Present when a system/agent prompt was injected via
+   * `experimental_instructions_file`. Removed on pre-spawn failure and purge/cleanup.
+   */
+  instructionsPath?: string;
   createdAt: string;
   /**
    * Lifecycle status. Absent (undefined) means alive/active. 'dead' marks a record
@@ -103,6 +150,8 @@ export interface SessionRecord {
    * transcript stays discoverable afterwards.
    */
   transcriptPath?: string;
+  /** Effective policy snapshot at spawn (for audit); optional. */
+  policy?: ExecutionPolicy;
 }
 
 export interface PaneInfo {
@@ -112,3 +161,29 @@ export interface PaneInfo {
   command: string;
   attached: boolean;
 }
+
+/**
+ * Environment variables used to propagate lineage and policy into child orc processes.
+ * Explicit AgentOptions override inherited values.
+ */
+export const ORC_ENV = {
+  ROOT_RUN_ID: 'ORC_ROOT_RUN_ID',
+  PARENT_RUN_ID: 'ORC_PARENT_RUN_ID',
+  PARENT_SESSION_ID: 'ORC_PARENT_SESSION_ID',
+  STEP_ID: 'ORC_STEP_ID',
+  DEPTH: 'ORC_DEPTH',
+  OWNER: 'ORC_OWNER',
+  /** Alias for parent run context (same semantics as PARENT_RUN_ID when set alone). */
+  RUN_ID: 'ORC_RUN_ID',
+  /** Absolute path to this attempt's result envelope JSON (agent may write testimony). */
+  RESULT_PATH: 'ORC_RESULT_PATH',
+  /** Current workflow attempt id (pairs with ORC_RESULT_PATH). */
+  ATTEMPT_ID: 'ORC_ATTEMPT_ID',
+  POLICY_MAX_DEPTH: 'ORC_POLICY_MAX_DEPTH',
+  POLICY_MAX_SESSIONS: 'ORC_POLICY_MAX_SESSIONS',
+  POLICY_MAX_CONCURRENT: 'ORC_POLICY_MAX_CONCURRENT',
+  POLICY_DEADLINE_MS: 'ORC_POLICY_DEADLINE_MS',
+  POLICY_CAN_DELEGATE: 'ORC_POLICY_CAN_DELEGATE',
+  /** Absolute ISO deadline stamped when a root starts with deadlineMs. */
+  POLICY_DEADLINE_AT: 'ORC_POLICY_DEADLINE_AT',
+} as const;

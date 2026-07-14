@@ -3,6 +3,11 @@ import {
   sanitizeTmuxName,
   buildSpawnArgs,
   buildAttachArgs,
+  buildSetBufferArgs,
+  buildPasteBufferArgs,
+  buildDeleteBufferArgs,
+  newPasteBufferName,
+  pasteWithNamedBuffer,
   PANE_WIDTH,
   PANE_HEIGHT,
 } from '../src/drivers/tmux.ts';
@@ -36,14 +41,12 @@ describe('buildSpawnArgs', () => {
 
   test('includes the fixed wide -x/-y geometry so a status line never wraps', () => {
     const args = buildSpawnArgs(base);
-    // The width/height flags must be present with the source-of-truth values.
     const xi = args.indexOf('-x');
     const yi = args.indexOf('-y');
     expect(xi).toBeGreaterThanOrEqual(0);
     expect(yi).toBeGreaterThanOrEqual(0);
     expect(args[xi + 1]).toBe(String(PANE_WIDTH));
     expect(args[yi + 1]).toBe(String(PANE_HEIGHT));
-    // The pinned width must be comfortably wider than any provider status line.
     expect(PANE_WIDTH).toBeGreaterThanOrEqual(120);
   });
 
@@ -53,7 +56,6 @@ describe('buildSpawnArgs', () => {
     expect(sep).toBeGreaterThanOrEqual(0);
     expect(args.indexOf('-x')).toBeLessThan(sep);
     expect(args.indexOf('-y')).toBeLessThan(sep);
-    // The program argv lands AFTER the separator, untouched.
     expect(args.slice(sep + 1)).toEqual(base.argv);
   });
 
@@ -91,5 +93,102 @@ describe('buildAttachArgs', () => {
       '-t',
       'orc-claude-abcd1234',
     ]);
+  });
+});
+
+describe('named paste buffers (no server-global unnamed buffer)', () => {
+  test('newPasteBufferName is unique and safe', () => {
+    const a = newPasteBufferName();
+    const b = newPasteBufferName();
+    expect(a).not.toBe(b);
+    expect(a).toMatch(/^orc-paste-[0-9a-f]+$/);
+    expect(b).toMatch(/^orc-paste-[0-9a-f]+$/);
+  });
+
+  test('set-buffer uses -b <name> -- text (never the unnamed buffer)', () => {
+    expect(buildSetBufferArgs('orc-paste-abc', 'hello\nworld')).toEqual([
+      'set-buffer',
+      '-b',
+      'orc-paste-abc',
+      '--',
+      'hello\nworld',
+    ]);
+    // `--` keeps text that starts with '-' from being parsed as a tmux flag.
+    expect(buildSetBufferArgs('orc-paste-abc', '-starts-with-dash')).toEqual([
+      'set-buffer',
+      '-b',
+      'orc-paste-abc',
+      '--',
+      '-starts-with-dash',
+    ]);
+  });
+
+  test('paste-buffer uses -b, bracketed paste -p, and -d (delete after paste)', () => {
+    expect(buildPasteBufferArgs('orc-paste-abc', 'orc-pane')).toEqual([
+      'paste-buffer',
+      '-b',
+      'orc-paste-abc',
+      '-p',
+      '-d',
+      '-t',
+      'orc-pane',
+    ]);
+  });
+
+  test('pasteWithNamedBuffer sets then pastes the same unique name', async () => {
+    const calls: string[][] = [];
+    const run = async (args: string[]) => {
+      calls.push(args);
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    const { bufferName } = await pasteWithNamedBuffer(run, 'orc-x', 'prompt text', 'orc-paste-fixed1');
+    expect(bufferName).toBe('orc-paste-fixed1');
+    expect(calls).toEqual([
+      ['set-buffer', '-b', 'orc-paste-fixed1', '--', 'prompt text'],
+      ['paste-buffer', '-b', 'orc-paste-fixed1', '-p', '-d', '-t', 'orc-x'],
+    ]);
+  });
+
+  test('two pastes get distinct buffer names by default', async () => {
+    const names: string[] = [];
+    const run = async (args: string[]) => {
+      if (args[0] === 'set-buffer') names.push(args[2]!);
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    await pasteWithNamedBuffer(run, 'p', 'a');
+    await pasteWithNamedBuffer(run, 'p', 'b');
+    expect(names).toHaveLength(2);
+    expect(names[0]).not.toBe(names[1]);
+  });
+
+  test('best-effort delete-buffer when set succeeds but paste fails', async () => {
+    const calls: string[][] = [];
+    const run = async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === 'paste-buffer') {
+        return { code: 1, stdout: '', stderr: 'paste failed' };
+      }
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    await expect(pasteWithNamedBuffer(run, 'orc-x', 'text', 'orc-paste-cleanup')).rejects.toThrow(
+      /paste-buffer failed/,
+    );
+    expect(calls).toEqual([
+      ['set-buffer', '-b', 'orc-paste-cleanup', '--', 'text'],
+      ['paste-buffer', '-b', 'orc-paste-cleanup', '-p', '-d', '-t', 'orc-x'],
+      buildDeleteBufferArgs('orc-paste-cleanup'),
+    ]);
+  });
+
+  test('set-buffer failure does not attempt paste or delete', async () => {
+    const calls: string[][] = [];
+    const run = async (args: string[]) => {
+      calls.push(args);
+      return { code: 1, stdout: '', stderr: 'set failed' };
+    };
+    await expect(pasteWithNamedBuffer(run, 'orc-x', 'text', 'orc-paste-setfail')).rejects.toThrow(
+      /set-buffer failed/,
+    );
+    expect(calls).toEqual([['set-buffer', '-b', 'orc-paste-setfail', '--', 'text']]);
   });
 });

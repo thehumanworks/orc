@@ -98,9 +98,11 @@ codex 0.137.0 has **no claude-style reusable named-agent persona**. Investigated
 
 **Recommendation for `agentName` when `provider=codex` (v1):**
 Treat a claude-style `agentName` as **unsupported for codex in v1, but degrade gracefully**:
-1. If the orchestrator has the agent's markdown body (we resolve claude agent files ourselves), inject that body as codex instructions via `-c experimental_instructions_file=<tmpfile>` OR by writing it to an `AGENTS.md` in the worktree. This makes "agent persona" portable across providers without relying on a codex-native concept.
+1. If the orchestrator has the agent's markdown body (we resolve claude agent files ourselves), inject that body as codex instructions via `-c experimental_instructions_file=<orc-owned path>` under `~/.orc/sessions/<sid>/` — **not** by writing `AGENTS.md` into the worktree (non-mutating; body never on argv).
 2. If only a bare `agentName` string is given and we can't resolve a body, **error with a clear message**: `provider=codex does not support named agents; pass a systemPrompt or use provider=claude`.
 Do NOT silently map `agentName` to codex `--profile` — that conflates persona with config and would surprise users.
+
+**Implemented (proposal 4):** orc writes persona text only under orc-owned state and passes the absolute path via `experimental_instructions_file`. Replace mode is rejected (inline `base_instructions` would put the body on argv).
 
 **2026-06 update:** current Codex custom subagent definitions are standalone TOML files in
 project `.codex/agents/` or user `$CODEX_HOME/agents` / `~/.codex/agents`, identified by their
@@ -142,9 +144,9 @@ pi has both `--system-prompt <text>` (replaces; default is its coding-assistant 
 
 codex has **no `--system-prompt` flag**. Inject a developer/system prompt via one of:
 - `-c experimental_instructions_file=<path>` (config override pointing at an instructions file), or
-- a project-scope **`AGENTS.md`** in the worktree cwd (auto-loaded), or
-- `-c base_instructions="..."` inline (replaces base instructions — heavy-handed; prefer AGENTS.md/experimental_instructions_file which augment).
-**Recommendation:** write the desired system/persona text to `AGENTS.md` in the worktree (cleanest, also visible to the user) for codex sessions.
+- a project-scope **`AGENTS.md`** in the worktree cwd (auto-loaded by codex itself — **orc must not write this**), or
+- `-c base_instructions="..."` inline (replaces base instructions — puts body on argv; not used by orc).
+**Recommendation (implemented):** write the desired system/persona text to an orc-owned file under `~/.orc/sessions/<sid>/instructions.md` and pass `-c experimental_instructions_file=<abs>` (append). Do not mutate the user's `AGENTS.md`.
 
 ---
 
@@ -404,7 +406,7 @@ claude --dangerously-skip-permissions --model <model> \
 
 # codex  (auto-confirm the trust dialog with Enter after boot; do NOT edit user config)
 codex --dangerously-bypass-approvals-and-sandbox -m <model>
-# (system prompt → write AGENTS.md into worktree, or -c experimental_instructions_file=<f>)
+# (system prompt → orc-owned instructions file + -c experimental_instructions_file=<abs>)
 
 # pi
 pi -a --model <model> --append-system-prompt <resolvedSystemPrompt> \
@@ -427,12 +429,12 @@ pi -a --model <model> --append-system-prompt <resolvedSystemPrompt> \
 
 ### agentName resolution behavior (per provider)
 - **claude:** native. `--agent <bareName>`; resolution project `.claude/agents/` → user `~/.claude/agents/` (`name:` frontmatter / filename). We may also resolve the agent .md ourselves to reuse cross-provider.
-- **codex:** resolve project/user `.codex/agents/*.toml` by parsed `name` first, then legacy `.codex/prompts/<name>.md`, then claude agent markdown; inject TOML `developer_instructions` or the markdown body as `AGENTS.md`. TOML `model` is used only when the caller omitted `--model`. Never map `agentName` to `--profile`.
+- **codex:** resolve project/user `.codex/agents/*.toml` by parsed `name` first, then legacy `.codex/prompts/<name>.md`, then claude agent markdown; inject TOML `developer_instructions` or the markdown body via orc-owned `experimental_instructions_file` (not `AGENTS.md`). TOML `model` is used only when the caller omitted `--model`. Never map `agentName` to `--profile`.
 - **pi:** no native named agent. Same as codex — feed resolved body via `--append-system-prompt`.
 
 ### systemPrompt default
 **Append**, not replace. claude `--append-system-prompt`; pi `--append-system-prompt`; codex via
-`AGENTS.md`/`experimental_instructions_file` (augmenting). Expose replace as advanced opt-in (claude/pi `--system-prompt`; codex `-c base_instructions`).
+orc-owned `experimental_instructions_file` (augmenting; never mutate user `AGENTS.md`). Expose replace as advanced opt-in for claude/pi (`--system-prompt`); codex replace is rejected (no safe file-backed base_instructions without argv stuffing).
 
 ### Transcript path mapping (per provider)
 - **claude:** we set `--session-id <sid>`, so **glob `~/.claude/projects/*/<sid>.jsonl`** (one unique match). Do NOT recompute the slug — it's only partially characterized; the glob is robust.
