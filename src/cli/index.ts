@@ -4,7 +4,6 @@
  * remainder with that command's own options map (parseArgs is strict on unknowns).
  */
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
 import type { ParseArgsConfig } from 'node:util';
 import { agent } from '../agent.ts';
@@ -17,26 +16,20 @@ import {
   retryWorkflow,
   cancelWorkflow,
   cleanupWorkflow,
-  runnerTmuxName,
   reconcileRun,
   assembleStepLogs,
   validateWorkflowDef,
-  runnerLineageEnv,
-  buildPlan,
-  planDigest,
 } from '../workflow.ts';
+import {
+  currentRunnerInfo,
+  followRunnerLog,
+  launchDetachedRecovery,
+  launchDetachedRun,
+  trapRunnerTermination,
+} from '../workflow-runner.ts';
 
 import type { WorkflowDef, WorkflowEvent, WorkflowRun, StepResult } from '../workflow.ts';
-import {
-  readRun,
-  listRuns,
-  writeRun,
-  writeRunOwned,
-  WORKFLOW_SCHEMA_VERSION,
-  makeLease,
-} from '../runs.ts';
-import { getDriver } from '../drivers/driver.ts';
-import { orcHome } from '../paths.ts';
+import { readRun, listRuns } from '../runs.ts';
 import { resolveUntil } from '../state.ts';
 import { resolveBind } from '../daemon/bind.ts';
 import { tailscaleIp4 } from '../daemon/tailscale.ts';
@@ -45,7 +38,7 @@ import { loadDaemonTokensFromEnv } from '../daemon/auth.ts';
 import type { Scope } from '../daemon/auth.ts';
 import { readPeers, addPeer, removePeer, peerHosts, DEFAULT_DAEMON_PORT } from '../daemon/peers.ts';
 import { DaemonClient, parseHostArg } from '../daemon/client.ts';
-import type { RemoteTarget } from '../daemon/client.ts';
+import type { RemoteTarget, DetachedWorkflowLaunch } from '../daemon/client.ts';
 import type { AgentOptions, AgentState, Provider, SystemPromptMode } from '../types.ts';
 import {
   printJson,
@@ -730,14 +723,18 @@ async function cmdWorkflowRun(args: string[]): Promise<number> {
   }
 
   let run: WorkflowRun;
+  // `--run-id` is the entrypoint a detached runner executes: reuse the id minted by
+  // `--detach` and self-report this process as the run's `runner` (the runner
+  // re-persists the record from scratch, stamping its own identity on the lease).
+  const runId = values['run-id'] as string | undefined;
+  const runner = runId ? startDetachedRunner(runId, 'run') : undefined;
+  const term = trapRunnerTermination();
   try {
     // Stream step events to stdout in human mode; --json prints only the final record.
-    // `--run-id` is the entrypoint a detached runner executes: reuse the id minted by
-    // `--detach` and re-thread runnerTmux (the runner re-persists the record from scratch).
-    const runId = values['run-id'] as string | undefined;
     run = await runWorkflow(def, {
       runId,
-      runnerTmux: runId ? runnerTmuxName(runId) : undefined,
+      runner,
+      signal: term.signal,
       sourcePath: absFile,
       maxConcurrency: conc.value,
       onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
@@ -745,7 +742,10 @@ async function cmdWorkflowRun(args: string[]): Promise<number> {
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
+  } finally {
+    term.dispose();
   }
+  if (term.signal.aborted) return runnerTerminated(run);
 
   if (json) printJson(run);
   // Non-zero exit when the run failed, so callers/CI can gate on it.
@@ -753,13 +753,28 @@ async function cmdWorkflowRun(args: string[]): Promise<number> {
 }
 
 /**
- * `--detach`: run the workflow as a detached, reattachable tmux session — consistent with
- * how orc runs agents (reuse the Driver; never nohup a bare process). Mint the runId up
- * front, write an initial `running` record (so `status` resolves immediately), spawn a
- * session `orc-wf-<runId>` whose argv runs the workflow in the FOREGROUND inside it
- * (`<bun> <cli> workflow run <absFile> --run-id <runId>`), then print and exit 0. The
- * detached runner owns the record from there. cwd is THIS invocation's cwd so steps that
- * share cwd behave identically to a foreground run.
+ * A detached runner (`--run-id` / `--runner`) reports itself: a separator line in its
+ * log (resumed/retried runners append to the same file) and its `runner` identity.
+ */
+function startDetachedRunner(runId: string, action: string): ReturnType<typeof currentRunnerInfo> {
+  const runner = currentRunnerInfo(runId);
+  process.stdout.write(`# orc runner pid=${runner.pid} action=${action} run=${runId} at ${runner.startedAt}\n`);
+  return runner;
+}
+
+/** SIGTERM'd runner (e.g. `orc workflow cancel`): it wrote nothing further; exit 143. */
+function runnerTerminated(run: WorkflowRun): number {
+  process.stdout.write(`# orc runner pid=${process.pid} terminated (SIGTERM); run ${run.id} ${run.status}\n`);
+  return 143;
+}
+
+/**
+ * `--detach`: run the workflow as a detached runner process. Mint the runId up front,
+ * write an initial `running` record (so `status` resolves immediately), spawn
+ * `<orc> workflow run <absFile> --run-id <runId>` fully detached (own session, no
+ * terminal, output → ~/.orc/runs/<runId>/runner.log), stamp its identity on the record,
+ * then print and exit 0. The runner owns the record from there. cwd is THIS
+ * invocation's cwd so steps that share cwd behave identically to a foreground run.
  */
 async function cmdWorkflowRunDetached(
   absFile: string,
@@ -767,65 +782,16 @@ async function cmdWorkflowRunDetached(
   json: boolean,
   maxConcurrency?: number,
 ): Promise<number> {
-  // The parent doesn't call runWorkflow, so validate the def here — a malformed workflow
-  // must fail cleanly now, not spawn a doomed runner and hand back a self-orphaning runId.
-  const defForPlan: WorkflowDef =
-    maxConcurrency !== undefined ? { ...def, maxConcurrency } : def;
   try {
-    validateWorkflowDef(defForPlan);
+    const launch = await launchDetachedRun(def, absFile, { maxConcurrency });
+    if (json) printJson({ runId: launch.runId, logPath: launch.logPath });
+    else process.stdout.write(`${launch.runId}\n`);
+    return 0;
   } catch (e) {
-    printError((e as Error).message, json);
+    const msg = (e as Error).message;
+    printError((e as { code?: string }).code === 'RUNNER_SPAWN_FAILED' ? `failed to launch detached runner: ${msg}` : msg, json);
     return 1;
   }
-
-  const runId = randomUUID().slice(0, 8);
-  const runnerTmux = runnerTmuxName(runId);
-
-  const plan = buildPlan(defForPlan);
-  const run: WorkflowRun = {
-    schemaVersion: WORKFLOW_SCHEMA_VERSION,
-    revision: 0,
-    id: runId,
-    name: def.name,
-    startedAt: new Date().toISOString(),
-    status: 'running',
-    runnerTmux,
-    steps: [],
-    plan,
-    definitionDigest: planDigest(plan),
-    sourcePath: absFile,
-    attempts: [],
-    lease: makeLease({ runnerTmux }),
-    rootRunId: runId,
-  };
-  await writeRunOwned(run);
-
-  // process.execPath = the exact bun binary running us → no reliance on the tmux server's
-  // PATH resolving `bun`. Thread ORC_HOME so the runner persists to the same runs dir
-  // (a new tmux session inherits the server env, not ours).
-  const argv = [process.execPath, import.meta.path, 'workflow', 'run', absFile, '--run-id', runId];
-  if (maxConcurrency !== undefined) {
-    argv.push('--max-concurrency', String(maxConcurrency));
-  }
-  try {
-    await getDriver().spawn({
-      name: runnerTmux,
-      cwd: process.cwd(),
-      argv,
-      env: { ORC_HOME: orcHome(), ...runnerLineageEnv(run) },
-    });
-  } catch (e) {
-    // Spawn failed → finalize the record we wrote so it doesn't linger as a phantom run.
-    run.status = 'failed';
-    run.finishedAt = new Date().toISOString();
-    await writeRun(run).catch(() => {});
-    printError(`failed to launch detached runner: ${(e as Error).message}`, json);
-    return 1;
-  }
-
-  if (json) printJson({ runId, runnerTmux });
-  else process.stdout.write(`${runId}\n`);
-  return 0;
 }
 
 async function cmdWorkflowList(args: string[]): Promise<number> {
@@ -859,6 +825,12 @@ async function cmdWorkflowStatus(args: string[]): Promise<number> {
   return 0;
 }
 
+/**
+ * `orc workflow attach <runId>` — follow a detached run's runner log in-process: print
+ * what is there, then tail it until the run is finalized and its runner is gone (or
+ * Ctrl-C). `--json` prints `{ runId, logPath, runner }` and does not follow.
+ * `--read-only` is accepted and ignored (following is read-only by construction).
+ */
 async function cmdWorkflowAttach(args: string[]): Promise<number> {
   const { values, positionals } = parse(args, {
     'read-only': { type: 'boolean' },
@@ -875,14 +847,32 @@ async function cmdWorkflowAttach(args: string[]): Promise<number> {
     printError(`no run found for '${runId}'`, json);
     return 1;
   }
-  if (!run.runnerTmux) {
-    printError(`run '${runId}' has no runner session to attach (it was not run with --detach)`, json);
+  if (!run.runner) {
+    printError(
+      run.legacyRunnerTmux
+        ? `run '${runId}' was started by a legacy tmux runner; it has no runner log`
+        : `run '${runId}' has no runner log (it was not run with --detach)`,
+      json,
+    );
     return 1;
   }
-  const cmd = getDriver().attachCommand(run.runnerTmux, { readOnly: values['read-only'] === true });
-  if (json) printJson({ runId, command: cmd });
-  else process.stdout.write(`${cmd}\n`);
-  return 0;
+  if (json) {
+    printJson({ runId, logPath: run.runner.logPath, runner: run.runner });
+    return 0;
+  }
+  const ac = new AbortController();
+  const onInt = () => ac.abort();
+  process.once('SIGINT', onInt);
+  try {
+    const last = await followRunnerLog(runId, { signal: ac.signal });
+    if (!ac.signal.aborted && last) process.stderr.write(`# run ${runId} ${last.status}\n`);
+    return 0;
+  } catch (e) {
+    printError((e as Error).message, false);
+    return 1;
+  } finally {
+    process.off('SIGINT', onInt);
+  }
 }
 
 /**
@@ -980,38 +970,27 @@ async function cmdWorkflowLogs(args: string[]): Promise<number> {
  * unless `--insecure`. The process blocks here serving forever (Ctrl-C / SIGTERM stops it).
  */
 
-/** Detach a resume/retry control action into a named runner tmux session. */
+/** Detach a resume/retry into a detached runner process (spawn first, then stamp). */
 async function detachWorkflowControl(
   action: 'resume' | 'retry',
   runId: string,
   absFile: string,
   json: boolean,
-  extraArgs: string[] = [],
+  stepId?: string,
 ): Promise<number> {
-  const runnerTmux = runnerTmuxName(runId);
-  const argv = [
-    process.execPath,
-    import.meta.path,
-    'workflow',
-    action,
-    runId,
-    absFile,
-    ...extraArgs,
-  ];
   try {
-    await getDriver().spawn({
-      name: runnerTmux,
-      cwd: process.cwd(),
-      argv,
-      env: { ORC_HOME: orcHome() },
-    });
+    const launch = await launchDetachedRecovery(action, runId, absFile, { stepId });
+    if (json) printJson({ runId, logPath: launch.logPath, action });
+    else process.stdout.write(`${runId}\n`);
+    return 0;
   } catch (e) {
-    printError(`failed to launch detached ${action}: ${(e as Error).message}`, json);
+    const msg = (e as Error).message;
+    printError(
+      (e as { code?: string }).code === 'RUNNER_SPAWN_FAILED' ? `failed to launch detached ${action}: ${msg}` : msg,
+      json,
+    );
     return 1;
   }
-  if (json) printJson({ runId, runnerTmux, action });
-  else process.stdout.write(`${runId}\n`);
-  return 0;
 }
 
 async function loadWorkflowDefFromFile(file: string): Promise<{ def: WorkflowDef; absPath: string }> {
@@ -1024,15 +1003,24 @@ async function loadWorkflowDefFromFile(file: string): Promise<{ def: WorkflowDef
 
 /** `orc workflow resume <runId> [workflowFile] [--detach]` */
 
-/** Refuse resume/retry when reconcile still reports running (owner not proven dead). */
-async function assertNoLiveOwner(runId: string, json: boolean): Promise<WorkflowRun | null> {
+/**
+ * Refuse resume/retry when reconcile still reports running (owner not proven dead).
+ * A detached runner (`--runner`) whose own identity was stamped by its parent is the
+ * live owner itself, which is allowed.
+ */
+async function assertNoLiveOwner(
+  runId: string,
+  json: boolean,
+  opts?: { asRunner?: boolean },
+): Promise<WorkflowRun | null> {
   const existing = await readRun(runId);
   if (!existing) {
     printError(`no run found for '${runId}'`, json);
     return null;
   }
   const live = await reconcileRun(existing);
-  if (live.status === 'running') {
+  const isSelf = opts?.asRunner === true && live.runner?.pid === process.pid;
+  if (live.status === 'running' && !isSelf) {
     printError(
       `run '${runId}' still has a live owner; wait for it to finish/expire or cancel first`,
       json,
@@ -1046,6 +1034,7 @@ async function cmdWorkflowResume(args: string[]): Promise<number> {
   const { values, positionals } = parse(args, {
     json: { type: 'boolean' },
     detach: { type: 'boolean' },
+    runner: { type: 'boolean' },
   });
   const json = jsonFlag(values);
   const runId = positionals[0];
@@ -1054,7 +1043,8 @@ async function cmdWorkflowResume(args: string[]): Promise<number> {
     printError('workflow resume requires <runId> [workflowFile]', json);
     return 1;
   }
-  if (!(await assertNoLiveOwner(runId, json))) return 1;
+  const asRunner = values.runner === true;
+  if (!(await assertNoLiveOwner(runId, json, { asRunner }))) return 1;
   if (!file) {
     printError(
       'workflow resume requires the original workflow file (function predicates remain non-portable; prefer verify descriptors)',
@@ -1067,12 +1057,20 @@ async function cmdWorkflowResume(args: string[]): Promise<number> {
     if (values.detach === true) {
       return detachWorkflowControl('resume', runId, absPath, json);
     }
-    const run = await resumeWorkflow(runId, def, {
-      sourcePath: absPath,
-      onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
-    });
-    if (json) printJson(run);
-    return run.status === 'done' ? 0 : 1;
+    const term = trapRunnerTermination();
+    try {
+      const run = await resumeWorkflow(runId, def, {
+        sourcePath: absPath,
+        runner: asRunner ? startDetachedRunner(runId, 'resume') : undefined,
+        signal: term.signal,
+        onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
+      });
+      if (term.signal.aborted) return runnerTerminated(run);
+      if (json) printJson(run);
+      return run.status === 'done' ? 0 : 1;
+    } finally {
+      term.dispose();
+    }
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
@@ -1085,6 +1083,7 @@ async function cmdWorkflowRetry(args: string[]): Promise<number> {
     json: { type: 'boolean' },
     detach: { type: 'boolean' },
     step: { type: 'string' },
+    runner: { type: 'boolean' },
   });
   const json = jsonFlag(values);
   const runId = positionals[0];
@@ -1093,7 +1092,8 @@ async function cmdWorkflowRetry(args: string[]): Promise<number> {
     printError('workflow retry requires <runId> [--step <id>] [workflowFile]', json);
     return 1;
   }
-  if (!(await assertNoLiveOwner(runId, json))) return 1;
+  const asRunner = values.runner === true;
+  if (!(await assertNoLiveOwner(runId, json, { asRunner }))) return 1;
   if (!file) {
     printError(
       'workflow retry requires the original workflow file (function predicates remain non-portable; prefer verify descriptors)',
@@ -1105,15 +1105,23 @@ async function cmdWorkflowRetry(args: string[]): Promise<number> {
     const { def, absPath } = await loadWorkflowDefFromFile(file);
     const stepId = values.step as string | undefined;
     if (values.detach === true) {
-      return detachWorkflowControl('retry', runId, absPath, json, stepId ? ['--step', stepId] : []);
+      return detachWorkflowControl('retry', runId, absPath, json, stepId);
     }
-    const run = await retryWorkflow(runId, def, {
-      sourcePath: absPath,
-      stepId,
-      onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
-    });
-    if (json) printJson(run);
-    return run.status === 'done' ? 0 : 1;
+    const term = trapRunnerTermination();
+    try {
+      const run = await retryWorkflow(runId, def, {
+        sourcePath: absPath,
+        stepId,
+        runner: asRunner ? startDetachedRunner(runId, 'retry') : undefined,
+        signal: term.signal,
+        onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
+      });
+      if (term.signal.aborted) return runnerTerminated(run);
+      if (json) printJson(run);
+      return run.status === 'done' ? 0 : 1;
+    } finally {
+      term.dispose();
+    }
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
@@ -1667,10 +1675,10 @@ async function remoteAttach(
 }
 
 
-/** Type guard: detach launch returns {runId,runnerTmux}; foreground returns WorkflowRun. */
+/** Type guard: detach launch returns {runId,logPath}; foreground returns WorkflowRun. */
 function isDetachedWorkflowLaunch(
-  res: WorkflowRun | { runId: string; runnerTmux: string },
-): res is { runId: string; runnerTmux: string } {
+  res: WorkflowRun | DetachedWorkflowLaunch,
+): res is DetachedWorkflowLaunch {
   return (
     typeof res === 'object' &&
     res !== null &&
@@ -1842,28 +1850,24 @@ async function remoteWorkflowAttach(
     printError('workflow attach requires <runId>', json);
     return 1;
   }
-  let runnerTmux: string | undefined;
+  let hasRunner = false;
   try {
     const run = await client.getRun(runId);
-    runnerTmux = run.runnerTmux;
+    hasRunner = !!run.runner;
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
   }
-  if (!runnerTmux) {
-    printError(`run '${runId}' has no runner session to attach (it was not run with --detach)`, json);
+  if (!hasRunner) {
+    printError(`run '${runId}' has no runner log (it was not run with --detach)`, json);
     return 1;
   }
-  const ssh = `tailscale ssh ${target.host}`;
-  const ro = values['read-only'] === true ? ' -r' : '';
-  const remoteTmux = `tmux attach${ro} -t ${runnerTmux}`;
+  // The runner log is host-local: follow it ON the host (`--read-only` is moot).
+  const command = `tailscale ssh ${target.host} orc workflow attach ${runId}`;
   if (json) {
-    printJson({ runId, host: target.host, ssh, command: remoteTmux });
+    printJson({ runId, host: target.host, command });
   } else {
-    process.stdout.write(
-      `# run ${runId} runs on ${target.host}; reattach over tailscale:\n` +
-        `${ssh}\n# then on ${target.host}:\n${remoteTmux}\n`,
-    );
+    process.stdout.write(`# run ${runId} runs on ${target.host}; follow its runner log over tailscale:\n${command}\n`);
   }
   return 0;
 }
@@ -1888,7 +1892,7 @@ async function remoteWorkflowResume(client: DaemonClient, args: string[]): Promi
       else process.stdout.write(`${renderRunDetail(res)}\n`);
       return res.status === 'done' ? 0 : 1;
     }
-    // Detached: { runId, runnerTmux }
+    // Detached: { runId, logPath, action }
     if (json) printJson(res);
     else process.stdout.write(`${res.runId}\n`);
     return 0;

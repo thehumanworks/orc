@@ -11,7 +11,6 @@ import {
   stepOutcomeFromWait,
   runWorkflow,
   deliverInstructions,
-  runnerTmuxName,
   reconcileRunStatus,
   assembleStepLogs,
   resolveContainedWorkflowFile,
@@ -498,24 +497,25 @@ describe('runWorkflow with a fake executor', () => {
     expect(run.steps[0]!.state).toBe('failed');
   });
 
-  test('opts.runId/runnerTmux are honored and persisted (the --detach entrypoint)', async () => {
+  test('opts.runId/runner are honored and persisted (the --detach entrypoint)', async () => {
     const def: WorkflowDef = { name: 'detached', steps: [step({ id: 'a' })] };
+    const runner = {
+      pid: process.pid,
+      startTime: null,
+      logPath: '/tmp/x/runner.log',
+      startedAt: '2026-01-01T00:00:00.000Z',
+    };
     const run = await runWorkflow(def, {
       execStep: fakeExec({}, []),
       runId: 'deadbeef',
-      runnerTmux: 'orc-wf-deadbeef',
+      runner,
     });
     expect(run.id).toBe('deadbeef'); // used INSTEAD of a generated one
-    expect(run.runnerTmux).toBe('orc-wf-deadbeef');
+    expect(run.runner).toEqual(runner);
     const onDisk = await readRun('deadbeef');
-    expect(onDisk!.runnerTmux).toBe('orc-wf-deadbeef'); // survives the runner's re-persist
+    expect(onDisk!.runner).toEqual(runner); // survives the runner's re-persist
+    expect(onDisk!.lease?.pid).toBe(runner.pid); // lease identity = the runner (D4)
     expect(onDisk!.status).toBe('done');
-  });
-});
-
-describe('runnerTmuxName', () => {
-  test('builds the orc-wf-<runId> session name', () => {
-    expect(runnerTmuxName('deadbeef')).toBe('orc-wf-deadbeef');
   });
 });
 
@@ -526,7 +526,7 @@ describe('reconcileRunStatus — stale running vs runner liveness', () => {
   test('a running record whose runner is alive stays running', () => {
     expect(reconcileRunStatus('running', true)).toBe('running');
   });
-  test('a running record with unknowable liveness (no runnerTmux) is trusted as running', () => {
+  test('a running record with unknowable liveness (no runner, no lease) is trusted as running', () => {
     expect(reconcileRunStatus('running', null)).toBe('running');
   });
   test('a finalized status is trusted regardless of liveness', () => {

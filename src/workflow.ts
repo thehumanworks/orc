@@ -11,7 +11,6 @@ import { validateAlias, readRegistry, findRecord } from './registry.ts';
 import {
   makeLease,
   isLeaseLive,
-  isFinalStatus,
   writeRunOwned,
   readRun,
   updateRun,
@@ -19,12 +18,11 @@ import {
   WORKFLOW_SCHEMA_VERSION,
   DEFAULT_LEASE_MS,
   FinalizedRunError,
+  LiveOwnerError,
   beginRunRecovery,
 } from './runs.ts';
 import { assertValidRunId, runInstructionsDir, runResultPath, runAttemptDir } from './paths.ts';
-import { sanitizeTmuxName } from './drivers/tmux.ts';
-import { getDriver } from './drivers/driver.ts';
-import type { Driver } from './drivers/driver.ts';
+import { isSameProcessAlive } from './runtime/process.ts';
 import type { Turn } from './transcript.ts';
 import type { AgentState, ExecutionPolicy, Provider } from './types.ts';
 import { ORC_ENV } from './types.ts';
@@ -45,6 +43,7 @@ import type {
   WorkflowRunStatus,
   OwnerLease,
   RunLease,
+  RunnerInfo,
 } from './run-schema.ts';
 import { TERMINAL_ATTEMPT_PHASES } from './run-schema.ts';
 
@@ -61,6 +60,7 @@ export type {
   WorkflowRunStatus,
   OwnerLease,
   RunLease,
+  RunnerInfo,
 } from './run-schema.ts';
 export { TERMINAL_ATTEMPT_PHASES } from './run-schema.ts';
 import type { VerifyDescriptor, VerifierObservation } from './verification.ts';
@@ -256,7 +256,23 @@ export interface RunWorkflowOptions {
   onEvent?: (e: WorkflowEvent) => void;
   execStep?: StepExecutor;
   runId?: string;
-  runnerTmux?: string;
+  /**
+   * The detached runner process executing this run (the `--run-id` / `--runner`
+   * entrypoints self-report it). Persisted as `run.runner`; it becomes the liveness
+   * authority. Omitted ⇒ the calling process owns the run via the lease identity.
+   */
+  runner?: RunnerInfo;
+  /**
+   * Lease renewal period while the run is in flight (default leaseMs/3). The runner
+   * heartbeats on this timer so a long step never lets a healthy lease expire.
+   */
+  heartbeatMs?: number;
+  /**
+   * Abort the runner (e.g. on SIGTERM after `orc workflow cancel`): stop launching,
+   * clear the heartbeat and return promptly WITHOUT further record writes — a finalized
+   * status is never overwritten. In-flight steps are abandoned, not awaited.
+   */
+  signal?: AbortSignal;
   sourcePath?: string;
   resume?: boolean;
   retryFromStepId?: string;
@@ -1081,7 +1097,39 @@ export function runnerLineageEnv(
   return env;
 }
 
+/** Process-level resources a run holds while it owns its record (released in `finally`). */
+interface RunLifecycle {
+  heartbeat?: ReturnType<typeof setInterval>;
+  disposers: (() => void)[];
+}
+
+function releaseLifecycle(life: RunLifecycle): void {
+  if (life.heartbeat !== undefined) clearInterval(life.heartbeat);
+  life.heartbeat = undefined;
+  for (const d of life.disposers.splice(0)) {
+    try {
+      d();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {}): Promise<WorkflowRun> {
+  const life: RunLifecycle = { disposers: [] };
+  try {
+    return await runWorkflowOwned(def, opts, life);
+  } finally {
+    // The lease heartbeat and abort listener never outlive the run (any exit path).
+    releaseLifecycle(life);
+  }
+}
+
+async function runWorkflowOwned(
+  def: WorkflowDef,
+  opts: RunWorkflowOptions,
+  life: RunLifecycle,
+): Promise<WorkflowRun> {
   // Merge CLI/daemon maxConcurrency override into the def before validation/plan.
   const defWithConc: WorkflowDef = {
     ...def,
@@ -1110,6 +1158,15 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
 
   const ownerId = opts.ownerId ?? randomUUID().slice(0, 8);
   const leaseMs = opts.leaseMs ?? DEFAULT_LEASE_MS;
+  // Lease identity = the runner when there is one, else this process (D1/D4).
+  const ownerLease = () =>
+    makeLease({
+      ownerId,
+      ...(opts.runner ? { pid: opts.runner.pid, startTime: opts.runner.startTime } : {}),
+      nowMs: nowMs(),
+      leaseMs,
+    });
+  if (opts.signal?.aborted) throw new Error(`workflow run aborted before start`);
   const existing =
     opts.continueExisting || opts.resume || opts.retryFromStepId ? await readRun(runId) : null;
   const rootRunId = opts.rootRunId ?? existing?.rootRunId ?? runId;
@@ -1135,9 +1192,8 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
     startedAt,
     status: 'running',
     finishedAt: undefined,
-    ...(opts.runnerTmux || existing?.runnerTmux
-      ? { runnerTmux: opts.runnerTmux ?? existing?.runnerTmux }
-      : {}),
+    // Only THIS invocation's runner: a previous (dead) runner is never inherited.
+    ...(opts.runner ? { runner: opts.runner } : {}),
     steps: opts.seedResults
       ? [...opts.seedResults]
       : existing?.steps
@@ -1153,12 +1209,7 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
       : existing?.attempts
         ? [...existing.attempts]
         : [],
-    lease: makeLease({
-      ownerId,
-      runnerTmux: opts.runnerTmux ?? existing?.runnerTmux,
-      nowMs: nowMs(),
-      leaseMs,
-    }),
+    lease: ownerLease(),
     ...(effectivePolicy ? { policy: effectivePolicy } : {}),
     rootRunId,
     ...(parentRunId ? { parentRunId } : {}),
@@ -1226,12 +1277,7 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
   const persist = () =>
     serialize(async () => {
       if (cancelled) return;
-      run.lease = makeLease({
-        ownerId,
-        runnerTmux: opts.runnerTmux ?? run.runnerTmux,
-        nowMs: nowMs(),
-        leaseMs,
-      });
+      run.lease = ownerLease();
       try {
         run = await writeRunOwned(run);
         emit({ type: 'lease-heartbeat', runId, expiresAt: run.lease!.expiresAt, ownerId });
@@ -1347,12 +1393,7 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
 
   const safeWriteOwned = async (): Promise<boolean> => {
     if (cancelled) return false;
-    run.lease = makeLease({
-      ownerId,
-      runnerTmux: opts.runnerTmux ?? run.runnerTmux,
-      nowMs: nowMs(),
-      leaseMs,
-    });
+    run.lease = ownerLease();
     try {
       run = await writeRunOwned(run);
       return true;
@@ -1365,6 +1406,50 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
       throw e;
     }
   };
+
+  // ── Lease heartbeat (D1): renew on a timer through the serialized write path so a
+  // step blocking far longer than leaseMs never lets a healthy owner's lease expire.
+  const stopHeartbeat = () => {
+    if (life.heartbeat !== undefined) clearInterval(life.heartbeat);
+    life.heartbeat = undefined;
+  };
+  const heartbeatMs = Math.max(10, Math.floor(opts.heartbeatMs ?? leaseMs / 3));
+  const heartbeat = () =>
+    serialize(async () => {
+      if (cancelled) {
+        stopHeartbeat();
+        return;
+      }
+      try {
+        await safeWriteOwned();
+      } catch {
+        // Transient I/O (lock timeout, disk) — the next tick retries.
+      }
+      if (cancelled) stopHeartbeat();
+    });
+  life.heartbeat = setInterval(() => {
+    void heartbeat();
+  }, heartbeatMs);
+  (life.heartbeat as { unref?: () => void }).unref?.();
+
+  // ── Abort (D5): stop launching, stop heartbeating, never write again, return promptly.
+  let aborted = false;
+  let wakeOnAbort: () => void = () => {};
+  const abortWake = new Promise<void>((resolve) => {
+    wakeOnAbort = resolve;
+  });
+  if (opts.signal) {
+    const onAbort = () => {
+      aborted = true;
+      cancelled = true;
+      stopNewLaunches = true;
+      stopHeartbeat();
+      wakeOnAbort();
+    };
+    opts.signal.addEventListener('abort', onAbort, { once: true });
+    life.disposers.push(() => opts.signal?.removeEventListener('abort', onAbort));
+    if (opts.signal.aborted) onAbort();
+  }
 
   const launchStep = async (stepId: string): Promise<void> => {
     const rawStep = stepsById.get(stepId);
@@ -1518,6 +1603,7 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
   const emittedBlocked = new Set<string>();
 
   while (true) {
+    if (aborted) break;
     if (await checkCancelled()) {
       // Cancel non-terminal pending attempts; in-flight settle below.
       break;
@@ -1564,13 +1650,23 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
       break;
     }
 
-    // Wait for any in-flight completion (bounded race — only currently running set).
-    await Promise.race([...inFlight.values()].map((f) => f.promise));
+    // Wait for any in-flight completion (bounded race — only currently running set), or
+    // an abort, which must not wait for a step that may block for minutes.
+    await Promise.race([...[...inFlight.values()].map((f) => f.promise), abortWake]);
   }
 
-  // Drain remaining in-flight after stop/cancel.
-  if (inFlight.size > 0) {
-    await Promise.all([...inFlight.values()].map((f) => f.promise));
+  // Drain remaining in-flight after stop/cancel — unless aborted (now or mid-drain).
+  if (!aborted && inFlight.size > 0) {
+    await Promise.race([Promise.all([...inFlight.values()].map((f) => f.promise)), abortWake]);
+  }
+
+  if (aborted) {
+    // Terminated (SIGTERM after cancel, or a plain kill): let an in-progress write land,
+    // then stop WITHOUT writing — a cancelled/finalized status stays as written; a
+    // still-`running` record reconciles to orphaned once this process is gone.
+    stopHeartbeat();
+    await persistChain;
+    return (await readRun(runId)) ?? run;
   }
 
   if (cancelled) {
@@ -1618,14 +1714,20 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
   run.status = allSucceeded ? 'done' : 'failed';
   if (opts.resume && defWithConc.steps.every((s) => resultsById[s.id]?.ok)) run.status = 'done';
   run.finishedAt = now();
-  run = await writeRunOwned(run);
+  stopHeartbeat();
+  await persistChain;
+  try {
+    run = await writeRunOwned(run);
+  } catch (e) {
+    // Cancelled concurrently (after the last loop check): the cancel stands.
+    if (!(e instanceof FinalizedRunError)) throw e;
+    const disk = await readRun(runId);
+    if (!disk) throw e;
+    emit({ type: 'run-done', runId, status: disk.status, run: disk });
+    return disk;
+  }
   emit({ type: 'run-done', runId, status: run.status, run });
   return run;
-}
-
-export function runnerTmuxName(runId: string): string {
-  assertValidRunId(runId);
-  return `orc-wf-${sanitizeTmuxName(runId)}`;
 }
 
 export function reconcileRunStatus(
@@ -1639,30 +1741,63 @@ export function reconcileRunStatus(
   return 'running';
 }
 
-export async function reconcileRun(run: WorkflowRun, driver: Driver = getDriver()): Promise<WorkflowRun> {
-  if (run.status !== 'running') return run;
-  let runnerAlive: boolean | null = null;
-  if (run.runnerTmux) runnerAlive = await driver.isAlive(run.runnerTmux);
-  else if (run.lease?.runnerTmux) runnerAlive = await driver.isAlive(run.lease.runnerTmux);
-  const leaseLive = run.lease
-    ? isLeaseLive(run.lease, {
-        runnerAlive: run.runnerTmux || run.lease.runnerTmux ? runnerAlive : null,
-        checkPid: !run.runnerTmux,
-      })
-    : run.runnerTmux
-      ? runnerAlive === true
+/**
+ * Liveness of a `running` record's owner (design §4.6, D1): the detached `runner`
+ * process (pid + start time) when there is one — a legacy tmux runner is always dead —
+ * and the lease (not expired AND its owner alive). Null = unknowable (trusted).
+ */
+export function runOwnerLiveness(run: WorkflowRun): {
+  runnerAlive: boolean | null;
+  leaseLive: boolean | null;
+} {
+  const runnerAlive = run.runner
+    ? isSameProcessAlive(run.runner)
+    : run.legacyRunnerTmux
+      ? false
       : null;
+  const leaseLive = run.lease
+    ? isLeaseLive(run.lease, { runnerAlive, runner: run.runner ?? null })
+    : null;
+  return { runnerAlive, leaseLive };
+}
+
+/**
+ * Don't trust a stale `running`: when its owner is dead (runner gone, lease expired or
+ * its owner process gone) persist and return `orphaned` (resumable). The write is
+ * conditional on the record being unchanged since it was judged, so a live owner's
+ * concurrent write is never clobbered.
+ */
+export async function reconcileRun(run: WorkflowRun): Promise<WorkflowRun> {
+  if (run.status !== 'running') return run;
+  const { runnerAlive, leaseLive } = runOwnerLiveness(run);
   const effective = reconcileRunStatus(run.status, runnerAlive, { leaseLive });
   if (effective === run.status) return run;
-  if (isFinalStatus(run.status)) return run;
   try {
-    return await writeRunOwned({
-      ...run,
-      status: effective,
-      finishedAt: run.finishedAt ?? new Date().toISOString(),
-    });
+    const written = await updateRun(run.id, (cur) =>
+      cur && cur.status === 'running' && (cur.revision ?? 0) === (run.revision ?? 0)
+        ? { ...cur, status: effective, finishedAt: cur.finishedAt ?? new Date().toISOString() }
+        : null,
+    );
+    return written ?? run;
   } catch {
     return (await readRun(run.id)) ?? run;
+  }
+}
+
+/**
+ * Status preconditions shared by foreground and detached resume/retry (D7): a `done`
+ * run is never resurrected, a `cancelled` run can only be retried, and a `running`
+ * run must have a dead owner (pass the RECONCILED record).
+ */
+export function assertRecoveryAllowed(run: WorkflowRun, action: 'resume' | 'retry'): void {
+  if (run.status === 'done') {
+    throw new FinalizedRunError(run.id, run.status);
+  }
+  if (run.status === 'cancelled' && action === 'resume') {
+    throw new Error(`run '${run.id}' is cancelled; use retry to create new attempts`);
+  }
+  if (run.status === 'running') {
+    throw new LiveOwnerError(run.id, run.runner?.pid ?? run.lease?.pid ?? 0);
   }
 }
 
@@ -1697,7 +1832,10 @@ export interface ResumeOptions {
   execStep?: StepExecutor;
   sourcePath?: string;
   workflowSourcePath?: string;
-  runnerTmux?: string;
+  /** The detached runner performing this resume/retry (see RunWorkflowOptions.runner). */
+  runner?: RunnerInfo;
+  /** Abort the runner (see RunWorkflowOptions.signal). */
+  signal?: AbortSignal;
   leaseMs?: number;
   ownerId?: string;
   allowUnknownDeliveryRetry?: boolean;
@@ -1709,6 +1847,8 @@ export interface RetryOptions extends ResumeOptions {
 
 export interface CancelOptions {
   cascade?: boolean;
+  /** SIGTERM the run's live detached runner (default true). */
+  signalRunner?: boolean;
   onEvent?: (e: WorkflowEvent) => void;
   killSession?: (sessionId: string) => Promise<void>;
   reason?: string;
@@ -1779,7 +1919,7 @@ export async function resumeWorkflow(
     existing = await beginRunRecovery(runId, {
       ownerId: opts.ownerId,
       leaseMs: opts.leaseMs,
-      runnerTmux: opts.runnerTmux ?? existing.runnerTmux,
+      runner: opts.runner,
       reason: 'resume',
     });
   }
@@ -1791,7 +1931,8 @@ export async function resumeWorkflow(
     onEvent: opts.onEvent,
     execStep: opts.execStep,
     sourcePath,
-    runnerTmux: opts.runnerTmux ?? existing.runnerTmux,
+    runner: opts.runner,
+    signal: opts.signal,
     leaseMs: opts.leaseMs,
     ownerId: opts.ownerId,
     rootRunId: existing.rootRunId ?? existing.id,
@@ -1822,7 +1963,7 @@ export async function retryWorkflow(
     existing = await beginRunRecovery(runId, {
       ownerId: opts.ownerId,
       leaseMs: opts.leaseMs,
-      runnerTmux: opts.runnerTmux ?? existing.runnerTmux,
+      runner: opts.runner,
       reason: 'retry',
       allowCancelled: true,
     });
@@ -1835,12 +1976,24 @@ export async function retryWorkflow(
     onEvent: opts.onEvent,
     execStep: opts.execStep,
     sourcePath,
-    runnerTmux: opts.runnerTmux ?? existing.runnerTmux,
+    runner: opts.runner,
+    signal: opts.signal,
     leaseMs: opts.leaseMs,
     ownerId: opts.ownerId,
     rootRunId: existing.rootRunId ?? existing.id,
     parentRunId: existing.parentRunId,
   });
+}
+
+/** Signal a run's detached runner iff it is still that same process (never ourselves). */
+function signalRunner(runner: RunnerInfo | undefined, signal: NodeJS.Signals): boolean {
+  if (!runner || runner.pid === process.pid || !isSameProcessAlive(runner)) return false;
+  try {
+    process.kill(runner.pid, signal);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function cancelWorkflow(runId: string, opts: CancelOptions = {}): Promise<WorkflowRun> {
@@ -1852,8 +2005,10 @@ export async function cancelWorkflow(runId: string, opts: CancelOptions = {}): P
       /* ignore */
     }
   };
+  let runner: RunnerInfo | undefined;
   const run = await updateRun(runId, (cur) => {
     if (!cur) return null;
+    runner = cur.runner;
     if (cur.status === 'cancelled') return cur;
     if (cur.status === 'done' || cur.status === 'failed') return cur;
     const ts = new Date().toISOString();
@@ -1881,6 +2036,10 @@ export async function cancelWorkflow(runId: string, opts: CancelOptions = {}): P
   });
   if (!run) throw new Error(`no run found for '${runId}'`);
   emit({ type: 'run-cancel', runId, cascade: opts.cascade === true });
+  // D5: a live detached runner is told to stop now (it exits without overwriting the
+  // cancelled status) instead of noticing at its next write. The runner pid only —
+  // agent sessions are governed by --cascade.
+  if (run.status === 'cancelled' && opts.signalRunner !== false) signalRunner(runner, 'SIGTERM');
   if (opts.cascade) {
     const root = run.rootRunId ?? run.id;
     const records = await readRegistry();

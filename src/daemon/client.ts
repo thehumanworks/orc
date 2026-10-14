@@ -39,6 +39,17 @@ export type LogsResult =
   | { kind: 'parsed'; logs: { step: string; provider: string; turns: Turn[] }[] }
   | { kind: 'raw'; logs: { step: string; provider: string; pane: string }[] };
 
+/**
+ * Detached `run`/`resume`/`retry` response: the run id and the HOST-LOCAL runner log
+ * (follow it on the host with `orc workflow attach <runId>`). `action` is set for
+ * resume/retry.
+ */
+export interface DetachedWorkflowLaunch {
+  runId: string;
+  logPath: string;
+  action?: 'resume' | 'retry';
+}
+
 export interface WaitResult {
   id: string;
   state: string;
@@ -248,27 +259,25 @@ export class DaemonClient {
     detach?: boolean;
     /** Positive integer; omit for workflow default (1). */
     maxConcurrency?: number;
-  }): Promise<WorkflowRun | { runId: string; runnerTmux: string }> {
-    return this.post('/workflows/run', body) as Promise<
-      WorkflowRun | { runId: string; runnerTmux: string }
-    >;
+  }): Promise<WorkflowRun | DetachedWorkflowLaunch> {
+    return this.post('/workflows/run', body) as Promise<WorkflowRun | DetachedWorkflowLaunch>;
   }
 
   async resumeWorkflow(
     id: string,
     body?: { file?: string; detach?: boolean },
-  ): Promise<WorkflowRun | { runId: string; runnerTmux: string; action?: string }> {
+  ): Promise<WorkflowRun | DetachedWorkflowLaunch> {
     return this.post(`/workflows/runs/${encodeURIComponent(id)}/resume`, body ?? {}) as Promise<
-      WorkflowRun | { runId: string; runnerTmux: string; action?: string }
+      WorkflowRun | DetachedWorkflowLaunch
     >;
   }
 
   async retryWorkflow(
     id: string,
     body?: { file?: string; step?: string; stepId?: string; detach?: boolean },
-  ): Promise<WorkflowRun | { runId: string; runnerTmux: string; action?: string }> {
+  ): Promise<WorkflowRun | DetachedWorkflowLaunch> {
     return this.post(`/workflows/runs/${encodeURIComponent(id)}/retry`, body ?? {}) as Promise<
-      WorkflowRun | { runId: string; runnerTmux: string; action?: string }
+      WorkflowRun | DetachedWorkflowLaunch
     >;
   }
 

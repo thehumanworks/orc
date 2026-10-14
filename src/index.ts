@@ -30,9 +30,10 @@ export {
   interpolate,
   evaluateStep,
   stepOutcomeFromWait,
-  runnerTmuxName,
   reconcileRunStatus,
   reconcileRun,
+  runOwnerLiveness,
+  assertRecoveryAllowed,
   assembleStepLogs,
   resolveContainedWorkflowFile,
   workflowImportRoots,
@@ -83,6 +84,7 @@ export type {
   WorkflowPlan,
   PlanStep,
   RunLease,
+  RunnerInfo,
   OwnerLease,
   WorkflowRunStatus,
   ResumeOptions,
@@ -101,7 +103,22 @@ export {
   runArtifactsDir,
   runResultPath,
   runAttemptDir,
+  runnerLogPath,
 } from './paths.ts';
+export {
+  launchDetachedRun,
+  launchDetachedRecovery,
+  followRunnerLog,
+  trapRunnerTermination,
+  currentRunnerInfo,
+  RunnerSpawnError,
+} from './workflow-runner.ts';
+export type {
+  RunnerSpawner,
+  LaunchRunnerOptions,
+  DetachedLaunch,
+  FollowRunnerLogOptions,
+} from './workflow-runner.ts';
 export {
   runVerify,
   executeVerify,
@@ -188,8 +205,10 @@ export {
   latestAttempt,
   patchAttempt,
   classifyOwnerLiveness,
+  stampRunner,
   CasConflictError,
   FinalizedRunError,
+  LiveOwnerError,
   RUN_SCHEMA_VERSION,
   WORKFLOW_SCHEMA_VERSION,
   DEFAULT_LEASE_MS,

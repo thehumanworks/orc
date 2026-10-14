@@ -148,7 +148,13 @@ export function publicRunView(run: WorkflowRun): Record<string, unknown> {
       ? {
           ownerId: run.lease.ownerId,
           expiresAt: run.lease.expiresAt,
-          runnerTmux: run.lease.runnerTmux,
+        }
+      : undefined,
+    runner: run.runner
+      ? {
+          pid: run.runner.pid,
+          startedAt: run.runner.startedAt,
+          logPath: run.runner.logPath,
         }
       : undefined,
     steps: run.steps.map((s) => ({
@@ -199,6 +205,11 @@ export function renderRunDetail(run: WorkflowRun): string {
     run.definitionDigest ? `digest:     ${run.definitionDigest.slice(0, 16)}…` : null,
     `maxConc:    ${maxConcurrency}`,
     run.lease ? `lease:      owner=${run.lease.ownerId} exp=${run.lease.expiresAt}` : null,
+    run.runner
+      ? `runner:     pid=${run.runner.pid} started=${run.runner.startedAt} log=${run.runner.logPath}`
+      : run.legacyRunnerTmux
+        ? `runner:     legacy tmux runner (gone; resumable)`
+        : null,
     `steps:      ${run.steps.length}`,
     run.attempts?.length ? `attempts:   ${run.attempts.length}` : null,
   ].filter((l): l is string => l !== null);
@@ -276,14 +287,16 @@ workflow subcommands:
                                       Import the file's default-exported WorkflowDef and
                                       run it, streaming step events (or --json the final WorkflowRun).
                                       Exits non-zero if the run failed. --detach runs it as a
-                                      detached tmux session (orc-wf-<runId>) and returns the runId.
+                                      detached runner process and returns the runId immediately
+                                      (--json: {runId,logPath}); its output goes to
+                                      ~/.orc/runs/<runId>/runner.log.
                                       --max-concurrency N (positive int; default 1) allows
                                       dependency-free steps to run concurrently (DAG needs[]).
-                                      immediately (--json: {runId,runnerTmux}).
   orc workflow list [--json]          List persisted runs from ~/.orc/runs/ (newest first)
   orc workflow status <runId> [--json]  Print a run record (per-step state + attempts). A \`running\`
                                       record whose owner lease/runner has died is reported \`orphaned\`.
-  orc workflow attach <runId> [--read-only]  Print the tmux attach command for a --detach run's runner
+  orc workflow attach <runId> [--json]  Follow a --detach run's runner log until the run ends
+                                      (Ctrl-C stops following); --json prints {runId,logPath,runner}.
   orc workflow logs <runId> [--step <id>] [--raw] [--json]  Per-step transcript ('### step <id>
                                       (<provider>)'). --raw shows the live pane; --json emits
                                       {step,turns}[] (or {step,provider,pane}[] with --raw).
@@ -328,7 +341,7 @@ daemon + remote (drive agents on other orc hosts over tailscale):
                         instead of locally — list/spawn/send/read/wait/state/kill/workflow.
                         Output (and --json) is identical to local. Sends Bearer from
                         \$ORC_DAEMON_TOKEN and/or x-orc-secret from \$ORC_DAEMON_SECRET when set.
-                        Remote attach prints a tailscale ssh hint (tmux is host-local).
+                        Remote attach prints a tailscale ssh hint (attach is host-local).
   orc list --all-hosts  Fleet view: aggregate local + every trusted peer, with a host column.
 
 Global:

@@ -7,6 +7,7 @@
  */
 import type { AgentState, Provider, ExecutionPolicy } from './types.ts';
 import type { DeliveryPhase } from './messages.ts';
+import type { ProcessIdentity } from './runtime/types.ts';
 
 export type { AgentState, Provider, ExecutionPolicy };
 
@@ -225,10 +226,28 @@ export interface WorkflowPlan {
 
 export interface RunLease {
   ownerId: string;
+  /**
+   * Pid of the process that wrote the lease. When the run has a `runner`, the runner
+   * identity is the liveness authority and this is informational; otherwise liveness
+   * = lease not expired AND this process (pid + startTime) still alive. 0 = unknown.
+   */
   pid?: number;
-  runnerTmux?: string;
+  /** Start-time token of `pid` (pid-reuse guard); null/absent = pid-only check. */
+  startTime?: string | null;
   updatedAt: string;
   expiresAt: string;
+}
+
+/**
+ * A detached workflow runner process (`orc workflow run --detach`, detached
+ * resume/retry, daemon-spawned runs): a plain detached process whose stdout/stderr
+ * go to `logPath` (~/.orc/runs/<runId>/runner.log).
+ */
+export interface RunnerInfo extends ProcessIdentity {
+  /** Append-only runner stdout/stderr log (followed by `orc workflow attach`). */
+  logPath: string;
+  /** ISO time the runner was spawned. */
+  startedAt: string;
 }
 
 /** @deprecated alias for RunLease */
@@ -249,7 +268,14 @@ export interface WorkflowRun {
   startedAt: string;
   finishedAt?: string;
   status: WorkflowRunStatus;
-  runnerTmux?: string;
+  /** Detached runner process that owns this run (absent for foreground/SDK runs). */
+  runner?: RunnerInfo;
+  /**
+   * READ-ONLY legacy marker: the pre-v5 tmux runner session name, mapped by
+   * `normalizeRun` from the legacy top-level or lease tmux-runner field. Treated as a
+   * dead runner (→ orphaned, resumable). Never written back to disk.
+   */
+  legacyRunnerTmux?: string;
   steps: StepResult[];
   plan?: WorkflowPlan;
   attempts?: StepAttempt[];

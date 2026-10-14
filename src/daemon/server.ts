@@ -11,7 +11,6 @@
  */
 import path from 'node:path';
 import os from 'node:os';
-import { randomUUID } from 'node:crypto';
 import { agent } from '../agent.ts';
 import { listSessions, getSession } from '../index.ts';
 import {
@@ -20,20 +19,16 @@ import {
   retryWorkflow,
   cancelWorkflow,
   cleanupWorkflow,
-  runnerTmuxName,
   reconcileRun,
   assembleStepLogs,
   validateWorkflowDef,
   resolveContainedWorkflowFile,
-  runnerLineageEnv,
-  buildPlan,
-  planDigest,
 } from '../workflow.ts';
 import type { WorkflowDef, WorkflowRun, StepResult } from '../workflow.ts';
 import { schedulingSummary } from '../workflow-scheduler.ts';
-import { readRun, listRuns, writeRun, writeRunOwned, makeLease, WORKFLOW_SCHEMA_VERSION } from '../runs.ts';
-import { getDriver } from '../drivers/driver.ts';
-import { orcHome } from '../paths.ts';
+import { readRun, listRuns, FinalizedRunError, LiveOwnerError } from '../runs.ts';
+import { launchDetachedRecovery, launchDetachedRun, RunnerSpawnError } from '../workflow-runner.ts';
+import type { RunnerSpawner } from '../workflow-runner.ts';
 import { selectTurns } from '../transcript.ts';
 import type { TurnSelection } from '../transcript.ts';
 import { isAllowlisted } from './trust.ts';
@@ -70,12 +65,13 @@ function publicWorkflowRunView(run: WorkflowRun): Record<string, unknown> {
     definitionDigest: run.definitionDigest,
     maxConcurrency: sched?.maxConcurrency ?? run.plan?.maxConcurrency ?? 1,
     policy: run.policy,
-    runnerTmux: run.runnerTmux,
+    // Host-local log path is deliberately not exposed: remote attach follows it ON the
+    // host (`tailscale ssh <host> orc workflow attach <runId>`).
+    runner: run.runner ? { pid: run.runner.pid, startedAt: run.runner.startedAt } : undefined,
     lease: run.lease
       ? {
           ownerId: run.lease.ownerId,
           expiresAt: run.lease.expiresAt,
-          runnerTmux: run.lease.runnerTmux,
         }
       : undefined,
     steps: run.steps.map((s) => ({
@@ -147,6 +143,8 @@ export interface DaemonOptions {
   resolveIp?: (req: Request, server: Bun.Server<undefined>) => string | null;
   /** Resolve a source IP to a tailnet identity. Default `whoisIdentity`. Injectable for tests. */
   whois?: (ip: string | null) => Promise<Identity | null>;
+  /** Spawner for detached workflow runners. Default `spawnDetached`. Injectable for tests. */
+  spawnRunner?: RunnerSpawner;
 }
 
 /** A handler error carrying an HTTP status; the outer catch maps it to a JSON response. */
@@ -261,6 +259,7 @@ export function createFetch(opts: DaemonOptions): (req: Request, server: Bun.Ser
         allowlist,
         principal: authn.principal,
         versionPromise,
+        spawnRunner: opts.spawnRunner,
       });
     } catch (e) {
       if (e instanceof HttpError) return jsonError(e.status, e.message);
@@ -275,6 +274,7 @@ interface DispatchCtx {
   allowlist: string[];
   principal: Principal;
   versionPromise: Promise<string>;
+  spawnRunner?: RunnerSpawner;
 }
 
 /** Route a matched request to the SDK and build its JSON response. */
@@ -462,7 +462,7 @@ async function dispatch(
     }
 
     case 'workflows.run':
-      return runWorkflowRoute(req);
+      return runWorkflowRoute(req, ctx);
 
     case 'workflows.runs.resume': {
       const runId = params.id!;
@@ -490,7 +490,7 @@ async function dispatch(
       }
       const { def, absPath } = await importWorkflowFileWithPath(file);
       if (body.detach === true) {
-        return detachWorkflowControl('resume', runId, absPath, existing);
+        return detachWorkflowControl('resume', runId, absPath, ctx);
       }
       try {
         const run = await resumeWorkflow(runId, def, { sourcePath: absPath });
@@ -536,7 +536,7 @@ async function dispatch(
             : undefined;
       const { def, absPath } = await importWorkflowFileWithPath(file);
       if (body.detach === true) {
-        return detachWorkflowControl('retry', runId, absPath, existing, stepId);
+        return detachWorkflowControl('retry', runId, absPath, ctx, stepId);
       }
       try {
         const run = await retryWorkflow(runId, def, { sourcePath: absPath, stepId });
@@ -600,10 +600,11 @@ function parseBodyMaxConcurrency(body: Record<string, unknown>): number | undefi
  * `POST /workflows/run {file?, def?, detach?, maxConcurrency?}`. Foreground: run a def
  * (inline `def`, or imported from the host-local `file`) to completion and return the
  * `WorkflowRun`. Detach: mint a runId, write an initial `running` record, and launch a
- * detached `orc workflow run <file> --run-id <id>` runner (mirrors the CLI `--detach`
- * path) — returns `{ runId, runnerTmux }` immediately. Detach requires `file`.
+ * detached `orc workflow run <file> --run-id <id>` runner process (the same helper as
+ * the CLI `--detach` path) — returns `{ runId, logPath }` immediately. Detach requires
+ * `file`.
  */
-async function runWorkflowRoute(req: Request): Promise<Response> {
+async function runWorkflowRoute(req: Request, ctx: DispatchCtx): Promise<Response> {
   const body = await readJsonBody(req);
   const file = typeof body.file === 'string' ? body.file : undefined;
   const detach = body.detach === true;
@@ -612,47 +613,18 @@ async function runWorkflowRoute(req: Request): Promise<Response> {
   if (detach) {
     if (!file) throw new HttpError(400, 'workflow run --detach requires a `file` (a host-local path)');
     const def = await importWorkflowFile(file);
-    const defForPlan: WorkflowDef =
-      maxConcurrency !== undefined ? { ...def, maxConcurrency } : def;
     try {
-      validateWorkflowDef(defForPlan);
+      const launch = await launchDetachedRun(def, path.resolve(file), {
+        maxConcurrency,
+        spawn: ctx.spawnRunner,
+      });
+      return json({ runId: launch.runId, logPath: launch.logPath });
     } catch (e) {
+      if (e instanceof RunnerSpawnError) {
+        throw new HttpError(500, `failed to launch detached runner: ${e.message}`);
+      }
       throw new HttpError(400, (e as Error).message);
     }
-    const runId = randomUUID().slice(0, 8);
-    const runnerTmux = runnerTmuxName(runId);
-    const plan = buildPlan(defForPlan);
-    const run: WorkflowRun = {
-      schemaVersion: WORKFLOW_SCHEMA_VERSION,
-      revision: 0,
-      id: runId,
-      name: def.name,
-      startedAt: new Date().toISOString(),
-      status: 'running',
-      runnerTmux,
-      steps: [],
-      plan,
-      definitionDigest: planDigest(plan),
-      sourcePath: path.resolve(file),
-      attempts: [],
-      lease: makeLease({ runnerTmux }),
-      rootRunId: runId,
-    };
-    await writeRun(run);
-    const cliEntry = path.resolve(import.meta.dir, '../cli/index.ts');
-    const argv = [process.execPath, cliEntry, 'workflow', 'run', path.resolve(file), '--run-id', runId];
-    if (maxConcurrency !== undefined) {
-      argv.push('--max-concurrency', String(maxConcurrency));
-    }
-    try {
-      await getDriver().spawn({ name: runnerTmux, cwd: process.cwd(), argv, env: { ORC_HOME: orcHome() } });
-    } catch (e) {
-      run.status = 'failed';
-      run.finishedAt = new Date().toISOString();
-      await writeRun(run).catch(() => {});
-      throw new HttpError(500, `failed to launch detached runner: ${(e as Error).message}`);
-    }
-    return json({ runId, runnerTmux });
   }
 
   // Foreground: resolve the def from `def` or by importing `file`.
@@ -707,55 +679,36 @@ async function importWorkflowFileWithPath(
 }
 
 /**
- * Detached resume/retry: spawn `orc workflow resume|retry <runId> <file>` in tmux.
- * Returns `{ runId, runnerTmux, action }` immediately.
+ * Detached resume/retry: the same status preconditions as the foreground paths (a
+ * `done` run is never resurrected → 409), then spawn `orc workflow resume|retry <runId>
+ * <file> --runner` as a detached process and only THEN stamp the record (D7) — a spawn
+ * failure leaves the record untouched. Returns `{ runId, logPath, action }`.
  */
 async function detachWorkflowControl(
   mode: 'resume' | 'retry',
   runId: string,
   absPath: string,
-  existing: WorkflowRun,
+  ctx: DispatchCtx,
   stepId?: string,
 ): Promise<Response> {
-  const runnerTmux = existing.runnerTmux ?? runnerTmuxName(runId);
-  const stamped: WorkflowRun = {
-    ...existing,
-    status: 'running',
-    finishedAt: undefined,
-    runnerTmux,
-    lease: makeLease({ runnerTmux }),
-    sourcePath: absPath,
-    workflowSourcePath: absPath,
-  };
   try {
-    await writeRunOwned(stamped);
-  } catch {
-    await writeRun(stamped);
-  }
-  const cliEntry = path.resolve(import.meta.dir, '../cli/index.ts');
-  const argv = [
-    process.execPath,
-    cliEntry,
-    'workflow',
-    mode,
-    runId,
-    absPath,
-    ...(mode === 'retry' && stepId ? ['--step', stepId] : []),
-  ];
-  try {
-    await getDriver().spawn({
-      name: runnerTmux,
-      cwd: process.cwd(),
-      argv,
-      env: {
-        ORC_HOME: orcHome(),
-        ...runnerLineageEnv({ ...existing, id: runId }),
-      },
+    const launch = await launchDetachedRecovery(mode, runId, absPath, {
+      stepId,
+      spawn: ctx.spawnRunner,
     });
+    return json({ runId, logPath: launch.logPath, action: mode });
   } catch (e) {
-    throw new HttpError(500, `failed to launch detached ${mode}: ${(e as Error).message}`);
+    if (e instanceof RunnerSpawnError) {
+      throw new HttpError(500, `failed to launch detached ${mode}: ${e.message}`);
+    }
+    if (e instanceof FinalizedRunError || e instanceof LiveOwnerError) {
+      throw new HttpError(409, e.message);
+    }
+    const msg = (e as Error).message;
+    if (/no run found/.test(msg)) throw new HttpError(404, msg);
+    if (/cancelled/.test(msg)) throw new HttpError(409, msg);
+    throw e;
   }
-  return json({ runId, runnerTmux, action: mode });
 }
 
 /**
