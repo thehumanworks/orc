@@ -42,6 +42,8 @@ if (modelIdx >= 0 && !MODEL) {
 }
 const KEEP = args.includes('--keep');
 const TURN_MS = 120_000;
+/** claude's initialize can be slow with many MCP servers / plugins configured. */
+const READY_MS = 45_000;
 
 // ---------------------------------------------------------------------------------
 // helpers
@@ -168,7 +170,7 @@ try {
     const rt = await startClaudeRuntime(mkLaunch(false));
     live.push(rt);
     A = new Tap(rt);
-    const ready = await A.waitFor<'ready'>((e) => e.type === 'ready', 10_000);
+    const ready = await A.waitFor<'ready'>((e) => e.type === 'ready', READY_MS);
     check(ready.providerSessionId === sid, 'ready.providerSessionId mismatch');
     check(ready.info?.pid === rt.pid, 'initialize pid != spawned pid');
     versionSeen = String(ready.info?.claude_code_version ?? '?');
@@ -243,7 +245,7 @@ try {
     const rt = await startClaudeRuntime(mkLaunch(true));
     live.push(rt);
     B = new Tap(rt);
-    const ready = await B.waitFor<'ready'>((e) => e.type === 'ready', 10_000);
+    const ready = await B.waitFor<'ready'>((e) => e.type === 'ready', READY_MS);
     check(ready.transcriptPath && fs.existsSync(ready.transcriptPath), 'ready.transcriptPath missing');
     await rt.send('r1', 'What codeword did I ask you to remember? Reply with only the codeword.');
     const out = await B.outcome('r1');

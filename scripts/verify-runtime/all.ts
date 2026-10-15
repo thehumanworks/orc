@@ -429,8 +429,11 @@ function mkRepo(dir: string, env: Record<string, string>): void {
     const r = Bun.spawnSync(['git', ...args], { cwd: dir, env, stdout: 'ignore', stderr: 'pipe' });
     if (r.exitCode !== 0) throw new Error(`git ${args[0]}: ${r.stderr.toString().trim()}`);
   };
-  git(['init', '-q']);
-  git(['-c', 'user.name=orc-verify', '-c', 'user.email=orc-verify@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'init']);
+  // Neutral settings: no hooks, no signing prompts (a signed-commit setup would block), no
+  // default-branch hint. The user's git config is read, never written.
+  const neutral = ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-c', 'init.defaultBranch=main'];
+  git([...neutral, 'init', '-q']);
+  git([...neutral, '-c', 'user.name=orc-verify', '-c', 'user.email=orc-verify@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'init']);
 }
 
 // ---------------------------------------------------------------------------------
@@ -516,7 +519,10 @@ async function cliE2E(p: Provider, ctx: Ctx, model: string | undefined): Promise
       check(gone, `the pre-crash provider ${oldProvider?.pid} is still running`);
       const others = liveProcs().filter((x) => x.cmd.includes(sid) && !x.cmd.includes('__actor') && x.pid !== fresh.pid);
       check(others.length === 0, `other live processes for the session: ${others.map((o) => o.pid).join(',')}`);
-      return `pre-crash provider ${oldProvider?.pid ?? '?'} gone; one live provider ${fresh.pid}`;
+      // codex app-server's argv carries no session id, so the argv scan cannot see a stray
+      // codex; the pid + start-time checks on the recorded providers still hold.
+      const how = p === 'codex' ? ' (codex: pid + start-time identity only; no session id in its argv)' : '';
+      return `pre-crash provider ${oldProvider?.pid ?? '?'} gone; one live provider ${fresh.pid}${how}`;
     });
     await s.step('e2e takeover → resume command; send refused', async () => {
       const live = notePids().provider;
@@ -759,7 +765,10 @@ async function main(): Promise<number> {
   // 1. preflight
   console.log('\n[1/4] preflight');
   const available: Provider[] = [];
-  const providerInfo: Record<string, { selected: boolean; bin?: string; version?: string; overridden?: boolean }> = {};
+  const providerInfo: Record<
+    string,
+    { selected: boolean; bin?: string; version?: string; overridden?: boolean; model?: string }
+  > = {};
   for (const p of PROVIDERS) {
     if (!args.providers.includes(p)) {
       providerInfo[p] = { selected: false };
@@ -772,8 +781,17 @@ async function main(): Promise<number> {
       continue;
     }
     const version = versionOf(bin, env);
-    providerInfo[p] = { selected: true, bin: sanitize(bin), version: sanitize(version), overridden: !!args.bin[p] };
+    providerInfo[p] = {
+      selected: true,
+      bin: sanitize(bin),
+      version: sanitize(version),
+      overridden: !!args.bin[p],
+      model: args.model[p] ?? '(provider default)',
+    };
     record(p, 'preflight', 'PASS', `${bin} — ${version}${args.bin[p] ? ' (override)' : ''}`);
+    if (!args.model[p]) {
+      console.log(`  note  ${p} will use your default model (pass --${p}-model <cheap model> to choose)`);
+    }
     available.push(p);
   }
 
