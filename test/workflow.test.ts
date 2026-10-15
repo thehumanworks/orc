@@ -308,14 +308,14 @@ describe('deliverInstructions — large input becomes a SHORT pointer + a file',
     await freshHome();
   });
 
-  /** Stub session capturing what would be sent to the pane (no live agent). */
+  /** Stub session capturing what would be sent (no live agent). */
   function stubSession(): { session: Pick<Session, 'send'>; sent: string[] } {
     const sent: string[] = [];
     return {
       session: {
         send: async (p: string) => {
           sent.push(p);
-          return { phase: 'acknowledged' as const, attempts: 1 };
+          return { phase: 'acknowledged' as const, messageId: 'm', replayed: false };
         },
       },
       sent,

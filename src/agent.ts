@@ -1,29 +1,48 @@
 /**
- * agent() — the core primitive. Validates options, resolves system prompt / agent
- * body, optionally creates a worktree, spawns the provider TUI in a detached driver
- * session, boots it (auto-confirm trust dialogs, wait for ready), then optionally
- * sends the initial prompt.
+ * agent() — the core primitive. Validates options, resolves the system prompt / agent
+ * body, optionally creates a worktree, writes the session's spawn spec and starts its
+ * detached actor (src/runtime/client.ts `createSession`), waits for the provider to be
+ * ready, then sends the initial prompt through the durable inbox.
  */
 import fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
-import { getDriver } from './drivers/driver.ts';
-import { sanitizeTmuxName } from './drivers/tmux.ts';
-import { getProvider } from './providers/provider.ts';
-import type { BuildCtx } from './providers/provider.ts';
+import { sanitizeLabel } from './naming.ts';
 import { effectiveAgentModel, resolveAgentDef } from './agentdefs.ts';
 import { createWorktree, gitToplevel, isInsideGitRepo, removeWorktree } from './worktree.ts';
 import { removeRecord, reserveRecord, upsertRecord, validateAlias } from './registry.ts';
-import { piSessionDir, sessionInstructionsPath } from './paths.ts';
+import { piSessionDir } from './paths.ts';
 import { Session } from './session.ts';
 import { withLock } from './lock.ts';
 import type { AgentOptions, Provider, SessionRecord, SystemPromptMode } from './types.ts';
-import { removeSessionInstructions } from './session-files.ts';
+import { removeSessionDir, writeSystemPromptFile } from './session-files.ts';
 import {
   resolveLineage,
   enforceSpawnPolicy,
   lineageEnv,
   validateExecutionPolicy,
 } from './lineage.ts';
+import { createSession, stop as kernelStop } from './runtime/client.ts';
+import { RUNTIME_SCHEMA_VERSION } from './runtime/types.ts';
+import { readSpawnSpec } from './runtime/spec.ts';
+import type { SpawnSpec } from './runtime/types.ts';
+
+/**
+ * Test seam: when set, sessions are started on the scripted `fake` provider runtime
+ * (src/runtime/providers/fake.ts) instead of the real CLI. Value: a JSON FakeScript, or
+ * `1` for the default script. Works from source only (the fake child is a .ts file).
+ */
+export const FAKE_PROVIDER_ENV = 'ORC_TEST_FAKE_PROVIDER';
+
+function fakeScriptFromEnv(env: NodeJS.ProcessEnv = process.env): unknown | undefined {
+  const raw = env[FAKE_PROVIDER_ENV];
+  if (raw === undefined || raw === '' || raw === '0') return undefined;
+  if (raw === '1' || raw === 'true') return {};
+  try {
+    return JSON.parse(raw) as unknown;
+  } catch {
+    throw new Error(`${FAKE_PROVIDER_ENV} must be '1' or a JSON fake script`);
+  }
+}
 
 const VALID_PROVIDERS: Provider[] = ['claude', 'codex', 'pi'];
 
@@ -51,16 +70,14 @@ export async function agent(opts: AgentOptions): Promise<Session> {
   // Explicit options override inherited ORC_* environment lineage.
   const lineage = resolveLineage(opts, process.env);
   const provider = opts.provider;
-  const adapter = getProvider(provider);
-  const driver = getDriver(opts.driver ?? 'tmux');
   const systemPromptMode: SystemPromptMode = opts.systemPromptMode ?? 'append';
   const alias = validateAlias(opts.alias);
 
   // Base cwd → realpath.
   const baseCwd = await fs.realpath(opts.cwd ?? process.cwd());
 
-  // Generate our handle uuid. claude/pi pass it as --session-id; for codex it's the
-  // handle only (the codex-side id is discovered later at transcript() time).
+  // Generate our handle uuid: the kernel session id (claude/pi also use it as their
+  // --session-id; codex assigns its own thread id, recorded as providerSessionId).
   const sessionId = randomUUID();
   const shortId = sessionId.slice(0, 8);
 
@@ -100,21 +117,16 @@ export async function agent(opts: AgentOptions): Promise<Session> {
   // is the project home — so a worktree agent belongs to the same workspace as the repo.
   const workspace = await resolveWorkspace(opts.workspace, baseCwd);
 
-  // tmux session name: orc-<agentLabel>-<shortId>. Alias intentionally does not affect it.
-  const agentLabel = sanitizeTmuxName(opts.agentName ?? provider);
-  const tmuxName = `orc-${agentLabel}-${shortId}`;
+  // Worktree label (branch `orc/<label>/<shortId>`). Alias intentionally does not affect it.
+  const agentLabel = sanitizeLabel(opts.agentName ?? provider);
 
   // pi needs a session dir.
   const sessionDir = piSessionDir(sessionId);
 
-  // Codex persona lives under orc-owned state (not cwd/AGENTS.md). Path is unique per
-  // sessionId and only allocated when a non-empty system/agent prompt will be injected.
-  const needsCodexInstructions =
-    provider === 'codex' &&
-    Boolean(resolvedSystemPrompt && resolvedSystemPrompt.trim().length > 0);
-  const instructionsPath = needsCodexInstructions
-    ? sessionInstructionsPath(sessionId)
-    : undefined;
+  // Every provider reads its system prompt from an orc-owned file (never argv, never the
+  // cwd): ~/.orc/sessions/<sid>/system-prompt.md. claude's native --agent needs none.
+  const systemPromptText =
+    resolvedSystemPrompt && resolvedSystemPrompt.trim().length > 0 ? resolvedSystemPrompt : undefined;
 
   let cwd = baseCwd;
   let worktreePath: string | undefined;
@@ -123,18 +135,17 @@ export async function agent(opts: AgentOptions): Promise<Session> {
   let record: SessionRecord = {
     id: shortId,
     sessionId,
+    runtime: 'actor',
     provider,
     model: effectiveModel,
     agentName: opts.agentName,
     alias,
-    tmuxName,
     cwd,
     worktreePath,
     branch,
     workspace,
     systemPromptMode,
     sessionDir: provider === 'pi' ? sessionDir : undefined,
-    ...(instructionsPath ? { instructionsPath } : {}),
     createdAt,
     aliasReservedAt: alias ? createdAt : undefined,
     ...(lineage.rootRunId ? { rootRunId: lineage.rootRunId } : {}),
@@ -146,15 +157,11 @@ export async function agent(opts: AgentOptions): Promise<Session> {
     ...(opts.policy ? { policy: opts.policy } : {}),
   };
 
-  // Reserve the alias under the registry lock before worktree/provider prep so two
-  // near-simultaneous spawns cannot claim the same workspace alias.
-  await reserveSpawnRecord(record, {
-    driver,
-    lineage,
-    policy: opts.policy,
-  });
+  // Reserve the record (and alias) under the registry lock — and the root policy lock —
+  // before any side effect, so concurrent spawns cannot oversubscribe a policy or alias.
+  await reserveSpawnRecord(record, { lineage, policy: opts.policy });
 
-  let spawned = false;
+  const fakeScript = fakeScriptFromEnv();
   try {
     // Worktree (optional). Requires cwd inside a git repo.
     if (opts.worktree) {
@@ -180,24 +187,15 @@ export async function agent(opts: AgentOptions): Promise<Session> {
       await fs.mkdir(sessionDir, { recursive: true });
     }
 
-    const ctx: BuildCtx = {
-      model: effectiveModel,
-      sessionId,
-      systemPrompt: resolvedSystemPrompt,
-      systemPromptMode,
-      agentName: nativeAgentName,
-      cwd,
-      sessionDir,
-      ...(instructionsPath ? { instructionsPath } : {}),
-    };
+    let systemPromptPath: string | undefined;
+    if (systemPromptText) {
+      systemPromptPath = await writeSystemPromptFile(sessionId, systemPromptText);
+      record = { ...record, systemPromptPath };
+      await upsertRecord(record);
+    }
 
-    // Provider prep (codex writes orc-owned instructions file, not AGENTS.md).
-    await adapter.prepare(ctx);
-
-    const argv = adapter.buildArgv(ctx);
-
-    // Spawn the detached TUI. Thread ORC_* lineage so nested `orc` CLIs inherit context
-    // (explicit AgentOptions still override env on the next agent() call).
+    // Thread ORC_* lineage so nested `orc` CLIs inherit context (explicit AgentOptions
+    // still override env on the next agent() call).
     const childEnv = {
       ...lineageEnv({
         ...lineage,
@@ -207,45 +205,56 @@ export async function agent(opts: AgentOptions): Promise<Session> {
       }),
       ...(opts.extraEnv ?? {}),
     };
-    await driver.spawn({
-      name: tmuxName,
+
+    const spec: SpawnSpec = {
+      version: RUNTIME_SCHEMA_VERSION,
+      sessionId,
+      provider: fakeScript !== undefined ? 'fake' : provider,
       cwd,
-      argv,
-      env: Object.keys(childEnv).length > 0 ? childEnv : undefined,
-    });
-    spawned = true;
+      env: childEnv,
+      ...(effectiveModel ? { model: effectiveModel } : {}),
+      ...(nativeAgentName ? { agentName: nativeAgentName } : {}),
+      ...(systemPromptPath ? { systemPrompt: { mode: systemPromptMode, path: systemPromptPath } } : {}),
+      ...(provider === 'pi' ? { sessionDir } : {}),
+      ...(fakeScript !== undefined ? { fakeScript } : {}),
+      createdAt,
+    };
+    await createSession(spec);
     if (record.aliasReservedAt) {
       const { aliasReservedAt: _reserved, ...launched } = record;
       record = launched;
     }
-  } catch (e) {
-    if (!spawned) {
-      if (worktreePath) {
-        await removeWorktree(baseCwd, worktreePath, { branch }).catch(() => {});
+    // Persist the launched record, clearing any transient alias reservation marker.
+    await upsertRecord(record);
+
+    let session = new Session(record);
+    if (opts.waitForReady ?? true) {
+      await session.awaitReady(opts.readyTimeoutMs);
+      // Record the provider-side session id (codex: its thread id) once known.
+      const psid = readSpawnSpec(sessionId)?.providerSessionId;
+      if (psid) {
+        record = { ...record, providerSessionId: psid };
+        await upsertRecord(record);
+        session = new Session(record);
       }
-      // Drop orc-owned codex instructions written during prepare; never touch user files.
-      await removeSessionInstructions(record).catch(() => {});
-      await removeRecord(shortId).catch(() => {});
+      if (opts.prompt) await session.send(opts.prompt);
+    } else if (opts.prompt) {
+      // Durably queued; the actor delivers it once the provider is ready.
+      await session.send(opts.prompt, { ackTimeoutMs: 0 });
     }
+    return session;
+  } catch (e) {
+    // D16: nothing is left behind — stop the actor, drop the session dir (journal,
+    // system prompt), the worktree and the record. Never touches user files.
+    // Also when createSession itself failed: a slow actor may still be starting.
+    await kernelStop(sessionId, { reason: 'spawn-failed', graceMs: 1_000 }).catch(() => {});
+    await removeSessionDir(sessionId).catch(() => {});
+    if (worktreePath) {
+      await removeWorktree(baseCwd, worktreePath, { branch }).catch(() => {});
+    }
+    await removeRecord(shortId).catch(() => {});
     throw e;
   }
-
-  // Persist the launched record, clearing any transient alias reservation marker.
-  await upsertRecord(record);
-
-  const session = new Session(record, opts.driver ?? 'tmux');
-
-  const waitForReady = opts.waitForReady ?? true;
-  if (waitForReady) {
-    const ready = await session.waitForReady();
-    if (ready && opts.prompt) {
-      await session.send(opts.prompt);
-    }
-  }
-  // NOTE: when waitForReady=false we skip BOTH the boot-poll and the auto-send.
-  // The record is still returned so a caller can poll status / send later.
-
-  return session;
 }
 
 /**
@@ -256,7 +265,6 @@ export async function agent(opts: AgentOptions): Promise<Session> {
 export async function reserveSpawnRecord(
   record: SessionRecord,
   args: {
-    driver: ReturnType<typeof getDriver>;
     lineage: ReturnType<typeof resolveLineage>;
     policy?: AgentOptions['policy'];
   },
@@ -268,7 +276,7 @@ export async function reserveSpawnRecord(
       isDelegation:
         (args.lineage.depth ?? 0) > 0 || Boolean(args.lineage.parentRunId),
     });
-    await reserveRecord(record, { driver: args.driver });
+    await reserveRecord(record);
   };
 
   if (!args.lineage.rootRunId && !args.policy) {
@@ -294,9 +302,4 @@ export async function resolveWorkspace(
     return fs.realpath(workspace).catch(() => workspace);
   }
   return (await gitToplevel(cwd)) ?? cwd;
-}
-
-/** Slugless re-export of name builder for the CLI. */
-export function buildTmuxName(label: string, shortId: string): string {
-  return `orc-${sanitizeTmuxName(label)}-${shortId}`;
 }

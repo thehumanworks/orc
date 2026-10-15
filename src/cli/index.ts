@@ -40,7 +40,11 @@ import type { Scope } from '../daemon/auth.ts';
 import { readPeers, addPeer, removePeer, peerHosts, DEFAULT_DAEMON_PORT } from '../daemon/peers.ts';
 import { DaemonClient, parseHostArg } from '../daemon/client.ts';
 import type { RemoteTarget, DetachedWorkflowLaunch } from '../daemon/client.ts';
-import type { AgentOptions, AgentState, Provider, SystemPromptMode } from '../types.ts';
+import type { AgentOptions, Provider, SystemPromptMode } from '../types.ts';
+import type { Session, SessionStateDetail } from '../session.ts';
+import type { SendResult } from '../messages.ts';
+import { renderJournal } from '../journal-render.ts';
+import type { JournalEntry } from '../runtime/types.ts';
 import {
   printJson,
   printError,
@@ -275,8 +279,29 @@ async function cmdSpawn(args: string[]): Promise<number> {
   }
 }
 
+/** D8: acknowledged → 0, queued → 0, unknown → 3, failed → 1. */
+export function sendExitCode(phase: SendResult['phase']): number {
+  switch (phase) {
+    case 'acknowledged':
+    case 'queued':
+      return 0;
+    case 'unknown':
+      return 3;
+    default:
+      return 1;
+  }
+}
+
+function renderSendResult(id: string, r: { phase: string; messageId?: string; replayed?: boolean }): string {
+  const replay = r.replayed ? ', replayed' : '';
+  const key = r.messageId ? ` [${r.messageId}]` : '';
+  return `sent to ${id} (${r.phase}${replay})${key}\n`;
+}
+
 async function cmdSend(args: string[]): Promise<number> {
   const { values, positionals } = parse(args, {
+    'idempotency-key': { type: 'string' },
+    'no-wake': { type: 'boolean' },
     json: { type: 'boolean' },
   });
   const json = jsonFlag(values);
@@ -307,15 +332,33 @@ async function cmdSend(args: string[]): Promise<number> {
     );
     return 1;
   }
+  const key = values['idempotency-key'] as string | undefined;
+  let r: SendResult;
   try {
-    await session.send(prompt);
+    r = await session.send(prompt, {
+      ...(key !== undefined ? { messageId: key } : {}),
+      ...(values['no-wake'] === true ? { wake: false } : {}),
+    });
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
   }
-  if (json) printJson({ ok: true, id: session.id });
-  else process.stdout.write(`sent to ${session.id}\n`);
-  return 0;
+  const code = sendExitCode(r.phase);
+  if (json) printJson({ ok: code === 0, id: session.id, ...r });
+  else if (code === 0) process.stdout.write(renderSendResult(session.id, r));
+  else {
+    process.stderr.write(
+      r.phase === 'unknown'
+        ? `error: delivery to ${session.id} is unknown (cut before the provider acknowledged it); not re-sent — check \`orc read ${session.id}\` and send again with a new key\n`
+        : `error: delivery to ${session.id} failed before the provider accepted it\n`,
+    );
+  }
+  return code;
+}
+
+/** Normalized journal entries as JSONL (one entry per line). */
+function journalJsonl(entries: JournalEntry[]): string {
+  return entries.map((e) => JSON.stringify(e)).join('\n');
 }
 
 async function cmdRead(args: string[]): Promise<number> {
@@ -346,14 +389,14 @@ async function cmdRead(args: string[]): Promise<number> {
     return 1;
   }
   try {
-    // --raw: the full tmux pane (with scrollback) exactly as tmux shows it. The escape
-    // hatch for when the parsed transcript isn't enough.
+    // --raw: the session journal (normalized provider events + lifecycle facts). The
+    // escape hatch for when the parsed transcript isn't enough.
     if (values.raw === true) {
-      const pane = await session.capture({ scrollback: true });
+      const journal = session.journal();
       if (json) {
-        printJson({ id: session.id, pane });
-      } else {
-        process.stdout.write(pane.endsWith('\n') ? pane : `${pane}\n`);
+        printJson({ id: session.id, journal });
+      } else if (journal.length > 0) {
+        process.stdout.write(`${journalJsonl(journal)}\n`);
       }
       return 0;
     }
@@ -371,20 +414,27 @@ async function cmdRead(args: string[]): Promise<number> {
       return 0;
     }
 
-    // Fallback: nothing on disk yet (just booted / nothing written). Show the live
-    // pane so `read` always shows something, and flag it so callers can tell.
-    const pane = await session.capture();
+    // Fallback: no provider transcript on disk yet. Render the session journal so `read`
+    // always shows something, and flag it so callers can tell.
+    const journal = session.journal();
     if (json) {
-      printJson({ id: session.id, fallback: true, pane });
+      printJson({ id: session.id, fallback: true, journal });
     } else {
-      process.stderr.write('(no on-disk transcript yet — showing live pane; --raw for full pane)\n');
-      process.stdout.write(pane.endsWith('\n') ? pane : `${pane}\n`);
+      process.stderr.write('(no on-disk transcript yet — showing the session journal; --raw for JSONL)\n');
+      const text = renderJournal(journal);
+      process.stdout.write(text.length > 0 ? `${text}\n` : '(empty)\n');
     }
     return 0;
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
   }
+}
+
+/** Record + kernel status (D1) + derived state, for list/get views. */
+export async function sessionViewOf(s: Session): Promise<SessionView> {
+  const d = await s.stateDetail().catch(() => undefined);
+  return { ...s.toJSON(), status: d?.status ?? 'dead', ...(d ? { state: d.state } : {}) };
 }
 
 async function cmdList(args: string[]): Promise<number> {
@@ -408,12 +458,7 @@ async function cmdList(args: string[]): Promise<number> {
     dead: values.dead === true,
     runId,
   });
-  const views: SessionView[] = await Promise.all(
-    sessions.map(async (s) => {
-      const status = (await s.status().catch(() => 'dead')) as 'running' | 'dead';
-      return { ...s.toJSON(), status };
-    }),
-  );
+  const views: SessionView[] = await Promise.all(sessions.map(sessionViewOf));
   const showLineage = values.lineage === true || Boolean(runId);
   if (json) {
     printJson(
@@ -448,17 +493,14 @@ async function cmdListAllHosts(values: Parsed['values'], json: boolean): Promise
 
   const rows: HostSessionView[] = [];
   const local = await listSessions(filter);
-  for (const s of local) {
-    const status = (await s.status().catch(() => 'dead')) as 'running' | 'dead';
-    rows.push({ ...s.toJSON(), status, host: 'local' });
-  }
+  for (const s of local) rows.push({ ...(await sessionViewOf(s)), host: 'local' });
 
   const peers = await readPeers();
   for (const p of peers) {
     const client = new DaemonClient({ host: p.host, port: p.port ?? DEFAULT_DAEMON_PORT });
     try {
       const remote = await client.listSessions(filter);
-      for (const r of remote) rows.push({ ...r, host: p.host });
+      for (const r of remote) rows.push({ ...r, state: r.state as SessionView['state'], host: p.host });
     } catch (e) {
       process.stderr.write(`warning: peer ${p.host} unreachable: ${(e as Error).message}\n`);
     }
@@ -469,6 +511,12 @@ async function cmdListAllHosts(values: Parsed['values'], json: boolean): Promise
   return 0;
 }
 
+/**
+ * `orc attach <id>` — follow the session journal rendered as text (prompts, replies,
+ * outcomes, lifecycle) until the session stops/suspends or Ctrl-C. Read-only by
+ * construction (`--read-only` accepted and ignored). `--json` prints
+ * `{id, command, journalPath}` and does not follow.
+ */
 async function cmdAttach(args: string[]): Promise<number> {
   const { values, positionals } = parse(args, {
     'read-only': { type: 'boolean' },
@@ -486,13 +534,84 @@ async function cmdAttach(args: string[]): Promise<number> {
     printError(`no session found for '${idOrName}'`, json);
     return 1;
   }
-  const cmd = session.attachCommand({ readOnly: values['read-only'] === true });
   if (json) {
-    printJson({ id: session.id, command: cmd });
+    printJson({ id: session.id, command: session.attachCommand(), journalPath: session.journalPath() });
     return 0;
   }
+  const ac = new AbortController();
+  const onInt = () => ac.abort();
+  process.once('SIGINT', onInt);
   try {
-    return await session.attach({ readOnly: values['read-only'] === true });
+    return await session.attach({ signal: ac.signal });
+  } catch (e) {
+    printError((e as Error).message, false);
+    return 1;
+  } finally {
+    process.off('SIGINT', onInt);
+  }
+}
+
+/**
+ * `orc resume <id>` — hand a stopped (killed / taken-over) or suspended session back to
+ * an actor: clear the sticky stop, wake it (re-checking maxConcurrentSessions) and wait
+ * for the provider to be ready. Purged and legacy sessions cannot be resumed.
+ */
+async function cmdResume(args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, { json: { type: 'boolean' } });
+  const json = jsonFlag(values);
+  const idOrName = positionals[0];
+  if (!idOrName) {
+    printError('resume requires <id|@alias>', json);
+    return 1;
+  }
+  // @alias resolves only active (running/suspended) sessions; a killed or taken-over
+  // session is addressed by its id.
+  const session = await getSessionForCli(idOrName, json);
+  if (session === undefined) return 1;
+  if (!session) {
+    printError(`no session found for '${idOrName}'`, json);
+    return 1;
+  }
+  let d: SessionStateDetail;
+  try {
+    d = await session.resume();
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
+  if (json) printJson(d);
+  else process.stdout.write(`resumed ${session.id}: ${d.state}\n`);
+  return 0;
+}
+
+/**
+ * `orc takeover <id>` — the escape hatch: stop the actor cleanly (sticky: a send cannot
+ * wake a second writer), then print the provider's own resume command for a human.
+ * Handback: `orc resume <id>`. `--json` prints `{id, cwd, command}`.
+ */
+async function cmdTakeover(args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, { json: { type: 'boolean' } });
+  const json = jsonFlag(values);
+  const idOrName = positionals[0];
+  if (!idOrName) {
+    printError('takeover requires <id|@alias>', json);
+    return 1;
+  }
+  const session = await getSessionForCli(idOrName, json);
+  if (session === undefined) return 1;
+  if (!session) {
+    printError(`no session found for '${idOrName}'`, json);
+    return 1;
+  }
+  try {
+    const t = await session.takeover();
+    if (json) printJson({ id: t.id, cwd: t.cwd, command: t.command });
+    else {
+      process.stdout.write(
+        `# orc stopped ${t.id}; continue it yourself with:\n${t.command}\n# hand it back with: orc resume ${t.id}\n`,
+      );
+    }
+    return 0;
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
@@ -532,18 +651,25 @@ async function cmdKill(args: string[]): Promise<number> {
 async function cmdPrune(args: string[]): Promise<number> {
   const { values } = parse(args, {
     worktree: { type: 'boolean' },
+    suspended: { type: 'boolean' },
     json: { type: 'boolean' },
   });
   const json = jsonFlag(values);
   let removed: string[];
   try {
-    removed = await pruneSessions({ removeWorktree: values.worktree === true });
+    removed = await pruneSessions({
+      removeWorktree: values.worktree === true,
+      suspended: values.suspended === true,
+    });
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
   }
   if (json) printJson({ ok: true, pruned: removed });
-  else process.stdout.write(`pruned ${removed.length} dead record(s)\n`);
+  else {
+    const what = values.suspended === true ? 'dead/suspended' : 'dead';
+    process.stdout.write(`pruned ${removed.length} ${what} record(s)\n`);
+  }
   return 0;
 }
 
@@ -568,15 +694,18 @@ async function cmdState(args: string[]): Promise<number> {
     printError(`no session found for '${idOrName}'`, json);
     return 1;
   }
-  let state: AgentState;
+  let d: SessionStateDetail;
   try {
-    state = await session.state();
+    d = await session.stateDetail();
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
   }
-  if (json) printJson({ id: session.id, state });
-  else process.stdout.write(`${state}\n`);
+  if (json) printJson(d);
+  else {
+    const note = d.stopped ? ' (stopped)' : d.suspended ? ' (suspended)' : '';
+    process.stdout.write(`${d.state}${note}\n`);
+  }
   return 0;
 }
 
@@ -614,7 +743,7 @@ async function cmdWait(args: string[]): Promise<number> {
     return 1;
   }
   const startedAt = Date.now();
-  let state: AgentState;
+  let state: string;
   let reached: boolean;
   try {
     const result = await session.waitForResult({ until, timeoutMs });
@@ -858,7 +987,7 @@ async function cmdWorkflowAttach(args: string[]): Promise<number> {
   if (!run.runner) {
     printError(
       run.legacyRunnerTmux
-        ? `run '${runId}' was started by a legacy tmux runner; it has no runner log`
+        ? `run '${runId}' was started by a legacy (pre-actor) runner; it has no runner log`
         : `run '${runId}' has no runner log (it was not run with --detach)`,
       json,
     );
@@ -883,11 +1012,15 @@ async function cmdWorkflowAttach(args: string[]): Promise<number> {
   }
 }
 
+/** Journal entries per step shown by `workflow logs --raw`. */
+const RAW_JOURNAL_TAIL = 200;
+
 /**
  * `orc workflow logs <runId> [--step <id>] [--raw]` — read the actual work each step's
  * agent did. Default: the full token-efficient parsed transcript per step (the same
- * parsed format as `orc read --full`), labeled `### step <id> (<provider>)`. `--raw` shows the live pane capture
- * instead. `--json` emits `{ step, turns }[]` (parsed) or `{ step, provider, pane }[]` (raw).
+ * parsed format as `orc read --full`), labeled `### step <id> (<provider>)`. `--raw` shows
+ * each step session's journal tail instead. `--json` emits `{ step, turns }[]` (parsed)
+ * or `{ step, provider, journal }[]` (raw).
  */
 async function cmdWorkflowLogs(args: string[]): Promise<number> {
   const { values, positionals } = parse(args, {
@@ -921,22 +1054,22 @@ async function cmdWorkflowLogs(args: string[]): Promise<number> {
 
   try {
     if (values.raw === true) {
-      // Raw: the live tmux pane (with scrollback) of each step's still-alive session.
-      const panes: { step: string; provider: StepResult['provider']; pane: string }[] = [];
+      // Raw: each step session's journal tail (normalized provider events + lifecycle).
+      const logs: { step: string; provider: StepResult['provider']; journal: JournalEntry[] }[] = [];
       for (const s of selected) {
-        let pane = '';
+        let journal: JournalEntry[] = [];
         if (s.sessionId) {
           const session = await getSession(s.sessionId);
-          if (session) pane = await session.capture({ scrollback: true }).catch(() => '');
+          if (session) journal = session.journal({ tail: RAW_JOURNAL_TAIL });
         }
-        panes.push({ step: s.id, provider: s.provider, pane });
+        logs.push({ step: s.id, provider: s.provider, journal });
       }
       if (json) {
-        printJson(panes);
+        printJson(logs);
       } else {
         process.stdout.write(
-          `${panes
-            .map((p) => `### step ${p.step} (${p.provider})\n${p.pane.trimEnd() || '(no pane — session gone)'}`)
+          `${logs
+            .map((l) => `### step ${l.step} (${l.provider})\n${renderJournal(l.journal) || '(no journal — session gone)'}`)
             .join('\n\n')}\n`,
         );
       }
@@ -1419,7 +1552,7 @@ async function remoteList(client: DaemonClient, args: string[], target: RemoteTa
       dead: values.dead === true,
     });
     if (json) printJson(views);
-    else process.stdout.write(`${renderSessionList(views as SessionView[])}\n`);
+    else process.stdout.write(`${renderSessionList(views.map((v) => ({ ...v, state: v.state as SessionView['state'] })))}\n`);
     return 0;
   } catch (e) {
     void target;
@@ -1488,7 +1621,11 @@ async function remoteSpawn(client: DaemonClient, args: string[]): Promise<number
 }
 
 async function remoteSend(client: DaemonClient, args: string[]): Promise<number> {
-  const { values, positionals } = parse(args, { json: { type: 'boolean' } });
+  const { values, positionals } = parse(args, {
+    'idempotency-key': { type: 'string' },
+    'no-wake': { type: 'boolean' },
+    json: { type: 'boolean' },
+  });
   const json = jsonFlag(values);
   const id = positionals[0];
   if (!id) {
@@ -1507,10 +1644,17 @@ async function remoteSend(client: DaemonClient, args: string[]): Promise<number>
     return 1;
   }
   try {
-    const r = await client.send(id, prompt);
+    const key = values['idempotency-key'] as string | undefined;
+    const r = await client.send(id, prompt, {
+      ...(key !== undefined ? { messageId: key } : {}),
+      ...(values['no-wake'] === true ? { wake: false } : {}),
+    });
+    const phase = (r.phase ?? 'acknowledged') as SendResult['phase'];
+    const code = sendExitCode(phase);
     if (json) printJson(r);
-    else process.stdout.write(`sent to ${r.id}\n`);
-    return 0;
+    else if (code === 0) process.stdout.write(renderSendResult(r.id, { ...r, phase }));
+    else process.stderr.write(`error: delivery to ${r.id} ${phase}\n`);
+    return code;
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
@@ -1540,22 +1684,29 @@ async function remoteRead(client: DaemonClient, args: string[]): Promise<number>
   }
   try {
     const res = await client.read(id, { raw: values.raw === true, selection });
-    if (res.kind === 'raw') {
-      if (json) printJson({ id: res.id, pane: res.pane });
-      else process.stdout.write(res.pane.endsWith('\n') ? res.pane : `${res.pane}\n`);
-      return 0;
-    }
     if (res.kind === 'parsed') {
       if (json) printJson(res.turns);
       else process.stdout.write(`${renderTurns(res.turns)}\n`);
       return 0;
     }
-    // fallback: nothing on disk yet — the daemon returned the live pane.
+    if ('pane' in res) {
+      // A pre-actor (v1) daemon: it still answers raw/fallback reads with a pane.
+      if (json) printJson({ id: res.id, ...(res.kind === 'fallback' ? { fallback: true } : {}), pane: res.pane });
+      else process.stdout.write(res.pane.endsWith('\n') ? res.pane : `${res.pane}\n`);
+      return 0;
+    }
+    if (res.kind === 'raw') {
+      if (json) printJson({ id: res.id, journal: res.journal });
+      else if (res.journal.length > 0) process.stdout.write(`${journalJsonl(res.journal)}\n`);
+      return 0;
+    }
+    // fallback: no transcript on disk yet — the daemon returned the session journal.
     if (json) {
-      printJson({ id: res.id, fallback: true, pane: res.pane });
+      printJson({ id: res.id, fallback: true, journal: res.journal });
     } else {
-      process.stderr.write('(no on-disk transcript yet — showing live pane; --raw for full pane)\n');
-      process.stdout.write(res.pane.endsWith('\n') ? res.pane : `${res.pane}\n`);
+      process.stderr.write('(no on-disk transcript yet — showing the session journal; --raw for JSONL)\n');
+      const text = renderJournal(res.journal);
+      process.stdout.write(text.length > 0 ? `${text}\n` : '(empty)\n');
     }
     return 0;
   } catch (e) {
@@ -1611,8 +1762,18 @@ async function remoteState(client: DaemonClient, args: string[]): Promise<number
   }
   try {
     const rec = await client.getSession(id);
-    if (json) printJson({ id: rec.id, state: rec.state });
-    else process.stdout.write(`${rec.state}\n`);
+    if (json) {
+      printJson({
+        id: rec.id,
+        state: rec.state,
+        ...(rec.status !== undefined ? { status: rec.status } : {}),
+        ...(rec.suspended !== undefined ? { suspended: rec.suspended } : {}),
+        ...(rec.stopped !== undefined ? { stopped: rec.stopped } : {}),
+      });
+    } else {
+      const note = rec.stopped ? ' (stopped)' : rec.suspended ? ' (suspended)' : '';
+      process.stdout.write(`${rec.state}${note}\n`);
+    }
     return 0;
   } catch (e) {
     printError((e as Error).message, json);
@@ -1645,9 +1806,8 @@ async function remoteKill(client: DaemonClient, args: string[]): Promise<number>
 }
 
 /**
- * Remote attach is HOST-LOCAL: the tmux session lives on the remote host, so a local
- * `tmux attach` is useless. Print the host + a `tailscale ssh <host>` hint (and the exact
- * `tmux attach` to run once there).
+ * Remote attach is HOST-LOCAL: the session journal lives on the remote host. Print the
+ * `tailscale ssh <host> orc attach <id>` command that follows it there.
  */
 async function remoteAttach(
   client: DaemonClient,
@@ -1664,27 +1824,20 @@ async function remoteAttach(
     printError('attach requires <id|@alias>', json);
     return 1;
   }
-  let tmuxName: string | undefined;
+  let resolved = id;
   try {
-    const rec = await client.getSession(id);
-    tmuxName = rec.tmuxName;
+    resolved = (await client.getSession(id)).id;
   } catch {
     /* still give the ssh hint even if the lookup failed */
   }
-  const ssh = `tailscale ssh ${target.host}`;
-  const ro = values['read-only'] === true ? ' -r' : '';
-  const remoteTmux = `tmux attach${ro} -t ${tmuxName ?? '<tmux-session>'}`;
+  const command = `tailscale ssh ${target.host} orc attach ${resolved}`;
   if (json) {
-    printJson({ id, host: target.host, ssh, command: remoteTmux });
+    printJson({ id: resolved, host: target.host, command });
   } else {
-    process.stdout.write(
-      `# session ${id} lives on ${target.host}; reattach over tailscale:\n` +
-        `${ssh}\n# then on ${target.host}:\n${remoteTmux}\n`,
-    );
+    process.stdout.write(`# session ${resolved} lives on ${target.host}; follow it over tailscale:\n${command}\n`);
   }
   return 0;
 }
-
 
 /** Type guard: detach launch returns {runId,logPath}; foreground returns WorkflowRun. */
 function isDetachedWorkflowLaunch(
@@ -1824,7 +1977,11 @@ async function remoteWorkflowLogs(client: DaemonClient, args: string[]): Promise
       } else {
         process.stdout.write(
           `${res.logs
-            .map((p) => `### step ${p.step} (${p.provider})\n${p.pane.trimEnd() || '(no pane — session gone)'}`)
+            .map((l) => {
+              const body =
+                'journal' in l ? renderJournal(l.journal) : (l as { pane?: string }).pane?.trimEnd() ?? '';
+              return `### step ${l.step} (${l.provider})\n${body || '(no journal — session gone)'}`;
+            })
             .join('\n\n')}\n`,
         );
       }
@@ -2019,6 +2176,10 @@ export function resolveCommand(raw: string | undefined): string {
       return 'attach';
     case 'kill':
       return 'kill';
+    case 'resume':
+      return 'resume';
+    case 'takeover':
+      return 'takeover';
     case 'prune':
       return 'prune';
     case 'workflow':
@@ -2069,6 +2230,10 @@ async function main(): Promise<number> {
       return cmdAttach(rest);
     case 'kill':
       return cmdKill(rest);
+    case 'resume':
+      return cmdResume(rest);
+    case 'takeover':
+      return cmdTakeover(rest);
     case 'prune':
       return cmdPrune(rest);
     case 'workflow':

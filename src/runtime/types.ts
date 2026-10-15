@@ -201,7 +201,9 @@ export type JournalEvent =
       type: 'actor.stopped';
       reason: 'stop' | 'provider-exit' | 'error' | 'lease-lost';
       error?: string;
-    };
+    }
+  /** A sticky stop was cleared by `reopen()` (e.g. `orc resume` after kill/takeover). */
+  | { type: 'actor.reopened'; reason?: string };
 
 export type JournalEntry = JournalEvent & { seq: number; ts: string };
 

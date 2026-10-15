@@ -52,7 +52,11 @@ export interface PolicyCheckContext {
   nowMs?: number;
   /** Sessions already attributed to this root (registry snapshot). */
   rootSessions?: SessionRecord[];
-  /** How many of those are currently live (caller-provided; default: status !== dead). */
+  /**
+   * How many of those currently hold a live actor (lease live, or a spawn in progress).
+   * Callers compute it from the kernel (src/session-status.ts `countLiveSessions`);
+   * without it, only records explicitly marked `status: 'running'` count.
+   */
   liveCount?: number;
   /** Total sessions under root including the one about to spawn (usually rootSessions.length + 1). */
   totalAfterSpawn?: number;
@@ -103,9 +107,9 @@ export function assertPolicyAllowsSpawn(ctx: PolicyCheckContext): void {
     );
   }
 
-  const live =
-    ctx.liveCount ??
-    sessions.filter((s) => s.status !== 'dead').length;
+  // D2: concurrency counts LIVE actors (not merely "not marked dead"): a suspended
+  // session holds no process and does not use a slot until it is woken.
+  const live = ctx.liveCount ?? sessions.filter((s) => s.status === 'running').length;
   // The new session will be live after spawn.
   if (policy.maxConcurrentSessions !== undefined && live + 1 > policy.maxConcurrentSessions) {
     throw new PolicyViolationError(

@@ -2,8 +2,8 @@
  * Token-efficient transcript parsing. Each provider writes a JSONL message log to
  * disk; we normalize it into a flat list of `Turn`s — the conversation text plus
  * ONE-LINE tool-call summaries — dropping raw tool output, reasoning/thinking, and
- * all UI chrome. `orc read` selects from this compact view by default (the raw tmux
- * pane is the `--raw` escape hatch).
+ * all UI chrome. `orc read` selects from this compact view by default (the session
+ * journal is the `--raw` escape hatch).
  */
 import type { Provider } from './types.ts';
 

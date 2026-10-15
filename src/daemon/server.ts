@@ -31,6 +31,11 @@ import { launchDetachedRecovery, launchDetachedRun, RunnerSpawnError } from '../
 import type { RunnerSpawner } from '../workflow-runner.ts';
 import { selectTurns } from '../transcript.ts';
 import type { TurnSelection } from '../transcript.ts';
+import type { JournalEntry } from '../runtime/types.ts';
+import { DAEMON_API_VERSION } from './client.ts';
+
+/** Journal entries per step returned by raw run logs. */
+const RAW_JOURNAL_TAIL = 200;
 import { isAllowlisted } from './trust.ts';
 import type { Identity } from './trust.ts';
 import {
@@ -227,7 +232,7 @@ export function createFetch(opts: DaemonOptions): (req: Request, server: Bun.Ser
 
     // /health is the ONLY unauthenticated route (liveness).
     if (authReq.type === 'public' || match.name === 'health') {
-      return json({ ok: true, version: await versionPromise, host: hostName });
+      return json({ ok: true, version: await versionPromise, host: hostName, api: DAEMON_API_VERSION });
     }
 
     // ---- Authn + authz (fail closed) — every other route. ----
@@ -287,7 +292,7 @@ async function dispatch(
 ): Promise<Response> {
   switch (name) {
     case 'health':
-      return json({ ok: true, version: await ctx.versionPromise, host: ctx.hostName });
+      return json({ ok: true, version: await ctx.versionPromise, host: ctx.hostName, api: DAEMON_API_VERSION });
 
     case 'whoami':
       return json({
@@ -304,10 +309,10 @@ async function dispatch(
         dead: boolParam(url.searchParams.get('dead')),
       });
       const views = await Promise.all(
-        sessions.map(async (s) => ({
-          ...s.toJSON(),
-          status: (await s.status().catch(() => 'dead')) as 'running' | 'dead',
-        })),
+        sessions.map(async (s) => {
+          const d = await s.stateDetail().catch(() => undefined);
+          return { ...s.toJSON(), status: d?.status ?? 'dead', ...(d ? { state: d.state } : {}) };
+        }),
       );
       return json(views);
     }
@@ -327,9 +332,14 @@ async function dispatch(
     case 'sessions.get': {
       const session = await getSession(params.id!);
       if (!session) throw new HttpError(404, `no session found for '${params.id}'`);
-      const state = await session.state();
-      const status = (await session.status().catch(() => 'dead')) as 'running' | 'dead';
-      return json({ ...session.toJSON(), status, state });
+      const d = await session.stateDetail();
+      return json({
+        ...session.toJSON(),
+        status: d.status,
+        state: d.state,
+        suspended: d.suspended,
+        stopped: d.stopped,
+      });
     }
 
     case 'sessions.send': {
@@ -342,18 +352,16 @@ async function dispatch(
       } catch (e) {
         throw new HttpError(400, (e as Error).message);
       }
-      const result = await session.send(
-        mapped.prompt,
-        mapped.messageId ? { messageId: mapped.messageId } : undefined,
-      );
+      const result = await session.send(mapped.prompt, {
+        ...(mapped.messageId ? { messageId: mapped.messageId } : {}),
+        ...(mapped.wake === false ? { wake: false } : {}),
+      });
       return json({
-        ok: true,
+        ok: result.phase === 'acknowledged' || result.phase === 'queued',
         id: session.id,
         phase: result.phase,
-        attempts: result.attempts,
-        ...(result.messageId ? { messageId: result.messageId } : {}),
-        ...(result.payloadHash ? { payloadHash: result.payloadHash } : {}),
-        ...(result.replayed ? { replayed: true } : {}),
+        messageId: result.messageId,
+        replayed: result.replayed,
       });
     }
 
@@ -389,8 +397,7 @@ async function dispatch(
         ) {
           throw new HttpError(400, 'raw cannot be combined with full, last, or index');
         }
-        const pane = await session.capture({ scrollback: true });
-        return json({ kind: 'raw', id: session.id, pane });
+        return json({ kind: 'raw', id: session.id, journal: session.journal() });
       }
       const selection = readSelectionFromParams(url.searchParams);
       const turns = await session.readParsed();
@@ -401,9 +408,8 @@ async function dispatch(
         throw new HttpError(400, (e as Error).message);
       }
       if (turns.length > 0) return json({ kind: 'parsed', id: session.id, turns: selected });
-      // Nothing on disk yet — fall back to the live pane (the CLI does the same).
-      const pane = await session.capture();
-      return json({ kind: 'fallback', id: session.id, pane });
+      // No transcript on disk yet — fall back to the session journal (the CLI does the same).
+      return json({ kind: 'fallback', id: session.id, journal: session.journal() });
     }
 
     case 'sessions.kill': {
@@ -441,16 +447,16 @@ async function dispatch(
         }
       }
       if (boolParam(url.searchParams.get('raw'))) {
-        const panes: { step: string; provider: StepResult['provider']; pane: string }[] = [];
+        const logs: { step: string; provider: StepResult['provider']; journal: JournalEntry[] }[] = [];
         for (const s of selected) {
-          let pane = '';
+          let journal: JournalEntry[] = [];
           if (s.sessionId) {
             const session = await getSession(s.sessionId);
-            if (session) pane = await session.capture({ scrollback: true }).catch(() => '');
+            if (session) journal = session.journal({ tail: RAW_JOURNAL_TAIL });
           }
-          panes.push({ step: s.id, provider: s.provider, pane });
+          logs.push({ step: s.id, provider: s.provider, journal });
         }
-        return json({ kind: 'raw', logs: panes });
+        return json({ kind: 'raw', logs });
       }
       const logs = await assembleStepLogs(selected, async (s) => {
         if (!s.sessionId) return [];

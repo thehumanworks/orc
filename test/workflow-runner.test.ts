@@ -210,13 +210,13 @@ describe('schema v5: runner + legacy tmux-runner normalization', () => {
 
   test('status rendering: a legacy runner is "resumable" only when the run is', () => {
     expect(renderRunDetail(baseRun({ status: 'done', legacyRunnerTmux: 'orc-wf-x' }))).toContain(
-      'runner:     legacy tmux runner (gone)',
+      'runner:     legacy pre-actor runner (gone)',
     );
     expect(renderRunDetail(baseRun({ status: 'cancelled', legacyRunnerTmux: 'orc-wf-x' }))).not.toContain(
       'resumable',
     );
     expect(renderRunDetail(baseRun({ status: 'orphaned', legacyRunnerTmux: 'orc-wf-x' }))).toContain(
-      'legacy tmux runner (gone; resumable)',
+      'legacy pre-actor runner (gone; resumable)',
     );
   });
 

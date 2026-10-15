@@ -8,6 +8,10 @@ import { agent } from './agent.ts';
 import { Session } from './session.ts';
 import { commitCountSince, commitCountVsMain } from './worktree.ts';
 import { validateAlias, readRegistry, findRecord } from './registry.ts';
+import { countLiveSessions, sessionStatusOf } from './session-status.ts';
+import { lastAssistantText, renderCapture } from './journal-render.ts';
+import { deliveryVerdict } from './runtime/client.ts';
+import type { DeliveryVerdict } from './runtime/client.ts';
 import {
   makeLease,
   isLeaseLive,
@@ -154,6 +158,12 @@ export interface WorkflowStep {
 export interface StepDoneCtx {
   state: AgentState;
   commitsAhead: number;
+  /**
+   * The step session's last assistant message, then a short rendering of its final turn
+   * (prompt, replies, outcome/error), from the session journal — bounded to 8000 chars.
+   * (Before the actor runtime this was a tmux pane capture; predicates that matched TUI
+   * chrome must match the agent's words instead.)
+   */
   capture: string;
   sessionId?: string;
   turns?: Turn[];
@@ -252,9 +262,32 @@ export type StepExecutor = (args: {
   attempt?: StepAttempt;
 }) => Promise<StepResult>;
 
+/**
+ * Continue an in-flight attempt adopted on resume (D10). Default: wake the attempt's
+ * session if suspended and supervise it like a fresh launch (wait → verify).
+ */
+export type StepAdopter = (args: {
+  step: WorkflowStep;
+  runId: string;
+  emit: (e: WorkflowEvent) => void;
+  attempt: StepAttempt;
+  transition?: (phase: AttemptPhase, patch?: Partial<StepAttempt>) => Promise<void> | void;
+}) => Promise<StepResult>;
+
+/** Kernel facts about an in-flight attempt's session (see probeAttemptSession). */
+export type AdoptionProbe = (
+  attempt: StepAttempt,
+  runId: string,
+) => Promise<{ sessionAlive: boolean | null; verdict?: DeliveryVerdict }>;
+
 export interface RunWorkflowOptions {
   onEvent?: (e: WorkflowEvent) => void;
   execStep?: StepExecutor;
+  /** Adoption of in-flight attempts on resume/retry (D10). Injectable for tests. */
+  adoptStep?: StepAdopter;
+  probeAdoption?: AdoptionProbe;
+  /** Resume: relaunch an attempt whose instruction delivery is unknown (default: require retry). */
+  allowUnknownDeliveryRetry?: boolean;
   runId?: string;
   /**
    * The detached runner process executing this run (the `--run-id` / `--runner`
@@ -718,33 +751,59 @@ export function projectStepsFromAttempts(
   return out;
 }
 
+/**
+ * What to do with a step's latest attempt when a run is recovered (resume/retry, D10):
+ * - `skip_succeeded` — already succeeded
+ * - `adopt`          — in flight, its session still continuable (exists, not stopped) and
+ *                      the instruction is queued / acknowledged / completed: keep waiting
+ * - `require_retry`  — delivery `unknown` (cut before the provider acked it): never
+ *                      re-sent automatically; an explicit retry is required
+ * - `spawn_new`      — no attempt, terminal non-success, session gone/stopped, or the
+ *                      instruction failed / was never enqueued / was interrupted
+ * `verdict` is the kernel delivery verdict of the attempt's instruction message; without
+ * one, an alive session is adopted (pre-kernel behaviour).
+ */
 export function adoptionDecision(args: {
   attempt: StepAttempt | undefined;
   sessionAlive: boolean | null;
+  verdict?: DeliveryVerdict;
+  allowUnknownDeliveryRetry?: boolean;
 }): 'skip_succeeded' | 'adopt' | 'require_retry' | 'spawn_new' {
   const a = args.attempt;
   if (!a) return 'spawn_new';
   if (a.phase === 'succeeded') return 'skip_succeeded';
   if (a.phase === 'cancelled' || a.phase === 'abandoned') return 'spawn_new';
   if (a.phase === 'failed') return 'spawn_new';
-  if (a.deliveryPhase === 'unknown') return 'require_retry';
-  if (a.sessionId && args.sessionAlive === true) {
-    if (['dispatched', 'running', 'verifying', 'waiting', 'spawning'].includes(a.phase)) return 'adopt';
-  }
-  if (a.sessionId && args.sessionAlive === null) {
+  if (TERMINAL_ATTEMPT_PHASES.has(a.phase)) return 'spawn_new';
+  const unknown = a.deliveryPhase === 'unknown' || args.verdict === 'unknown';
+  if (unknown) return args.allowUnknownDeliveryRetry ? 'spawn_new' : 'require_retry';
+  if (!a.sessionId) return 'spawn_new';
+  if (args.sessionAlive === false) return 'spawn_new';
+  if (args.sessionAlive === null) {
     if (['dispatched', 'running', 'verifying'].includes(a.phase)) return 'require_retry';
+    return 'spawn_new';
   }
-  if (!TERMINAL_ATTEMPT_PHASES.has(a.phase)) return 'spawn_new';
-  return 'spawn_new';
+  if (!['dispatched', 'running', 'verifying', 'waiting', 'spawning'].includes(a.phase)) return 'spawn_new';
+  switch (args.verdict) {
+    case undefined:
+    case 'queued':
+    case 'acknowledged':
+    case 'completed':
+      return 'adopt';
+    default:
+      // failed | interrupted | absent → normal relaunch rules.
+      return 'spawn_new';
+  }
 }
 
 export function decideAdoption(args: {
   attempt: StepAttempt | undefined;
   sessionAlive: boolean | null;
+  verdict?: DeliveryVerdict;
+  allowUnknownDeliveryRetry?: boolean;
 }): 'skip_succeeded' | 'adopt' | 'require_retry' | 'spawn_new' {
   return adoptionDecision(args);
 }
-
 
 export interface FinalizeStepArgs {
   step: Pick<WorkflowStep, 'done' | 'worktree' | 'allowUnverified' | 'verify' | 'id' | 'outputs'>;
@@ -819,8 +878,6 @@ const defaultExecStep: StepExecutor = async ({
   const attemptId = attempt?.attemptId ?? randomUUID().slice(0, 12);
   const stepTimeout = step.timeoutMs ?? DEFAULT_STEP_TIMEOUT_MS;
   const stepDeadline = Date.now() + stepTimeout;
-  const maxTurns = step.turns?.maxTurns ?? 1;
-  const turnEvents: AttemptTurnEvent[] = [];
 
   if (policy || lineage) {
     const records = await readRegistry();
@@ -830,6 +887,8 @@ const defaultExecStep: StepExecutor = async ({
       policy,
       deadlineAt: lineage?.deadlineAt,
       rootSessions,
+      // D2: concurrency counts live actors (or spawns in progress), not "not dead".
+      liveCount: countLiveSessions(rootSessions),
       isDelegation: depth > 0,
       totalAfterSpawn: rootSessions.length + 1,
     });
@@ -874,12 +933,15 @@ const defaultExecStep: StepExecutor = async ({
     resultPath,
   });
 
-  const messageId = `wf-${runId}-${step.id}-${attemptId}-t0`;
+  const messageId = instructionMessageId(runId, step.id, attemptId);
+  let sent: SendResult;
   try {
-    await deliverInstructions(session, step, runId, { messageId });
+    sent = await deliverInstructions(session, step, runId, { messageId });
+    if (sent.phase === 'failed') throw new Error(`step '${step.id}': instructions were rejected by the provider`);
   } catch (e) {
     await transition?.('failed', {
       sessionId: session.id,
+      messageId,
       errorCategory: 'send',
       errorMessage: (e as Error).message,
       finishedAt: new Date().toISOString(),
@@ -891,13 +953,64 @@ const defaultExecStep: StepExecutor = async ({
   await transition?.('running', {
     sessionId: session.id,
     messageId,
+    deliveryPhase: sent.phase,
     baselineSha,
     resultPath,
   });
 
+  return superviseStep({
+    session,
+    step,
+    runId,
+    attemptId,
+    baselineSha,
+    resultPath,
+    effectiveCwd,
+    stepDeadline,
+    transition,
+    emit,
+    turnEvents: [],
+    turnsDone: 0,
+  });
+};
+
+/** Deterministic idempotency key of a step attempt's instruction (turn 0) message. */
+export function instructionMessageId(runId: string, stepId: string, attemptId: string): string {
+  return `wf-${runId}-${stepId}-${attemptId}-t0`;
+}
+
+interface SuperviseArgs {
+  session: Session;
+  step: WorkflowStep;
+  runId: string;
+  attemptId: string;
+  baselineSha?: string;
+  resultPath: string;
+  effectiveCwd: string;
+  stepDeadline: number;
+  transition?: Parameters<StepExecutor>[0]['transition'];
+  emit: (e: WorkflowEvent) => void;
+  turnEvents: AttemptTurnEvent[];
+  /** Turns already settled before this supervisor took over (adoption). */
+  turnsDone: number;
+}
+
+/**
+ * Wait for the step's turns to settle (bounded multi-turn steering), collect outputs,
+ * evaluate the step's success contract and build its StepResult. Shared by a fresh
+ * launch and by adoption of an in-flight attempt on resume (D10).
+ */
+async function superviseStep(a: SuperviseArgs): Promise<StepResult> {
+  const { session, step, runId, attemptId, resultPath, effectiveCwd, stepDeadline, transition, emit } = a;
+  const baselineSha = a.baselineSha;
+  const turnEvents = a.turnEvents;
+  const maxTurns = step.turns?.maxTurns ?? 1;
+
   let wait: WaitForResult = { state: 'failed', settled: false };
-  let turn = 0;
-  while (turn < maxTurns) {
+  let turn = a.turnsDone;
+  // An adopted attempt always gets (at least) one more wait for its open turn.
+  const turnLimit = a.turnsDone > 0 ? Math.max(maxTurns, a.turnsDone + 1) : maxTurns;
+  while (turn < turnLimit) {
     const remaining = stepDeadline - Date.now();
     if (remaining <= 0) {
       wait = { state: wait.state === 'failed' ? 'failed' : 'done', settled: false };
@@ -1028,7 +1141,11 @@ const defaultExecStep: StepExecutor = async ({
     : session.worktreePath
       ? await commitCountVsMain(session.worktreePath)
       : 0;
-  const capture = await session.capture().catch(() => '');
+  // StepDoneCtx.capture: last assistant message + a short rendering of the final turn,
+  // from the session journal (see StepDoneCtx).
+  const journal = session.journal();
+  const capture = renderCapture(journal);
+  const lastText = lastAssistantText(journal);
 
   const finalized = await finalizeStepOutcome({
     step,
@@ -1039,6 +1156,7 @@ const defaultExecStep: StepExecutor = async ({
     ctx: {
       commitsAhead,
       capture,
+      ...(lastText !== undefined ? { lastAssistantText: lastText } : {}),
       sessionId: session.id,
       cwd: effectiveCwd,
       baselineSha,
@@ -1076,7 +1194,60 @@ const defaultExecStep: StepExecutor = async ({
     envelope: finalized.envelope ?? undefined,
     resultPath,
   };
+}
+
+/**
+ * Continue an adopted in-flight attempt (D10): wake its session if it is suspended, then
+ * supervise it exactly like a fresh launch (wait → verify). Never re-sends the
+ * instruction (the kernel would replay it idempotently anyway).
+ */
+const defaultAdoptStep: StepAdopter = async ({ step, runId, attempt, transition, emit }) => {
+  if (!attempt.sessionId) throw new Error(`step '${step.id}': adopted attempt has no session`);
+  const rec = await findRecord(attempt.sessionId);
+  if (!rec) throw new Error(`step '${step.id}': session ${attempt.sessionId} not found`);
+  const session = new Session(rec);
+  const detail = await session.stateDetail();
+  if (!detail.live) await session.resume();
+  const resultPath = attempt.resultPath ?? runResultPath(runId, attempt.attemptId);
+  const messageId = attempt.messageId ?? instructionMessageId(runId, step.id, attempt.attemptId);
+  await transition?.('running', { sessionId: session.id, messageId, resultPath });
+  const turns = attempt.turns ?? [];
+  return superviseStep({
+    session,
+    step,
+    runId,
+    attemptId: attempt.attemptId,
+    ...(attempt.baselineSha ? { baselineSha: attempt.baselineSha } : {}),
+    resultPath,
+    effectiveCwd: session.worktreePath ?? session.cwd,
+    stepDeadline: Date.now() + (step.timeoutMs ?? DEFAULT_STEP_TIMEOUT_MS),
+    transition,
+    emit,
+    turnEvents: [...turns],
+    turnsDone: turns.filter((t) => t.kind === 'settle' || t.kind === 'timeout').length,
+  });
 };
+
+/**
+ * What the kernel says about an in-flight attempt's session (D10): whether the session
+ * can still be continued (exists, not stopped) and the delivery verdict of the
+ * instruction message. `sessionAlive: null` = unknowable.
+ */
+export async function probeAttemptSession(
+  attempt: StepAttempt,
+  runId: string,
+): Promise<{ sessionAlive: boolean | null; verdict?: DeliveryVerdict }> {
+  if (!attempt.sessionId) return { sessionAlive: false };
+  const rec = await findRecord(attempt.sessionId);
+  if (!rec) return { sessionAlive: false };
+  if (sessionStatusOf(rec) === 'dead') return { sessionAlive: false };
+  try {
+    const messageId = attempt.messageId ?? instructionMessageId(runId, attempt.stepId, attempt.attemptId);
+    return { sessionAlive: true, verdict: deliveryVerdict(rec.sessionId, messageId) };
+  } catch {
+    return { sessionAlive: null };
+  }
+}
 
 export function runnerLineageEnv(
   run: Pick<WorkflowRun, 'id' | 'rootRunId' | 'parentRunId' | 'policy' | 'deadlineAt' | 'lease'>,
@@ -1500,9 +1671,8 @@ async function runWorkflowOwned(
       await safeWriteOwned();
     });
 
-    let result: StepResult | undefined;
-    try {
-      result = await execStep({
+    await runAttempt(rawStep, attempt, (transition) =>
+      execStep({
         step,
         runId,
         emit,
@@ -1515,14 +1685,32 @@ async function runWorkflowOwned(
           policy: effectivePolicy,
           deadlineAt,
         },
-        transition: async (phase, patch) => {
-          await serialize(async () => {
-            attempt = transitionAttempt(attempt, phase, patch ?? {}, now());
-            recordAttempt(attempt);
-            await safeWriteOwned();
-          });
-        },
+        transition,
         attempt,
+      }),
+    );
+  };
+
+  /**
+   * Execute one attempt (fresh launch or adoption) and persist its outcome. `exec` gets
+   * the attempt's mid-flight `transition` and must return the StepResult.
+   */
+  const runAttempt = async (
+    rawStep: WorkflowStep,
+    initial: StepAttempt,
+    exec: (
+      transition: (phase: AttemptPhase, patch?: Partial<StepAttempt>) => Promise<void>,
+    ) => Promise<StepResult>,
+  ): Promise<void> => {
+    let attempt = initial;
+    let result: StepResult | undefined;
+    try {
+      result = await exec(async (phase, patch) => {
+        await serialize(async () => {
+          attempt = transitionAttempt(attempt, phase, patch ?? {}, now());
+          recordAttempt(attempt);
+          await safeWriteOwned();
+        });
       });
       const completed = result;
       await serialize(async () => {
@@ -1606,6 +1794,93 @@ async function runWorkflowOwned(
       stopNewLaunches = true;
     }
   };
+
+  // ── Adoption (D10): a recovered run continues in-flight attempts whose session is
+  // still continuable and whose instruction reached it, instead of relaunching them.
+  if (opts.resume || opts.retryFromStepId !== undefined) {
+    const probe = opts.probeAdoption ?? probeAttemptSession;
+    const adoptStep = opts.adoptStep ?? defaultAdoptStep;
+    const allowUnknown = opts.retryFromStepId !== undefined || opts.allowUnknownDeliveryRetry === true;
+    let changed = false;
+    const toAdopt: StepAttempt[] = [];
+    for (const id of graph.order) {
+      const a = latestAttemptForStep(run.attempts, id);
+      if (!a || !IN_FLIGHT_PHASES.has(a.phase)) continue;
+      const facts = await probe(a, runId).catch(() => ({ sessionAlive: null }) as const);
+      const decision = adoptionDecision({
+        attempt: a,
+        sessionAlive: facts.sessionAlive,
+        ...('verdict' in facts && facts.verdict ? { verdict: facts.verdict } : {}),
+        allowUnknownDeliveryRetry: allowUnknown,
+      });
+      if (decision === 'adopt' && stepsById.has(id)) {
+        toAdopt.push(a);
+        continue;
+      }
+      const ts = now();
+      if (decision === 'require_retry') {
+        const failed: StepResult = {
+          id,
+          sessionId: a.sessionId ?? '',
+          provider: a.provider,
+          state: 'failed',
+          ok: false,
+          outcome: 'failed',
+          commitsAhead: 0,
+        };
+        recordAttempt(
+          transitionAttempt(
+            a,
+            'failed',
+            {
+              result: failed,
+              deliveryPhase: 'unknown',
+              errorCategory: 'delivery_unknown',
+              errorMessage:
+                'instruction delivery is unknown (cut before the provider acknowledged it); ' +
+                'not re-sent automatically — use `orc workflow retry`',
+            },
+            ts,
+          ),
+        );
+        upsertResult(failed);
+        emit({ type: 'step-error', runId, stepId: id, error: 'delivery unknown: explicit retry required' });
+      } else {
+        recordAttempt(
+          transitionAttempt(
+            a,
+            'abandoned',
+            {
+              errorCategory: 'abandoned',
+              errorMessage: `previous owner died; attempt not adoptable (session ${
+                facts.sessionAlive === false ? 'gone or stopped' : 'not continuable'
+              })`,
+            },
+            ts,
+          ),
+        );
+      }
+      changed = true;
+    }
+    if (changed) await persist();
+    for (const a of toAdopt) {
+      const rawStep = stepsById.get(a.stepId)!;
+      emit({
+        type: 'attempt-adopt',
+        runId,
+        attemptId: a.attemptId,
+        stepId: a.stepId,
+        sessionId: a.sessionId ?? '',
+      });
+      const step = resolveStep(rawStep, resultsById);
+      const promise = runAttempt(rawStep, a, (transition) =>
+        adoptStep({ step, runId, emit, attempt: a, transition }),
+      ).finally(() => {
+        inFlight.delete(a.stepId);
+      });
+      inFlight.set(a.stepId, { stepId: a.stepId, attemptId: a.attemptId, promise });
+    }
+  }
 
   // ── Bounded worker / launch loop (no unbounded Promise.all) ──────────────
   const emittedBlocked = new Set<string>();
@@ -1840,6 +2115,9 @@ export async function assembleStepLogs(
 export interface ResumeOptions {
   onEvent?: (e: WorkflowEvent) => void;
   execStep?: StepExecutor;
+  /** Adoption of in-flight attempts (D10). Injectable for tests. */
+  adoptStep?: StepAdopter;
+  probeAdoption?: AdoptionProbe;
   sourcePath?: string;
   workflowSourcePath?: string;
   /** The detached runner performing this resume/retry (see RunWorkflowOptions.runner). */
@@ -1958,6 +2236,9 @@ export async function resumeWorkflow(
     continueExisting: true,
     onEvent: opts.onEvent,
     execStep: opts.execStep,
+    adoptStep: opts.adoptStep,
+    probeAdoption: opts.probeAdoption,
+    allowUnknownDeliveryRetry: opts.allowUnknownDeliveryRetry,
     sourcePath,
     runner: opts.runner,
     signal: opts.signal,
@@ -2004,6 +2285,8 @@ export async function retryWorkflow(
     continueExisting: true,
     onEvent: opts.onEvent,
     execStep: opts.execStep,
+    adoptStep: opts.adoptStep,
+    probeAdoption: opts.probeAdoption,
     sourcePath,
     runner: opts.runner,
     signal: opts.signal,
@@ -2074,7 +2357,7 @@ export async function cancelWorkflow(runId: string, opts: CancelOptions = {}): P
     const records = await readRegistry();
     const owned = records.filter(
       (r) =>
-        r.status !== 'dead' &&
+        sessionStatusOf(r) !== 'dead' &&
         (r.rootRunId === root || r.parentRunId === runId || r.rootRunId === runId),
     );
     const kill =

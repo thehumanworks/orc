@@ -8,7 +8,6 @@ function deadRecord(): SessionRecord {
     id: 'waitdead',
     sessionId: 'waitdead-session',
     provider: 'claude',
-    tmuxName: 'orc-test-wait-dead-does-not-exist',
     cwd: process.cwd(),
     workspace: process.cwd(),
     systemPromptMode: 'append',
@@ -23,26 +22,29 @@ describe('resolveCommand routing for state/wait', () => {
   });
 });
 
-describe('Session.waitForResult debounce outcome', () => {
-  test('a terminal-looking state at timeout is not reported as settled', async () => {
+describe('Session.waitForResult (journal-derived, no debounce)', () => {
+  // A record with no kernel session is not live: its state is `failed`.
+  test('a requested state that is already reached settles immediately', async () => {
     const result = await new Session(deadRecord()).waitForResult({
       until: ['failed'],
       timeoutMs: 0,
       pollMs: 1,
     });
-    expect(result).toEqual({ state: 'failed', settled: false });
+    expect(result).toEqual({ state: 'failed', settled: true });
   });
 
-  test('does not settle after sleeping past the timeout deadline', async () => {
+  test('a state outside `until` times out with the last observed state', async () => {
+    const t0 = Date.now();
     const result = await new Session(deadRecord()).waitForResult({
-      until: ['failed'],
+      until: ['done'],
       timeoutMs: 20,
       pollMs: 100,
     });
     expect(result).toEqual({ state: 'failed', settled: false });
+    expect(Date.now() - t0).toBeLessThan(1_000);
   });
 
-  test('waitFor keeps the legacy state-only return shape', async () => {
+  test('waitFor keeps the state-only return shape', async () => {
     const state = await new Session(deadRecord()).waitFor({
       until: ['failed'],
       timeoutMs: 0,
