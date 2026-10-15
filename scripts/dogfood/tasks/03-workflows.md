@@ -1,8 +1,12 @@
 # Task: orc workflows — core runner (feature 2a)
 
+> **Completed** (the feature shipped). Kept as an example task spec for `scripts/dogfood/run.ts`.
+> Written for the pre-actor runtime: tmux-specific steps were removed; other details (e.g. the
+> large-paste bug) are historical. Current behaviour: `README.md`, `docs/ARCHITECTURE.md`.
+
 ## Context
 You are an autonomous coding agent in an **isolated git worktree** of `orc` — a tool that drives
-coding-agent CLIs (claude/codex/pi) as interactive tmux sessions, with an SDK + an `orc` CLI. First:
+coding-agent CLIs (claude/codex/pi) as detached sessions, with an SDK + an `orc` CLI. First:
 `bun install` (no node_modules in the worktree), then read `README.md`, `docs/DESIGN-workflows.md`
 (the design you are implementing), `src/index.ts`, `src/session.ts` (note `state()`, `waitFor()`,
 `readParsed()`), `src/agent.ts`, `src/state.ts` (`AgentState`), and `scripts/dogfood/run.ts` (a
@@ -39,7 +43,7 @@ export interface StepResult {
 
 ### CRITICAL — `done` must not equate "yielded" with "succeeded"
 `state === 'done'` means the turn YIELDED (ready for input), NOT that the step succeeded — an agent
-that asks a clarifying question and stops is pane-indistinguishable from one that finished (this is a
+that asks a clarifying question and stops is indistinguishable from one that finished (this is a
 documented F1 limitation; `waitFor` returns `done`, not `waiting`, for a question). If the runner
 treated yield as success it would chain past a stalled step into garbage. So success evaluation is:
 - `step.done` provided → `ok = step.done(ctx)`.
@@ -67,13 +71,13 @@ export async function runWorkflow(def: WorkflowDef, opts?: { onEvent?: (e: Workf
      multi-KB string as the initial `prompt` (the `send()` verify-before-submit probe drops large
      pastes — this is a known bug; the harness shows the file+pointer workaround).
    - `await session.waitFor({ until: ['done','waiting','failed'], timeoutMs })` — RELIABILITY:
-     sequencing MUST use `waitFor` (the debounced settle), never an ad-hoc sleep or pane poll.
+     sequencing MUST use `waitFor` (the journal-derived settle), never an ad-hoc sleep or poll.
    - Compute `commitsAhead` (`git -C <worktree> rev-list --count main..HEAD`) when a worktree exists.
    - Evaluate `done(ctx)` (default `state==='done'`). `ok = predicate`. Record the `StepResult`,
      re-persist the run.
    - If `!ok` and not `continueOnFail`: set run `status:'failed'`, stop. Otherwise continue.
    - Leave each step's session record intact (do NOT purge) so a later `logs` command can read its
-     transcript; killing the tmux is fine (kill() persists the transcript path) but is OPTIONAL — for
+     transcript; killing the session is fine (kill() persists the transcript path) but is OPTIONAL — for
      v1 you may leave sessions running. Document the choice.
 3. Set `status:'done'` if all steps ok; `finishedAt`; final persist; return the run.
 
@@ -118,8 +122,7 @@ Throwaway `ORC_HOME="$(mktemp -d)/orc"`. Run the real example workflow end-to-en
    yielded-but-didn't-succeed step, not just an artificial false predicate. Also verify a non-worktree
    yield-only step is flagged `unverified:true`.
 4. Clean up: kill any sessions you spawned, remove throwaway ORC_HOME, restore `~/.codex/config.toml`
-   (remove temp trust entries; keep pre-existing). You run inside tmux; prefix nested spawns with
-   `TMUX= ` if needed.
+   (remove temp trust entries; keep pre-existing).
 
 ## When done
 1. `bun run typecheck` and `bun test` green.

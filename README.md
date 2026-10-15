@@ -370,6 +370,11 @@ detached workflow; and a check that `tmux` is never invoked. A missing provider 
 exits 1. Everything runs in a temp `ORC_HOME`; expect a few cents with haiku. Flags and the
 per-provider gates: [`scripts/verify-runtime/README.md`](scripts/verify-runtime/README.md).
 
+Dogfooding: `bun scripts/dogfood/run.ts spawn <task.md> [provider]` starts an implementer in a
+worktree of this repo; `bun scripts/dogfood/run.ts watch <id>` supervises it until it reports
+`DOGFOOD_COMPLETE` (with a commit), `DOGFOOD_BLOCKED: …`, or yields (example specs in
+`scripts/dogfood/tasks/`).
+
 ## Upgrading from the tmux runtime
 
 1. **Kill live pre-actor sessions first**, with the old binary (`orc kill`) or

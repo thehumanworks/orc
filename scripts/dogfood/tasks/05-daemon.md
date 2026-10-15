@@ -1,5 +1,9 @@
 # Task: orc daemon — HTTP API + tailscale federation (feature 3)
 
+> **Completed** (the feature shipped). Kept as an example task spec for `scripts/dogfood/run.ts`.
+> Written for the pre-actor runtime: tmux-specific steps were removed; other details (e.g. the
+> large-paste bug) are historical. Current behaviour: `README.md`, `docs/ARCHITECTURE.md`.
+
 > Spawn this ONLY after F2b (`--detach`/`logs`) is merged — the daemon exposes the workflow surface.
 
 ## Context
@@ -22,7 +26,7 @@ POST /sessions {provider,model,agent,systemPrompt,prompt,worktree,cwd,workspace}
 GET  /sessions/:id                        → record + state()
 POST /sessions/:id/send   {prompt}        → send
 POST /sessions/:id/wait   {for,timeoutMs} → waitFor (server-side long-poll; reuse F1)
-GET  /sessions/:id/read?raw=              → parsed turns (or raw pane)
+GET  /sessions/:id/read?raw=              → parsed turns (or the raw journal)
 POST /sessions/:id/kill   {worktree,purge}
 GET  /workflows/runs , GET /workflows/runs/:id            → list/read runs
 POST /workflows/run {file?,def?,detach?}                  → run/detach a workflow
@@ -50,7 +54,7 @@ When `--host <h>` is present, the existing CLI commands (`list`, `spawn`, `send`
 (thin client; identical output/`--json`). `orc remote add|list|rm <host>` manages `~/.orc/peers.json`.
 `orc list --all-hosts` fans out to every peer + local and aggregates with a `host` column.
 - Remote `attach`/`read --raw` are host-local: `attach` should print the host + a
-  `tailscale ssh <host>` hint instead of a bare local tmux command.
+  `tailscale ssh <host>` hint instead of a bare local command.
 
 ## Constraints
 - Bun + TypeScript, ESM, match style. `Bun.serve` only — NO new HTTP deps. `bun run typecheck` clean,
@@ -77,7 +81,6 @@ Bind to `127.0.0.1` (loopback stands in for the tailscale IP locally). Throwaway
    `x-orc-secret` → ok (all scopes); scoped bearer with insufficient scope → `403`; `/health` open.
    (On loopback, `tailscale whois` cannot resolve `127.0.0.1`, so this exercises secret/bearer + deny.)
 5. Clean up: stop the daemon, kill sessions, remove throwaway ORC_HOME, restore `~/.codex/config.toml`.
-   You run inside tmux; prefix nested spawns with `TMUX= ` if needed.
 
 ### Verification ceiling — REPORT HONESTLY (do not rubber-stamp)
 Loopback testing covers the plumbing, secret/bearer auth, 401/403 paths, and bind-refusal — but
