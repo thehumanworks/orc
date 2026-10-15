@@ -26,6 +26,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { resolveClaudeTranscript } from '../../src/runtime/providers/claude.ts';
+import { isSameProcessAlive } from '../../src/runtime/process.ts';
+import type { ProcessIdentity } from '../../src/runtime/types.ts';
 
 // ---------------------------------------------------------------------------------
 // args
@@ -173,7 +175,6 @@ function psList(): Proc[] {
   return out;
 }
 const liveProcs = (): Proc[] => psList().filter((p) => !p.stat.startsWith('Z') && p.pid !== process.pid);
-const isAlive = (pid: number | undefined): boolean => !!pid && liveProcs().some((p) => p.pid === pid);
 async function until(pred: () => boolean, ms: number): Promise<boolean> {
   const end = Date.now() + ms;
   while (Date.now() < end) {
@@ -182,6 +183,7 @@ async function until(pred: () => boolean, ms: number): Promise<boolean> {
   }
   return pred();
 }
+/** SIGKILL a process (and its group). Callers pass only pids this run started. */
 function killTree(pid: number | undefined): void {
   if (!pid) return;
   for (const target of [-pid, pid]) {
@@ -191,6 +193,33 @@ function killTree(pid: number | undefined): void {
       /* gone / not a group */
     }
   }
+}
+
+/** SIGKILL the actor + provider groups recorded in every state.json under `root`. */
+function killEverythingUnder(root: string): void {
+  const walk = (dir: string, depth: number): void => {
+    if (depth > 6) return;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p, depth + 1);
+      else if (e.name === 'state.json') {
+        try {
+          const st = JSON.parse(fs.readFileSync(p, 'utf8')) as { lease?: ProcessIdentity; provider?: ProcessIdentity };
+          // Identity-checked (pid + start time): a recycled pid is never signalled.
+          for (const id of [st.lease, st.provider]) if (id && isSameProcessAlive(id)) killTree(id.pid);
+        } catch {
+          /* unreadable */
+        }
+      }
+    }
+  };
+  walk(root, 0);
 }
 
 // ---------------------------------------------------------------------------------
@@ -284,7 +313,7 @@ async function orcJson<T = Record<string, unknown>>(ctx: Ctx, args: string[], ti
   return parsed as T;
 }
 
-function readState(ctx: Ctx, sid: string): { lease?: { pid: number }; provider?: { pid: number }; phase?: string } {
+function readState(ctx: Ctx, sid: string): { lease?: ProcessIdentity; provider?: ProcessIdentity; phase?: string } {
   try {
     return JSON.parse(fs.readFileSync(path.join(ctx.home, 'sessions', sid, 'state.json'), 'utf8'));
   } catch {
@@ -338,10 +367,10 @@ async function cliE2E(p: Provider, ctx: Ctx, model: string | undefined): Promise
   const CODEWORD = `ORCHID${tag}`;
   let id = '';
   let sid = '';
-  const providerPids = new Set<number>();
+  const providers = new Map<number, ProcessIdentity>();
   const notePids = () => {
     const st = sid ? readState(ctx, sid) : {};
-    if (st.provider?.pid) providerPids.add(st.provider.pid);
+    if (st.provider?.pid) providers.set(st.provider.pid, st.provider);
     return st;
   };
   try {
@@ -373,13 +402,13 @@ async function cliE2E(p: Provider, ctx: Ctx, model: string | undefined): Promise
       await readContains(ctx, id, 'KIWI');
       return `phase ${a.phase}; replay → replayed:true; reply KIWI`;
     });
-    let oldProvider: number | undefined;
+    let oldProvider: ProcessIdentity | undefined;
     await s.step('e2e SIGKILL actor → list shows suspended', async () => {
       const st = notePids();
-      const actor = st.lease?.pid;
-      check(actor && isAlive(actor), 'no live actor in state.json');
-      oldProvider = st.provider?.pid;
-      process.kill(actor, 'SIGKILL');
+      const actor = st.lease;
+      check(actor && isSameProcessAlive(actor), 'no live actor in state.json');
+      oldProvider = st.provider;
+      process.kill(actor.pid, 'SIGKILL');
       let status = '';
       const end = Date.now() + 15_000;
       while (Date.now() < end) {
@@ -389,7 +418,7 @@ async function cliE2E(p: Provider, ctx: Ctx, model: string | undefined): Promise
         await Bun.sleep(300);
       }
       check(status === 'suspended', `list status ${status}`);
-      return `actor ${actor} killed; status suspended`;
+      return `actor ${actor.pid} killed; status suspended`;
     });
     await s.step('e2e send wakes it and recalls the codeword', async () => {
       const r = await orcJson<{ phase: string }>(ctx, [
@@ -403,20 +432,20 @@ async function cliE2E(p: Provider, ctx: Ctx, model: string | undefined): Promise
     });
     await s.step('e2e exactly one provider process for the session', async () => {
       const st = notePids();
-      const fresh = st.provider?.pid;
-      check(fresh && isAlive(fresh), 'no live provider recorded after wake');
-      check(fresh !== oldProvider, 'provider pid did not change across the wake');
-      const gone = await until(() => !isAlive(oldProvider), 10_000);
-      check(gone, `the pre-crash provider ${oldProvider} is still running`);
-      const others = liveProcs().filter((x) => x.cmd.includes(sid) && !x.cmd.includes('__actor') && x.pid !== fresh);
+      const fresh = st.provider;
+      check(fresh && isSameProcessAlive(fresh), 'no live provider recorded after wake');
+      check(fresh.pid !== oldProvider?.pid, 'provider pid did not change across the wake');
+      const gone = await until(() => !isSameProcessAlive(oldProvider), 10_000);
+      check(gone, `the pre-crash provider ${oldProvider?.pid} is still running`);
+      const others = liveProcs().filter((x) => x.cmd.includes(sid) && !x.cmd.includes('__actor') && x.pid !== fresh.pid);
       check(others.length === 0, `other live processes for the session: ${others.map((o) => o.pid).join(',')}`);
-      return `pre-crash provider ${oldProvider ?? '?'} gone; one live provider ${fresh}`;
+      return `pre-crash provider ${oldProvider?.pid ?? '?'} gone; one live provider ${fresh.pid}`;
     });
     await s.step('e2e takeover → resume command; send refused', async () => {
-      const live = notePids().provider?.pid;
+      const live = notePids().provider;
       const t = await orcJson<{ command: string; cwd: string }>(ctx, ['takeover', id]);
       check(t.command && !t.command.startsWith('#') && t.command.includes(' && '), `command "${t.command}"`);
-      check(await until(() => !isAlive(live), 15_000), `provider ${live} still running after takeover`);
+      check(await until(() => !isSameProcessAlive(live), 15_000), `provider ${live?.pid} still running after takeover`);
       const refused = await orc(ctx, ['send', id, 'this must be refused']);
       check(refused.code !== 0, 'send after takeover succeeded');
       check(/orc resume/.test(refused.err), `refusal lacks the resume hint: ${refused.err}`);
@@ -448,16 +477,20 @@ async function cliE2E(p: Provider, ctx: Ctx, model: string | undefined): Promise
     }
     await s.always('e2e no orc/provider processes left', async () => {
       if (!sid) return 'nothing was started';
+      const ids = [...providers.values()];
       const settled = await until(
-        () => ![...providerPids].some((x) => isAlive(x)) && !liveProcs().some((x) => x.cmd.includes(sid)),
+        () => !ids.some((x) => isSameProcessAlive(x)) && !liveProcs().some((x) => x.cmd.includes(sid)),
         15_000,
       );
       if (!settled) {
-        const leaked = liveProcs().filter((x) => x.cmd.includes(sid) || providerPids.has(x.pid));
-        for (const x of leaked) killTree(x.pid);
-        throw new Error(`leaked processes (now killed): ${leaked.map((x) => x.pid).join(',')}`);
+        const leaked = [
+          ...liveProcs().filter((x) => x.cmd.includes(sid)).map((x) => x.pid),
+          ...ids.filter((x) => isSameProcessAlive(x)).map((x) => x.pid),
+        ];
+        for (const pid of leaked) killTree(pid);
+        throw new Error(`leaked processes (now killed): ${[...new Set(leaked)].join(',')}`);
       }
-      return `none (provider pids seen: ${[...providerPids].join(',') || '-'})`;
+      return `none (provider pids seen: ${[...providers.keys()].join(',') || '-'})`;
     });
   }
 }
@@ -493,14 +526,17 @@ async function workflowE2E(ctx: Ctx, model: string | undefined): Promise<void> {
   // Workflow steps take the provider's default model; --claude-model applies via the env.
   const wctx: Ctx = { ...ctx, env: { ...ctx.env, ...(model ? { ANTHROPIC_MODEL: model } : {}) } };
   let runId = '';
-  let runnerPid: number | undefined;
+  let runner: ProcessIdentity | undefined;
   try {
     await s.step('workflow run --detach', async () => {
       const r = await orcJson<{ runId: string }>(wctx, ['workflow', 'run', file, '--detach']);
       runId = r.runId;
-      const st = await orcJson<{ runner?: { pid: number } }>(wctx, ['workflow', 'status', runId]);
-      runnerPid = st.runner?.pid;
-      return `run ${runId} (runner pid ${runnerPid ?? '?'})`;
+      // The full record carries the runner's start time (the public status view does not).
+      const rec = JSON.parse(fs.readFileSync(path.join(ctx.home, 'runs', `${runId}.json`), 'utf8')) as {
+        runner?: ProcessIdentity;
+      };
+      runner = rec.runner ? { pid: rec.runner.pid, startTime: rec.runner.startTime ?? null } : undefined;
+      return `run ${runId} (runner pid ${runner?.pid ?? '?'})`;
     });
     await s.step('workflow attach follows to done', async () => {
       const r = await orc(wctx, ['workflow', 'attach', runId], 900_000);
@@ -530,13 +566,16 @@ async function workflowE2E(ctx: Ctx, model: string | undefined): Promise<void> {
       if (runId) await orc(wctx, ['workflow', 'cleanup', runId, '--sessions', '--json'], 120_000);
       await orc(wctx, ['prune', '--json'], 60_000);
       const settled = await until(
-        () => !isAlive(runnerPid) && !liveProcs().some((x) => sids.some((sid) => x.cmd.includes(sid))),
+        () => !isSameProcessAlive(runner) && !liveProcs().some((x) => sids.some((sid) => x.cmd.includes(sid))),
         20_000,
       );
       if (!settled) {
-        const leaked = liveProcs().filter((x) => x.pid === runnerPid || sids.some((sid) => x.cmd.includes(sid)));
-        for (const x of leaked) killTree(x.pid);
-        throw new Error(`leaked processes (now killed): ${leaked.map((x) => x.pid).join(',')}`);
+        const leaked = liveProcs()
+          .filter((x) => sids.some((sid) => x.cmd.includes(sid)))
+          .map((x) => x.pid);
+        if (runner && isSameProcessAlive(runner)) leaked.push(runner.pid);
+        for (const pid of leaked) killTree(pid);
+        throw new Error(`leaked processes (now killed): ${leaked.join(',')}`);
       }
       return `${sids.length} step session(s) cleaned up; runner gone`;
     });
@@ -620,6 +659,15 @@ async function main(): Promise<number> {
   }
   const env = baseEnv(shimDir);
   for (const p of PROVIDERS) if (args.bin[p] && BIN_ENV[p]) env[BIN_ENV[p]!] = path.join(shimDir, p);
+  // Ctrl-C: stop every actor/provider this run started (found via its temp ORC_HOMEs).
+  const onInterrupt = () => {
+    console.error('\ninterrupted: stopping the sessions this run started…');
+    killEverythingUnder(root);
+    if (!args.keep) fs.rmSync(root, { recursive: true, force: true });
+    process.exit(130);
+  };
+  process.once('SIGINT', onInterrupt);
+  process.once('SIGTERM', onInterrupt);
 
   console.log('orc runtime verification (tmux-free actor runtime)');
   const host = { platform: process.platform, arch: process.arch, osRelease: os.release() };
@@ -657,10 +705,14 @@ async function main(): Promise<number> {
     }
     console.log(`  running scripts/verify-runtime/${p}.ts …`);
     const t0 = Date.now();
-    const g = await runtimeGate(p, env, args.model[p]);
-    gates[p] = g;
-    const passed = g.rows.filter((r) => r.status === 'PASS').length;
-    record(p, 'runtime gate', g.exitCode === 0 ? 'PASS' : 'FAIL', `${passed}/${g.rows.length} steps; ${g.summary}`, Date.now() - t0);
+    try {
+      const g = await runtimeGate(p, env, args.model[p]);
+      gates[p] = g;
+      const passed = g.rows.filter((r) => r.status === 'PASS').length;
+      record(p, 'runtime gate', g.exitCode === 0 ? 'PASS' : 'FAIL', `${passed}/${g.rows.length} steps; ${g.summary}`, Date.now() - t0);
+    } catch (e) {
+      record(p, 'runtime gate', 'FAIL', `harness error: ${(e as Error)?.message ?? String(e)}`, Date.now() - t0);
+    }
   }
 
   // 3. CLI e2e
@@ -671,9 +723,13 @@ async function main(): Promise<number> {
       continue;
     }
     const ctx: Ctx = { provider: p, home: path.join(root, p, 'orc-home'), repo: path.join(root, p, 'repo'), env };
-    fs.mkdirSync(ctx.home, { recursive: true });
-    mkRepo(ctx.repo, env);
-    await cliE2E(p, ctx, args.model[p]);
+    try {
+      fs.mkdirSync(ctx.home, { recursive: true });
+      mkRepo(ctx.repo, env);
+      await cliE2E(p, ctx, args.model[p]);
+    } catch (e) {
+      record(p, 'e2e', 'FAIL', `harness error: ${(e as Error)?.message ?? String(e)}`);
+    }
   }
 
   // 4. workflow
@@ -682,9 +738,13 @@ async function main(): Promise<number> {
     record('claude', 'workflow', 'SKIP', !args.workflow ? '--no-workflow' : 'claude unavailable or not selected');
   } else {
     const ctx: Ctx = { provider: 'claude', home: path.join(root, 'workflow', 'orc-home'), repo: path.join(root, 'workflow', 'repo'), env };
-    fs.mkdirSync(ctx.home, { recursive: true });
-    mkRepo(ctx.repo, env);
-    await workflowE2E(ctx, args.model.claude);
+    try {
+      fs.mkdirSync(ctx.home, { recursive: true });
+      mkRepo(ctx.repo, env);
+      await workflowE2E(ctx, args.model.claude);
+    } catch (e) {
+      record('claude', 'workflow', 'FAIL', `harness error: ${(e as Error)?.message ?? String(e)}`);
+    }
   }
 
   // tmux shim
