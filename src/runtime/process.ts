@@ -65,22 +65,42 @@ export function cliEntryPath(): string {
   return path.resolve(import.meta.dir, '..', 'cli', 'index.ts');
 }
 
+let procfsAvailable: boolean | undefined;
+function hasProcfs(): boolean {
+  if (procfsAvailable === undefined) {
+    try {
+      procfsAvailable = fs.readFileSync('/proc/self/stat', 'utf8').length > 0;
+    } catch {
+      procfsAvailable = false;
+    }
+  }
+  return procfsAvailable;
+}
+
 /**
  * Opaque start-time token for `pid`, or null when the process does not exist / cannot
- * be inspected. Linux: /proc/<pid>/stat field 22 (clock ticks since boot). macOS (and
- * Linux fallback): `ps -o lstart=` (1 s resolution — adequate as a reuse guard).
+ * be inspected. Linux: /proc/<pid>/stat field 22 (clock ticks since boot). macOS:
+ * `ps -o lstart=` (1 s resolution — adequate as a reuse guard).
+ *
+ * The token SOURCE is fixed per host: on a procfs host a transient read failure returns
+ * null (unknown → treated as "same process" by isSameProcessAlive) rather than a `ps:`
+ * token that could never equal a stored `proc:` token and would make a live process
+ * look recycled.
  */
 export function processStartTime(pid: number): string | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-    // comm (field 2) may contain spaces/parens: parse after the LAST ')'.
-    const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
-    // rest[0] is field 3 (state) → field 22 is rest[19].
-    const ticks = rest[19];
-    if (ticks && /^\d+$/.test(ticks)) return `proc:${ticks}`;
-  } catch {
-    // no procfs (macOS) or process gone — fall through to ps.
+  if (hasProcfs()) {
+    try {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+      // comm (field 2) may contain spaces/parens: parse after the LAST ')'.
+      const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      // rest[0] is field 3 (state) → field 22 is rest[19].
+      const ticks = rest[19];
+      if (ticks && /^\d+$/.test(ticks)) return `proc:${ticks}`;
+    } catch {
+      // process gone or transiently unreadable — unknown.
+    }
+    return null;
   }
   try {
     const r = Bun.spawnSync(['ps', '-o', 'lstart=', '-p', String(pid)], {
@@ -115,7 +135,11 @@ export function isSameProcessAlive(id: ProcessIdentity | undefined | null): bool
   if (!id || !isPidAlive(id.pid)) return false;
   if (id.startTime === null) return true;
   const now = processStartTime(id.pid);
-  return now === null ? true : now === id.startTime;
+  if (now === null) return true;
+  // Tokens from different sources (e.g. a record written on another host type) are not
+  // comparable — fall back to pid liveness rather than declaring the process recycled.
+  if (now.split(':', 1)[0] !== id.startTime.split(':', 1)[0]) return true;
+  return now === id.startTime;
 }
 
 /** Signal a whole process group (pgid === leader pid). Missing group is not an error. */

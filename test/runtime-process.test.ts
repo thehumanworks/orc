@@ -43,6 +43,10 @@ describe('runtime/process', () => {
     expect(isSameProcessAlive({ pid: process.pid, startTime: 'proc:1' })).toBe(false);
     expect(isSameProcessAlive({ pid: process.pid, startTime: null })).toBe(true);
     expect(isSameProcessAlive(null)).toBe(false);
+    // A token from the other source (proc vs ps) is not comparable → pid liveness wins.
+    const own = processStartTime(process.pid)!;
+    const foreign = own.startsWith('proc:') ? 'ps:Thu Jan  1 00:00:00 1970' : 'proc:1';
+    expect(isSameProcessAlive({ pid: process.pid, startTime: foreign })).toBe(true);
   });
 
   test('spawnDetached: own session, no tty, logs to file, terminated by group', async () => {
