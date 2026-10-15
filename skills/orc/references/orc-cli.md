@@ -6,7 +6,8 @@ reference from the binary you are running.
 Conventions:
 
 - Flags are parsed per subcommand and strictly (an unknown flag is an error). Every command except
-  `help` takes `--json`.
+  `help` takes `--json`. There is no per-subcommand `--help` (`orc spawn --help` is an unknown-flag
+  error): `orc help` (or `orc --help`, `-h`) prints the whole reference.
 - Errors: exit 1; with `--json` the error is `{"error": "..."}` on **stdout**, otherwise
   `error: ...` on stderr.
 - A session is addressed by short id, full session id, `@alias` (current workspace) or
@@ -15,6 +16,13 @@ Conventions:
 - Prompt arguments: literal text, `-` (stdin) or `@path` (file). Multi-line text is delivered
   verbatim as one message. Text that starts with `-` goes after `--`
   (`orc send <id> -- "-v is broken"`).
+- `orc send <id>` with **no** prompt argument reads stdin when stdin is not a terminal (it blocks
+  until EOF; empty stdin is an error) and errors on a terminal. `orc spawn` never reads stdin
+  implicitly: no `--prompt` means no initial prompt.
+- Workspace of a session: `--workspace W`, else the git toplevel of its cwd, else the cwd. A
+  `--worktree` session belongs to its parent repo's workspace, but a session spawned with
+  `--cwd` **inside an existing linked worktree** gets that worktree's toplevel: plain `orc list` and
+  `@alias` run from the main checkout won't see it. Pass `--workspace <repo>` (or use the id).
 
 ## Session commands
 
@@ -23,7 +31,7 @@ Conventions:
 | `orc spawn` (aliases `agent`, `new`) | see below | 0 / 1 | `SessionRecord` (`id`, `sessionId`, `provider`, `cwd`, `worktreePath?`, `branch?`, `workspace`, `alias?`, …) |
 | `orc send <sel> [PROMPT\|-\|@file]` | `--idempotency-key K`, `--no-wake` | 0 acknowledged/queued, **3 unknown**, 1 failed/error | `{ok, id, phase, messageId, replayed}` |
 | `orc read <sel>` | `--last` (default) \| `--index N` \| `--full` \| `--raw` | 0 / 1 | `Turn[]`; `--raw`: `{id, journal}`; no transcript yet: `{id, fallback: true, journal}` |
-| `orc state <sel>` | — | 0 / 1 | `{id, state, status, stopped, suspended, live, pendingMessages, openTurn?, lastTurn?, stopReason?}` |
+| `orc state <sel>` | — | 0 / 1 | `{id, state, status, stopped, suspended, live, pendingMessages, openTurn?, lastTurn?, stopReason?, legacy?}` |
 | `orc wait <sel>` | `--for done\|waiting\|failed\|settled` (default settled), `--timeout SEC` (default 600) | 0 reached, 1 timeout/error | `{id, state, elapsedMs, timedOut}` |
 | `orc list` (alias `ps`) | `--workspace W`, `--all`, `--dead`, `--all-hosts`, `--run ID`, `--lineage` | 0 / 1 | records + `status` + `state` (+ `lineage`; `host` with `--all-hosts`) |
 | `orc attach <sel>` | — | 0 when the session stops/suspends or Ctrl-C; 1 no runtime state | `{id, command, journalPath}` (no follow) |
@@ -120,8 +128,8 @@ last state and exits 1. After 3 consecutive failed starts a session is no longer
 | `orc workflow status <runId> [--json]` | per-step state + attempts; a `running` run whose owner died → `orphaned` |
 | `orc workflow attach <runId> [--json]` | follow a `--detach` run's runner.log until it ends; `--json` `{runId, logPath, runner}` |
 | `orc workflow logs <runId> [--step id] [--raw] [--json]` | parsed transcript per step; `--raw` each step session's last 200 journal entries; `--json` `{step, turns}[]` / `{step, provider, journal}[]` |
-| `orc workflow resume <runId> <file> [--detach] [--json]` | skips successes, adopts in-flight steps whose instruction reached a resumable session. `<file>` required locally (over `--host`: defaults to the run's recorded file) |
-| `orc workflow retry <runId> [--step id] <file> [--detach] [--json]` | new attempts for failed/incomplete steps (or `--step` and its descendants); history kept. `<file>` as for resume |
+| `orc workflow resume <runId> <file> [--detach] [--json]` | skips successes, adopts in-flight steps whose instruction reached a resumable session. `<file>` required locally (over `--host`: defaults to the run's recorded file). `--detach --json`: `{runId, logPath, action: "resume"}` |
+| `orc workflow retry <runId> [--step id] <file> [--detach] [--json]` | new attempts for failed/incomplete steps (or `--step` and its descendants); history kept. `<file>` as for resume. `--detach --json`: `{runId, logPath, action: "retry"}` |
 | `orc workflow cancel <runId> [--cascade] [--json]` | idempotent; `--cascade` kills only sessions owned by the run |
 | `orc workflow cleanup <runId> [--sessions] [--worktrees] [--json]` | removes owned sessions/worktrees only |
 
@@ -168,7 +176,7 @@ removed `codex app-server` runtime are `dead` with no transcript.
 | --- | --- |
 | `orc daemon [--port 8787] [--bind <ip>] [--insecure]` | HTTP API on the host's tailscale IP; refuses `0.0.0.0` without `--insecure` |
 | `orc remote add\|list\|rm <host> [--port P]` | trusted peers (`~/.orc/peers.json`) |
-| `orc --host <h> <command>` | `list`/`spawn`/`send`/`read`/`wait`/`state`/`kill`/`workflow` against a peer; same output and `--json`. `attach` prints `tailscale ssh <h> orc attach <id>`. `resume`/`takeover`/`prune`/`daemon`/`remote` are host-local (error) |
+| `orc --host <h> <command>` | `list`/`spawn`/`send`/`read`/`wait`/`state`/`kill`/`workflow` against a peer, with local output and `--json` except: `state --json` is only `{id, state, status, suspended, stopped}`; `list` takes only `--workspace`/`--all`/`--dead` and its rows have no `lineage`; `workflow resume`/`retry` take no `--detach`. `attach` / `workflow attach` print `tailscale ssh <h> orc attach <id>` / `… orc workflow attach <runId>`. `resume`/`takeover`/`prune`/`daemon`/`remote` are host-local (error) |
 | `orc list --all-hosts` | local + every peer, with a `host` column; an unreachable peer is a stderr warning |
 
 Auth is fail-closed: allowlisted tailnet identity (all scopes), `Authorization: Bearer` (client

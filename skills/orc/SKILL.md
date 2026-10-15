@@ -191,6 +191,10 @@ don't collide — each gets an isolated checkout on its own branch. Then you rev
 and merge the good ones. Things to remember:
 
 - `--worktree` requires the cwd to be inside a git repo (orc errors otherwise).
+- A `--worktree` session stays in the repo's workspace, but a session you point at an existing
+  worktree with `--cwd` lands in *that worktree's* workspace (invisible to `orc list` / `@alias`
+  from the repo). Add `--workspace "$(git rev-parse --show-toplevel)"` (run from the repo) when you
+  do that.
 - A fresh worktree has no `node_modules`/deps — tell the subagent to install first if it needs to
   build or test.
 - **Every worktree is cleanup you owe.** `orc kill <id> --worktree` removes the session's worktree;
@@ -240,8 +244,10 @@ orc send "$ID" "Read /tmp/spec.md and implement it; commit when done." --idempot
 orc wait "$ID" --for settled --timeout 1800             # block until it yields (exit 1 = timed out)
 orc state "$ID" --json                                  # done? or failed (lastTurn.error)?
 orc read "$ID"                                          # see what it did (token-efficient)
-# verify: a SECOND provider reviews the SAME branch (run it IN that worktree)
-RV=$(orc spawn -p codex --cwd "$WT" --prompt "Review the diff on this branch for correctness; be adversarial." --json | jq -r .id)
+# verify: a SECOND provider reviews the SAME branch (run it IN that worktree; --workspace keeps it
+# in this repo's workspace — a --cwd inside a linked worktree would otherwise get its own)
+REPO=$(git rev-parse --show-toplevel)                    # the main checkout (run from the repo)
+RV=$(orc spawn -p codex --cwd "$WT" --workspace "$REPO" --prompt "Review the diff on this branch for correctness; be adversarial." --json | jq -r .id)
 orc wait "$RV" --for settled && orc read "$RV"
 # ... you review the diff + merge the branch if it's good ...
 orc kill "$ID" --worktree --purge; orc kill "$RV" --purge   # kill sessions + remove the worktree

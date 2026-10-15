@@ -79,14 +79,13 @@ Current behaviour: [`../README.md`](../README.md), [`ARCHITECTURE.md`](ARCHITECT
 | command | before | now |
 | --- | --- | --- |
 | `read --raw --json` | `{id, pane}` | `{id, journal}`; fallback `{id, fallback: true, journal}` |
-| `state --json` | `{id, state}` | `{id, state, status, stopped, suspended, live, pendingMessages, openTurn?, lastTurn?, stopReason?}` |
+| `state --json` | `{id, state}` | `{id, state, status, stopped, suspended, live, pendingMessages, openTurn?, lastTurn?, stopReason?, legacy?}` |
 | `send` | exit 0/1 | exit 0 acknowledged/queued, **3 unknown**, 1 failed; `{ok, id, phase, messageId, replayed}` |
 | `list` | statuses `running`/`dead` | `running`/`suspended`/`spawning`/`dead` |
 | `attach --json` | tmux attach command | `{id, command: "orc attach <id>", journalPath}` |
 | `workflow run --detach --json` | `{runId, runnerTmux}` | `{runId, logPath}` |
 | `workflow logs --raw --json` | `{step, provider, pane}[]` | `{step, provider, journal}[]` |
 | `workflow attach` | printed a tmux command | follows `runner.log` until the run ends |
-| `workflow resume/retry` | file optional | `<file>` required locally (over `--host`: the run's recorded file) |
 | `resume`, `takeover`, `prune`, `daemon`, `remote` | — | host-local: error under `--host` |
 
 ## Breaking changes for SDK users (`src/index.ts`)
@@ -95,15 +94,18 @@ Current behaviour: [`../README.md`](../README.md), [`ARCHITECTURE.md`](ARCHITECT
   `runnerTmuxName`, `PaneInfo`, `DeliveryRecord`, `hashPayload`, `evaluateDeliveryReplay`,
   `readDelivery`, `persistDelivery`.
 - **Removed members/options**: `Session.tmuxName`, `Session.capture()`, `AgentOptions.driver`,
-  `pruneSessions({driver})`, the `Session` constructor's driver argument.
-- **Changed**: `SessionStatus` = `running | suspended | spawning | dead`; `SendOptions` =
+  `pruneSessions({driver})`, the `Session` constructor's driver argument, `SessionRecord.tmuxName`.
+- **Changed**: `SessionStatus` = `running | suspended | spawning | dead` (was `running | dead`), so
+  `statusOf()` now returns `Map<string, SessionStatus>`; `SendOptions` =
   `{messageId, wake, ackTimeoutMs}`; `SendResult` = `{phase, messageId, replayed}`;
   `Session.attach()` follows the journal and resolves an exit code; `attachCommand()` returns
   `orc attach <id>`; `listSessions` hides dead, shows suspended/spawning; `WorkflowRun.runnerTmux` →
   `runner {pid, startTime, logPath, startedAt}`; `WORKFLOW_SCHEMA_VERSION` 4 → 5;
   `SessionRecord.transcriptSessionId` → `providerSessionId`, `instructionsPath` → `systemPromptPath`.
-- **Added**: `Session.takeover()`, `resume()`, `journal()`, `journalPath()`, `stateDetail()`,
-  `interrupt()`, `awaitReady()`; `AgentOptions.readyTimeoutMs`; `pruneSessions({suspended,
+- **Added**: `Session.takeover()`, `resume()`, `journal()`, `journalPath()`, `stateDetail()` (its
+  `SessionStateDetail` carries `legacy?: true` for a pre-actor record), `interrupt()`,
+  `awaitReady()`; `SessionRecord` fields `runtime` (`"actor"`), `stoppedBy` (`kill` | `takeover`),
+  `legacy` (`"tmux"`), `legacyTmuxName`; `AgentOptions.readyTimeoutMs`; `pruneSessions({suspended,
   takenOver})`; `SessionNotControllableError` (codes `ORC_SESSION_STOPPED`, `ORC_MESSAGE_CONFLICT`,
   `ORC_SESSION_LEGACY`, `ORC_SESSION_UNKNOWN`); journal renderers (`renderJournal`,
   `renderJournalEntry`, `renderCapture`, `lastAssistantText`); `nativeResumeCommand`;
@@ -141,7 +143,7 @@ All migrations happen on read; nothing needs to be run.
 4. Clean up: `orc prune` (drops legacy and dead records); optionally delete `~/.orc/messages/`.
    One-off privacy fix for old state: `chmod -R go-rwx ~/.orc`.
 5. Update scripts for the JSON and exit-code changes above (notably `send` exit 3, `read --raw`
-   → `journal`, `list` statuses, `workflow resume/retry <file>`).
+   → `journal`, `list` statuses).
 6. Daemon fleets: upgrade every host; `GET /health` → `api` tells versions apart (a v2 client still
    reads v1 answers).
 7. Verify on the host: `bun scripts/verify-runtime/all.ts --claude-model haiku` (README →

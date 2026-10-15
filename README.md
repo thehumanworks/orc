@@ -80,6 +80,8 @@ Rules that matter for scripts:
   `--no-wake`. After 3 consecutive failed starts, auto-wake stops (`send` only queues) until
   `orc resume`.
 - `orc kill` drops messages still queued for the session (their delivery becomes `failed`).
+  `kill --worktree` and `prune --worktree` remove the worktree checkout but keep its branch (it may
+  hold the agent's commits); delete the branch yourself once merged.
 - `orc prune` removes `dead` records and their session dirs. It keeps `running` and `spawning`
   sessions; keeps `suspended` ones unless `--suspended` (which stops them first, under the
   session's lock, so a concurrent `orc resume` either wins or finds nothing); and keeps sessions a
@@ -136,7 +138,7 @@ dir, and removes a `--worktree` it created.
 | `spawn` | 0 / 1 | the `SessionRecord` |
 | `send` | 0 `acknowledged` or `queued`; **3** `unknown`; 1 failed or error | `{ok, id, phase, messageId, replayed}` |
 | `read` | 0 / 1 | `Turn[]`; `--raw`: `{id, journal}`; no transcript yet: `{id, fallback: true, journal}` |
-| `state` | 0 / 1 | `{id, state, status, stopped, suspended, live, pendingMessages, openTurn?, lastTurn?, stopReason?}` |
+| `state` | 0 / 1 | `{id, state, status, stopped, suspended, live, pendingMessages, openTurn?, lastTurn?, stopReason?, legacy?}` |
 | `wait` | 0 iff a requested state was reached; 1 on timeout or error | `{id, state, elapsedMs, timedOut}` |
 | `list` | 0 / 1 | records, each with `status` and `state` |
 | `attach` | 0 when the session stops/suspends or on Ctrl-C; 1 if it has no runtime state | `{id, command, journalPath}` (does not follow) |
@@ -159,6 +161,9 @@ With `--json`, errors print `{"error": "..."}` on stdout and exit 1.
   (the ack wait is bounded at 10 s). `unknown` (exit 3): cut before the provider acked it; orc
   never re-sends it, so check `orc read`, then send again with a new key.
 - A killed or taken-over session refuses sends until `orc resume`.
+- With no prompt argument, `send` reads stdin when it is not a terminal (blocking until EOF; empty
+  input is an error) and errors on a terminal. `spawn` never reads stdin implicitly.
+- There is no per-subcommand `--help`; `orc help` prints the whole reference.
 
 ### Examples
 
@@ -301,7 +306,8 @@ orc workflow cleanup <runId> [--sessions] [--worktrees] [--json]
   last 200 journal entries of each step session; `--json` emits `{step, turns}[]`, or
   `{step, provider, journal}[]` with `--raw`.
 - **`resume` / `retry`** need the original workflow file locally (over `--host` the daemon falls
-  back to the run's recorded source file); the plan digest must match. A step whose session a
+  back to the run's recorded source file); the plan digest must match. With `--detach` they start a
+  detached runner and return at once (`--json`: `{runId, logPath, action}`). A step whose session a
   human took over is never relaunched around them: the attempt fails as `taken_over`; hand the
   session back (`orc resume <id>`), then `orc workflow retry <runId> --step <id>`.
 - **Events**: each attempt transition is emitted once and only forward
@@ -366,9 +372,11 @@ orc list --all-hosts               # fleet view with a host column
   (cancelled, live owner); 502 the provider failed to start; 500 anything else.
 - `GET /health` reports `api: 2` (raw reads return `journal`). `--host` still works against a v1
   (pre-actor) daemon: its `submitted` send phase counts as success and `pane` reads render.
-- `--host` covers `list`, `spawn`, `send`, `read`, `wait`, `state`, `kill` and `workflow`. Remote
-  `attach` prints `tailscale ssh <host> orc attach <id>`. `resume`, `takeover`, `prune`, `daemon`
-  and `remote` are host-local.
+- `--host` covers `list`, `spawn`, `send`, `read`, `wait`, `state`, `kill` and `workflow`, with the
+  local output except: `state --json` is only `{id, state, status, suspended, stopped}`; `list`
+  takes only `--workspace`/`--all`/`--dead` (rows have no `lineage`); `workflow resume`/`retry`
+  take no `--detach`. Remote `attach` prints `tailscale ssh <host> orc attach <id>`. `resume`,
+  `takeover`, `prune`, `daemon` and `remote` are host-local.
 - **Auth is fail-closed** on every route but `/health`: an allowlisted tailnet identity (all
   scopes); `Authorization: Bearer` from `ORC_DAEMON_TOKENS` (JSON `token → scopes`; client:
   `ORC_DAEMON_TOKEN`); or legacy `x-orc-secret` = `ORC_DAEMON_SECRET` (all scopes). Missing or
@@ -380,8 +388,12 @@ orc list --all-hosts               # fleet view with a host column
 
 - A session's workspace is `--workspace W` (realpath when it is a path), else the git toplevel of
   its cwd, else the cwd's realpath. A `--worktree` session belongs to its parent repo's workspace.
-- `orc list` shows the current workspace's `running` and `suspended` sessions; `--workspace W`,
-  `--all` (every workspace, dead included) and `--dead` widen it.
+- But a session spawned with `--cwd` **inside an existing linked worktree** (e.g. a reviewer
+  pointed at another agent's worktree) gets that worktree's toplevel as its workspace: plain
+  `orc list` and `@alias` from the main checkout don't see it. Pass `--workspace <repo>` to keep
+  it in the repo's workspace, or address it by id.
+- `orc list` shows the current workspace's `running`, `suspended` and `spawning` sessions;
+  `--workspace W`, `--all` (every workspace, dead included) and `--dead` widen it.
 - `--alias debugger` makes `@debugger` (same workspace) and `@<workspace-name>:debugger` resolve
   to the session. An alias is unique among a workspace's active (running or suspended) sessions
   and reusable once the old session is killed or pruned. Dead records stay addressable by id.

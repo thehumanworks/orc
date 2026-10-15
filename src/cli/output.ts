@@ -371,9 +371,12 @@ daemon + remote (drive agents on other orc hosts over tailscale):
   orc remote add <h>    Trust peer <h> (also the host list for --host / --all-hosts).
   orc --host <h> <cmd>  Run <cmd> against the daemon on <h> (host or host:port) over HTTP
                         instead of locally — list/spawn/send/read/wait/state/kill/workflow.
-                        Output (and --json) is identical to local. Sends Bearer from
-                        \$ORC_DAEMON_TOKEN and/or x-orc-secret from \$ORC_DAEMON_SECRET when set.
-                        Remote attach prints \`tailscale ssh <host> orc attach <id>\`.
+                        Output (and --json) matches local, except: state --json is only
+                        {id,state,status,suspended,stopped}; list takes only --workspace/
+                        --all/--dead (rows have no lineage); workflow resume/retry take no
+                        --detach. Sends Bearer from \$ORC_DAEMON_TOKEN and/or x-orc-secret
+                        from \$ORC_DAEMON_SECRET when set. Remote attach / workflow attach
+                        print a \`tailscale ssh <host> orc …\` command instead of following.
   orc list --all-hosts  Fleet view: aggregate local + every trusted peer, with a host column.
 
 codex provider (orc's built-in harness; no codex CLI needed):
@@ -403,7 +406,7 @@ transcript, --index N emits zero-based parsed turn N, and --raw emits the sessio
 (JSONL; --json: {id,journal}). If no transcript exists yet it falls back to the journal
 rendered as text (--json: {id,fallback:true,journal}).
 state --json emits {id,state,status,stopped,suspended,live,pendingMessages,openTurn?,
-lastTurn?,stopReason?}. wait --json emits {id,state,elapsedMs,timedOut}; exit 0 iff a
+lastTurn?,stopReason?,legacy?}. wait --json emits {id,state,elapsedMs,timedOut}; exit 0 iff a
 requested state was reached.
 send --json emits {ok,id,phase,messageId,replayed}.
 takeover prints \`cd <cwd> && <provider resume command>\` (--json: {id,cwd,command});
