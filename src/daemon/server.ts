@@ -490,7 +490,7 @@ async function dispatch(
       }
       const { def, absPath } = await importWorkflowFileWithPath(file);
       if (body.detach === true) {
-        return detachWorkflowControl('resume', runId, absPath, ctx);
+        return detachWorkflowControl('resume', runId, def, absPath, ctx);
       }
       try {
         const run = await resumeWorkflow(runId, def, { sourcePath: absPath });
@@ -536,7 +536,7 @@ async function dispatch(
             : undefined;
       const { def, absPath } = await importWorkflowFileWithPath(file);
       if (body.detach === true) {
-        return detachWorkflowControl('retry', runId, absPath, ctx, stepId);
+        return detachWorkflowControl('retry', runId, def, absPath, ctx, stepId);
       }
       try {
         const run = await retryWorkflow(runId, def, { sourcePath: absPath, stepId });
@@ -614,16 +614,20 @@ async function runWorkflowRoute(req: Request, ctx: DispatchCtx): Promise<Respons
     if (!file) throw new HttpError(400, 'workflow run --detach requires a `file` (a host-local path)');
     const def = await importWorkflowFile(file);
     try {
+      validateWorkflowDef(maxConcurrency !== undefined ? { ...def, maxConcurrency } : def);
+    } catch (e) {
+      throw new HttpError(400, (e as Error).message);
+    }
+    try {
       const launch = await launchDetachedRun(def, path.resolve(file), {
         maxConcurrency,
         spawn: ctx.spawnRunner,
       });
       return json({ runId: launch.runId, logPath: launch.logPath });
     } catch (e) {
-      if (e instanceof RunnerSpawnError) {
-        throw new HttpError(500, `failed to launch detached runner: ${e.message}`);
-      }
-      throw new HttpError(400, (e as Error).message);
+      // The definition was validated above: anything left is a server-side failure.
+      const prefix = e instanceof RunnerSpawnError ? 'failed to launch detached runner: ' : '';
+      throw new HttpError(500, `${prefix}${(e as Error).message}`);
     }
   }
 
@@ -687,12 +691,13 @@ async function importWorkflowFileWithPath(
 async function detachWorkflowControl(
   mode: 'resume' | 'retry',
   runId: string,
+  def: WorkflowDef,
   absPath: string,
   ctx: DispatchCtx,
   stepId?: string,
 ): Promise<Response> {
   try {
-    const launch = await launchDetachedRecovery(mode, runId, absPath, {
+    const launch = await launchDetachedRecovery(mode, runId, def, absPath, {
       stepId,
       spawn: ctx.spawnRunner,
     });
@@ -706,6 +711,9 @@ async function detachWorkflowControl(
     }
     const msg = (e as Error).message;
     if (/no run found/.test(msg)) throw new HttpError(404, msg);
+    if (/digest mismatch|done predicate|no step|requires the original/.test(msg)) {
+      throw new HttpError(400, msg);
+    }
     if (/cancelled/.test(msg)) throw new HttpError(409, msg);
     throw e;
   }

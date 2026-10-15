@@ -1878,6 +1878,22 @@ export async function loadWorkflowFile(file: string): Promise<{ def: WorkflowDef
   return { def: mod.default, absPath };
 }
 
+/**
+ * Definition preconditions shared by resume/retry and their detached launchers: the
+ * definition must match the run's persisted plan digest (and supply any function `done`
+ * predicates), and a retry `stepId` must exist. Throws; nothing is written.
+ */
+export function assertRecoveryDefinition(
+  existing: WorkflowRun,
+  def: WorkflowDef,
+  opts?: { stepId?: string; sourcePath?: string },
+): void {
+  assertDigestMatches(existing, def, opts?.sourcePath ?? existing.sourcePath ?? existing.workflowSourcePath);
+  if (opts?.stepId && !def.steps.some((s) => s.id === opts.stepId)) {
+    throw new Error(`run '${existing.id}' has no step '${opts.stepId}'`);
+  }
+}
+
 function assertDigestMatches(existing: WorkflowRun, def: WorkflowDef, sourcePath?: string): void {
   // A run-time/CLI override is persisted in the original plan and intentionally
   // need not be repeated in the source definition on resume or retry.

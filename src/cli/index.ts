@@ -982,12 +982,13 @@ async function cmdWorkflowLogs(args: string[]): Promise<number> {
 async function detachWorkflowControl(
   action: 'resume' | 'retry',
   runId: string,
+  def: WorkflowDef,
   absFile: string,
   json: boolean,
   stepId?: string,
 ): Promise<number> {
   try {
-    const launch = await launchDetachedRecovery(action, runId, absFile, { stepId });
+    const launch = await launchDetachedRecovery(action, runId, def, absFile, { stepId });
     if (json) printJson({ runId, logPath: launch.logPath, action });
     else process.stdout.write(`${runId}\n`);
     return 0;
@@ -1064,7 +1065,7 @@ async function cmdWorkflowResume(args: string[]): Promise<number> {
   try {
     const { def, absPath } = await loadWorkflowDefFromFile(file);
     if (values.detach === true) {
-      return detachWorkflowControl('resume', runId, absPath, json);
+      return detachWorkflowControl('resume', runId, def, absPath, json);
     }
     const term = trapRunnerTermination();
     try {
@@ -1115,7 +1116,7 @@ async function cmdWorkflowRetry(args: string[]): Promise<number> {
     const { def, absPath } = await loadWorkflowDefFromFile(file);
     const stepId = values.step as string | undefined;
     if (values.detach === true) {
-      return detachWorkflowControl('retry', runId, absPath, json, stepId);
+      return detachWorkflowControl('retry', runId, def, absPath, json, stepId);
     }
     const term = trapRunnerTermination();
     try {

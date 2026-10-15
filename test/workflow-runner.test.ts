@@ -51,6 +51,7 @@ import {
   RunnerSpawnError,
 } from '../src/workflow-runner.ts';
 import { serveDaemon } from '../src/daemon/server.ts';
+import { renderRunDetail } from '../src/cli/output.ts';
 
 const CLI = path.resolve(import.meta.dir, '..', 'src', 'cli', 'index.ts');
 const POLICY_FAIL_WF = path.join(import.meta.dir, 'fixtures', 'policy-fail-workflow.ts');
@@ -205,6 +206,18 @@ describe('schema v5: runner + legacy tmux-runner normalization', () => {
     const both = normalizeRun({ ...baseRun(), runner, runnerTmux: 'orc-wf-x' })!;
     expect(both.runner).toEqual(runner);
     expect(both.legacyRunnerTmux).toBeUndefined();
+  });
+
+  test('status rendering: a legacy runner is "resumable" only when the run is', () => {
+    expect(renderRunDetail(baseRun({ status: 'done', legacyRunnerTmux: 'orc-wf-x' }))).toContain(
+      'runner:     legacy tmux runner (gone)',
+    );
+    expect(renderRunDetail(baseRun({ status: 'cancelled', legacyRunnerTmux: 'orc-wf-x' }))).not.toContain(
+      'resumable',
+    );
+    expect(renderRunDetail(baseRun({ status: 'orphaned', legacyRunnerTmux: 'orc-wf-x' }))).toContain(
+      'legacy tmux runner (gone; resumable)',
+    );
   });
 
   test('readRun never sees a torn record while a writer atomically rewrites it', async () => {
@@ -624,7 +637,7 @@ describe('launch helpers (injected spawner): spawn first, then stamp (D7)', () =
     const before = fs.readFileSync(runPath('rs1'), 'utf8');
     const calls: Call[] = [];
     await expect(
-      launchDetachedRecovery('resume', 'rs1', '/abs/wf.ts', { spawn: failingSpawner(calls) }),
+      launchDetachedRecovery('resume', 'rs1', oneStep, '/abs/wf.ts', { spawn: failingSpawner(calls) }),
     ).rejects.toBeInstanceOf(RunnerSpawnError);
     expect(calls).toHaveLength(1);
     expect(fs.readFileSync(runPath('rs1'), 'utf8')).toBe(before);
@@ -633,7 +646,7 @@ describe('launch helpers (injected spawner): spawn first, then stamp (D7)', () =
   test('detached retry: argv carries --step and --runner; cancelled run reopened after spawn', async () => {
     await writeRun(baseRun({ id: 'rt1', status: 'cancelled', cancelledAt: 'x', finishedAt: 'x' }));
     const calls: Call[] = [];
-    const launch = await launchDetachedRecovery('retry', 'rt1', '/abs/wf.ts', {
+    const launch = await launchDetachedRecovery('retry', 'rt1', oneStep, '/abs/wf.ts', {
       spawn: fakeSpawner(calls),
       stepId: 'a',
     });
@@ -645,13 +658,28 @@ describe('launch helpers (injected spawner): spawn first, then stamp (D7)', () =
     expect(rec.runner?.pid).toBe(DEAD_PID);
   });
 
+  test('detached resume/retry with a mismatched definition is rejected before any spawn', async () => {
+    await writeRun(baseRun({ id: 'dg1', status: 'failed', definitionDigest: 'not-this-plan' }));
+    await writeRun(baseRun({ id: 'dg2', status: 'failed' }));
+    const before = fs.readFileSync(runPath('dg1'), 'utf8');
+    const calls: Call[] = [];
+    await expect(
+      launchDetachedRecovery('resume', 'dg1', oneStep, '/abs/wf.ts', { spawn: fakeSpawner(calls) }),
+    ).rejects.toThrow(/digest mismatch/);
+    await expect(
+      launchDetachedRecovery('retry', 'dg2', oneStep, '/abs/wf.ts', { spawn: fakeSpawner(calls), stepId: 'zz' }),
+    ).rejects.toThrow(/no step 'zz'/);
+    expect(calls).toHaveLength(0);
+    expect(fs.readFileSync(runPath('dg1'), 'utf8')).toBe(before);
+  });
+
   test('detached resume/retry on a done run is rejected before any spawn', async () => {
     await writeRun(baseRun({ id: 'dn1', status: 'done' }));
     const before = fs.readFileSync(runPath('dn1'), 'utf8');
     for (const action of ['resume', 'retry'] as const) {
       const calls: Call[] = [];
       await expect(
-        launchDetachedRecovery(action, 'dn1', '/abs/wf.ts', { spawn: fakeSpawner(calls) }),
+        launchDetachedRecovery(action, 'dn1', oneStep, '/abs/wf.ts', { spawn: fakeSpawner(calls) }),
       ).rejects.toBeInstanceOf(FinalizedRunError);
       expect(calls).toHaveLength(0);
     }
@@ -663,10 +691,10 @@ describe('launch helpers (injected spawner): spawn first, then stamp (D7)', () =
     await writeRun(baseRun({ id: 'cn1', status: 'cancelled' }));
     const calls: Call[] = [];
     await expect(
-      launchDetachedRecovery('resume', 'lv1', '/abs/wf.ts', { spawn: fakeSpawner(calls) }),
+      launchDetachedRecovery('resume', 'lv1', oneStep, '/abs/wf.ts', { spawn: fakeSpawner(calls) }),
     ).rejects.toBeInstanceOf(LiveOwnerError);
     await expect(
-      launchDetachedRecovery('resume', 'cn1', '/abs/wf.ts', { spawn: fakeSpawner(calls) }),
+      launchDetachedRecovery('resume', 'cn1', oneStep, '/abs/wf.ts', { spawn: fakeSpawner(calls) }),
     ).rejects.toThrow(/cancelled/);
     expect(calls).toHaveLength(0);
   });
@@ -746,6 +774,19 @@ describe('daemon detached routes (injected spawner)', () => {
     expect(view.runner).toMatchObject({ pid: DEAD_PID });
     expect(JSON.stringify(view)).not.toContain('runner.log');
     expect(JSON.stringify(view)).not.toContain('runnerTmux');
+  });
+
+  test('POST /workflows/run {detach}: a post-validation failure (stamp race) → 500, not 400', async () => {
+    const call = start((argv) => {
+      // The run is finalized underneath the launcher before it can stamp the runner.
+      const runId = argv[argv.indexOf('--run-id') + 1]!;
+      const rec = JSON.parse(fs.readFileSync(runPath(runId), 'utf8'));
+      fs.writeFileSync(runPath(runId), JSON.stringify({ ...rec, status: 'done' }));
+      return { pid: DEAD_PID, startTime: null };
+    });
+    const res = await call('/workflows/run', { detach: true, file: POLICY_FAIL_WF });
+    expect(res.status).toBe(500);
+    expect(((await res.json()) as { error: string }).error).toMatch(/finalized \(done\)/);
   });
 
   test('POST /workflows/run {detach}: spawn failure → 500 and the run is finalized failed', async () => {
@@ -832,6 +873,27 @@ describe('real detached runner processes', () => {
       expect(fs.readFileSync(runnerLogPath('ss1'), 'utf8')).toContain('exit finished running');
     },
     20_000,
+  );
+
+  test(
+    'trapRunnerTermination.dispose() clears the force-exit backstop',
+    async () => {
+      const mod = path.resolve(import.meta.dir, '..', 'src', 'workflow-runner.ts');
+      const script = [
+        `import { trapRunnerTermination } from ${JSON.stringify(mod)};`,
+        `const t = trapRunnerTermination({ forceExitMs: 100 });`,
+        `process.kill(process.pid, 'SIGTERM');`,
+        `while (!t.signal.aborted) await Bun.sleep(5);`,
+        `t.dispose();`,
+        `await Bun.sleep(400);`,
+        `console.log('alive');`,
+      ].join('\n');
+      const p = Bun.spawn([process.execPath, '-e', script], { stdout: 'pipe', stderr: 'pipe' });
+      const [out, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
+      expect(code).toBe(0);
+      expect(out).toContain('alive');
+    },
+    10_000,
   );
 
   test(

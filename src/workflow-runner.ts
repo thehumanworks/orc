@@ -31,6 +31,7 @@ import {
 import type { RunnerInfo, WorkflowRun } from './run-schema.ts';
 import {
   assertRecoveryAllowed,
+  assertRecoveryDefinition,
   buildPlan,
   planDigest,
   reconcileRun,
@@ -167,20 +168,26 @@ export async function launchDetachedRun(
 }
 
 /**
- * Detached `resume`/`retry`: the SAME status preconditions as the foreground paths
- * (never a `done` run; `resume` never a `cancelled` one; never over a live owner), then
- * spawn `orc workflow <action> <runId> <absFile> [--step id] --runner`, then stamp
- * `runner` + `running` (D7). On spawn failure nothing is written (RunnerSpawnError).
+ * Detached `resume`/`retry`: the SAME preconditions as the foreground paths — status
+ * (never a `done` run; `resume` never a `cancelled` one; never over a live owner) and
+ * definition (plan digest / `done` predicates / retry step) — then spawn
+ * `orc workflow <action> <runId> <absFile> [--step id] --runner`, then stamp `runner` +
+ * `running` (D7). Any precondition or spawn failure writes nothing.
  */
 export async function launchDetachedRecovery(
   action: 'resume' | 'retry',
   runId: string,
+  def: WorkflowDef,
   absFile: string,
   opts: LaunchRunnerOptions & { stepId?: string } = {},
 ): Promise<DetachedLaunch & { action: 'resume' | 'retry' }> {
   const existing = await readRun(runId);
   if (!existing) throw new Error(`no run found for '${runId}'`);
   assertRecoveryAllowed(await reconcileRun(existing), action);
+  assertRecoveryDefinition(existing, def, {
+    stepId: action === 'retry' ? opts.stepId : undefined,
+    sourcePath: absFile,
+  });
 
   const argv = [
     ...selfArgv(),
@@ -207,14 +214,22 @@ export function trapRunnerTermination(opts?: { forceExitMs?: number }): {
   dispose: () => void;
 } {
   const ac = new AbortController();
+  let forceExit: ReturnType<typeof setTimeout> | undefined;
   const onTerm = () => {
     if (ac.signal.aborted) return;
     ac.abort(new Error('runner received SIGTERM'));
-    const t = setTimeout(() => process.exit(143), opts?.forceExitMs ?? 5_000);
-    (t as { unref?: () => void }).unref?.();
+    forceExit = setTimeout(() => process.exit(143), opts?.forceExitMs ?? 5_000);
+    (forceExit as { unref?: () => void }).unref?.();
   };
   process.on('SIGTERM', onTerm);
-  return { signal: ac.signal, dispose: () => process.off('SIGTERM', onTerm) };
+  return {
+    signal: ac.signal,
+    dispose: () => {
+      process.off('SIGTERM', onTerm);
+      if (forceExit !== undefined) clearTimeout(forceExit);
+      forceExit = undefined;
+    },
+  };
 }
 
 /**
