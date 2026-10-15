@@ -114,3 +114,31 @@ export function quarantineInboxItem(sessionId: string, ulid: string): void {
     if ((e as { code?: string }).code !== 'ENOENT') throw e;
   }
 }
+
+/**
+ * Remove `.tmp-*` leftovers (an enqueue that died between write and rename) older than
+ * `maxAgeMs`. Younger ones may be an enqueue in progress and are left alone.
+ */
+export function sweepStaleInboxTmp(sessionId: string, maxAgeMs = 60_000): number {
+  const dir = inboxDir(sessionId);
+  let names: string[];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const name of names) {
+    if (!name.startsWith('.tmp-')) continue;
+    const p = path.join(dir, name);
+    try {
+      if (Date.now() - fs.statSync(p).mtimeMs > maxAgeMs) {
+        fs.rmSync(p, { force: true });
+        removed++;
+      }
+    } catch {
+      /* raced with rename / removal */
+    }
+  }
+  return removed;
+}

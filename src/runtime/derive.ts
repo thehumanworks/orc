@@ -44,6 +44,8 @@ export class TurnLedger {
   readonly byMessageId = new Map<string, TurnRecord>();
   readonly intentUlids = new Set<string>();
   readonly acceptedUlids = new Set<string>();
+  /** messageId → ulid of queued messages dropped undelivered (inbox.dropped). */
+  readonly dropped = new Map<string, string>();
   private readonly openIds = new Set<string>();
   completedTurns = 0;
   startedTurns = 0;
@@ -69,6 +71,9 @@ export class TurnLedger {
     switch (e.type) {
       case 'inbox.accepted':
         this.acceptedUlids.add(e.ulid);
+        break;
+      case 'inbox.dropped':
+        this.dropped.set(e.messageId, e.ulid);
         break;
       case 'turn.intent':
         this.intentUlids.add(e.ulid);
@@ -327,6 +332,7 @@ export function deriveState(view: SessionView): DerivedState {
  *                 stop) or before the actor died: may or may not have reached the provider.
  *                 Never auto-resubmitted.
  * - completed / failed / interrupted  turn outcome (interrupted = after the ack)
+ * - failed        also: dropped from the inbox undelivered (inbox.dropped — session stopped)
  * - absent        never seen
  */
 export type DeliveryVerdict =
@@ -338,7 +344,12 @@ export type DeliveryVerdict =
   | 'interrupted'
   | 'absent';
 
-export function verdictFor(turn: TurnRecord | undefined, inInbox: boolean, live: boolean): DeliveryVerdict {
+export function verdictFor(
+  turn: TurnRecord | undefined,
+  inInbox: boolean,
+  live: boolean,
+  dropped = false,
+): DeliveryVerdict {
   if (turn) {
     const started = turn.startedSeq !== undefined;
     switch (turn.outcome) {
@@ -354,7 +365,8 @@ export function verdictFor(turn: TurnRecord | undefined, inInbox: boolean, live:
         return live ? 'queued' : 'unknown';
     }
   }
-  return inInbox ? 'queued' : 'absent';
+  if (inInbox) return 'queued';
+  return dropped ? 'failed' : 'absent';
 }
 
 /**

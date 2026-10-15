@@ -18,6 +18,7 @@ import { readSpawnSpec, validateSpawnSpec, writeSpawnSpec } from './spec.ts';
 import { JournalCursor, JournalWriter, readJournal } from './journal.ts';
 import { enqueue, listPending, removeInboxItem } from './inbox.ts';
 import {
+  DEFAULT_STOP_GRACE_MS,
   initialActorState,
   isLiveProcess,
   leaseLive,
@@ -43,11 +44,10 @@ export type {
   TurnRecord,
 } from './derive.ts';
 export { sessionPaths } from './layout.ts';
-export { leaseLive, isLiveProcess } from './actor-state.ts';
+export { leaseLive, isLiveProcess, DEFAULT_STOP_GRACE_MS } from './actor-state.ts';
 
 export const DEFAULT_START_TIMEOUT_MS = 15_000;
 export const DEFAULT_ACK_TIMEOUT_MS = 10_000;
-export const DEFAULT_STOP_GRACE_MS = 5_000;
 
 export class SessionStoppedError extends Error {
   readonly code = 'ORC_SESSION_STOPPED';
@@ -284,7 +284,7 @@ async function waitForDelivery(
   sessionId: string,
   messageId: string,
   timeoutMs: number,
-): Promise<{ delivery: DeliveryVerdict; acked: boolean }> {
+): Promise<{ delivery: DeliveryVerdict; acked: boolean; dropped: boolean }> {
   const cursor = JournalCursor.forSession(sessionId);
   const ledger = new TurnLedger();
   const deadline = Date.now() + Math.max(0, timeoutMs);
@@ -294,12 +294,14 @@ async function waitForDelivery(
     for (const e of cursor.readNew()) ledger.apply(e);
     const turn = ledger.byMessageId.get(messageId);
     const acked = turn?.startedSeq !== undefined;
+    const dropped = !turn && ledger.dropped.has(messageId);
+    if (dropped) return { delivery: 'failed', acked: false, dropped: true };
     const v = verdictFor(turn, true, live);
-    if (v !== 'queued') return { delivery: v, acked };
+    if (v !== 'queued') return { delivery: v, acked, dropped: false };
     if (!live || Date.now() >= deadline) {
-      if (turn) return { delivery: v, acked };
+      if (turn) return { delivery: v, acked, dropped: false };
       const inInbox = listPending(sessionId).some((i) => i.kind === 'message' && i.messageId === messageId);
-      return { delivery: inInbox ? 'queued' : verdictFor(undefined, false, live), acked: false };
+      return { delivery: inInbox ? 'queued' : verdictFor(undefined, false, live), acked: false, dropped: false };
     }
     await Bun.sleep(25);
     if (Date.now() - liveCheckedAt >= 200) {
@@ -313,7 +315,9 @@ async function waitForDelivery(
  * Durably enqueue a message, wake the session (unless `wake: false`) and wait (bounded)
  * for its turn.started. Idempotent per messageId: if an inbox item or a journal intent
  * for it already exists nothing is enqueued and its current status is returned.
- * Throws SessionStoppedError for a stopped session (nothing is enqueued).
+ * Throws SessionStoppedError for a stopped or stopping session — also when the stop lands
+ * while the message waits (it is then dropped with an inbox.dropped fact, never left
+ * queued in a session that will not wake).
  */
 export async function send(
   sessionId: string,
@@ -345,7 +349,7 @@ export async function send(
       knownAcked = turn.startedSeq !== undefined;
       return;
     }
-    if (readActorState(sessionId)?.phase === 'stopped') throw new SessionStoppedError(sessionId);
+    if (isStopPhase(readActorState(sessionId)?.phase)) throw new SessionStoppedError(sessionId);
     ulid = enqueue(sessionId, { kind: 'message', messageId: msg.messageId, text: msg.text }).ulid;
   });
   if (known !== undefined && known !== 'queued') {
@@ -358,15 +362,51 @@ export async function send(
       ...(opts.beforeWake ? { beforeSpawn: opts.beforeWake } : {}),
       ...(opts.startTimeoutMs !== undefined ? { startTimeoutMs: opts.startTimeoutMs } : {}),
     });
-    if (r.status === 'stopped') throw new SessionStoppedError(sessionId);
+    if (r.status === 'stopped') {
+      // stop() landed between our phase check and the wake: never leave it queued.
+      await dropIfUndelivered(sessionId, ulid);
+      throw new SessionStoppedError(sessionId);
+    }
     woke = r.status === 'started';
   }
-  const { delivery, acked } = await waitForDelivery(
+  const { delivery, acked, dropped } = await waitForDelivery(
     sessionId,
     msg.messageId,
     opts.ackTimeoutMs ?? DEFAULT_ACK_TIMEOUT_MS,
   );
+  if (!acked && (delivery === 'queued' || dropped) && isStopPhase(readActorState(sessionId)?.phase)) {
+    // Stopped (or stopping) while we waited: the message can never be delivered.
+    await dropIfUndelivered(sessionId, ulid);
+    throw new SessionStoppedError(sessionId);
+  }
   return { ulid, verdict: coarseVerdict(delivery, acked), delivery, duplicate, woke };
+}
+
+function isStopPhase(phase: ActorStateFile['phase'] | undefined): boolean {
+  return phase === 'stopped' || phase === 'stopping';
+}
+
+/**
+ * A message queued into a session that is (being) stopped: once no actor is live, remove
+ * it with an inbox.dropped fact (unless it already became an intent or was dropped). A
+ * live stopping actor drops queued messages itself, so wait for it first.
+ */
+async function dropIfUndelivered(sessionId: string, ulid: string): Promise<void> {
+  const deadline = Date.now() + DEFAULT_STOP_GRACE_MS + 10_000;
+  while (leaseLive(readActorState(sessionId)) && Date.now() < deadline) await Bun.sleep(25);
+  await withActorLock(sessionId, async () => {
+    if (leaseLive(readActorState(sessionId))) return;
+    const item = listPending(sessionId).find((i) => i.ulid === ulid);
+    if (!item || item.kind !== 'message') return;
+    if (TurnLedger.from(readJournal(sessionId)).intentUlids.has(ulid)) return;
+    const j = JournalWriter.forSession(sessionId);
+    try {
+      j.append({ type: 'inbox.dropped', ulid, messageId: item.messageId, reason: 'stopped' });
+    } finally {
+      j.close();
+    }
+    removeInboxItem(sessionId, ulid);
+  });
 }
 
 /**
@@ -431,9 +471,15 @@ export async function stop(
       // No live actor and we hold the lock: we are the only journal writer.
       const j = JournalWriter.forSession(sessionId);
       try {
-        for (const t of TurnLedger.from(readJournal(sessionId)).openTurns()) {
+        const ledger = TurnLedger.from(readJournal(sessionId));
+        for (const t of ledger.openTurns()) {
           j.append({ type: 'turn.interrupted', messageId: t.messageId, reason: 'recovered' });
           removeInboxItem(sessionId, t.ulid);
+        }
+        for (const it of listPending(sessionId)) {
+          if (it.kind !== 'message' || ledger.intentUlids.has(it.ulid)) continue;
+          j.append({ type: 'inbox.dropped', ulid: it.ulid, messageId: it.messageId, reason: 'stopped' });
+          removeInboxItem(sessionId, it.ulid);
         }
         j.append({ type: 'actor.stopped', reason: 'stop', ...(opts.reason ? { error: opts.reason } : {}) });
         cur.lastSeq = Math.max(cur.lastSeq, j.lastSeq);
@@ -494,8 +540,13 @@ export function inspect(sessionId: string, opts: { tail?: number } = {}): Sessio
 export function deliveryVerdict(sessionId: string, messageId: string): DeliveryVerdict {
   assertValidSessionId(sessionId);
   const inInbox = listPending(sessionId).some((i) => i.kind === 'message' && i.messageId === messageId);
-  const turn = TurnLedger.from(readJournal(sessionId)).byMessageId.get(messageId);
-  return verdictFor(turn, inInbox, leaseLive(readActorState(sessionId)));
+  const ledger = TurnLedger.from(readJournal(sessionId));
+  return verdictFor(
+    ledger.byMessageId.get(messageId),
+    inInbox,
+    leaseLive(readActorState(sessionId)),
+    ledger.dropped.has(messageId),
+  );
 }
 
 /** spawn.json exists for this session. */

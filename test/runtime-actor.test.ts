@@ -466,6 +466,89 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
   );
 
   test(
+    'stop while a send waits behind a turn: send throws SessionStoppedError, message dropped as a fact',
+    async () => {
+      const sid = await newSession({ rules: [{ match: 'HANG', action: 'hang' }] });
+      expect((await send(sid, { messageId: 'h1', text: 'HANG' })).verdict).toBe('acknowledged');
+      const outcome = send(sid, { messageId: 'm2', text: 'later' }, { ackTimeoutMs: 15_000 }).then(
+        (r) => r,
+        (e: unknown) => e,
+      );
+      await waitFor(() => listPending(sid).some((i) => i.kind === 'message' && i.messageId === 'm2'), 'm2 queued');
+      expect(await stop(sid)).toEqual({ status: 'stopped' });
+      expect(await outcome).toBeInstanceOf(SessionStoppedError);
+      expect(listPending(sid)).toEqual([]);
+      expect(entries(sid, 'inbox.dropped')).toMatchObject([{ messageId: 'm2', reason: 'stopped' }]);
+      expect(deliveryVerdict(sid, 'm2')).toBe('failed');
+      expect(deliveryVerdict(sid, 'h1')).toBe('interrupted');
+      expect(deriveState(inspect(sid))).toMatchObject({ stopped: true, pendingMessages: 0 });
+    },
+    T,
+  );
+
+  test(
+    'stop with no live actor drops queued messages as facts (verdict failed)',
+    async () => {
+      const sid = await newSession();
+      await send(sid, { messageId: 'd0', text: 'zero' });
+      await waitCompleted(sid, 'd0');
+      await crashActor(sid);
+      expect((await send(sid, { messageId: 'd1', text: 'queued' }, { wake: false })).verdict).toBe('queued');
+      expect(await stop(sid)).toEqual({ status: 'stopped' });
+      expect(listPending(sid)).toEqual([]);
+      expect(entries(sid, 'inbox.dropped')).toMatchObject([{ messageId: 'd1' }]);
+      expect(deliveryVerdict(sid, 'd1')).toBe('failed');
+      await expect(send(sid, { messageId: 'd1', text: 'queued' })).rejects.toBeInstanceOf(SessionStoppedError);
+    },
+    T,
+  );
+
+  test(
+    'stop ‖ send race: a send is either acknowledged or throws SessionStoppedError; nothing stays queued',
+    async () => {
+      for (const delay of [0, 1, 3, 6, 12, 25]) {
+        const sid = await newSession();
+        const messageId = `race-${delay}`;
+        const [stopped, sent] = await Promise.allSettled([
+          stop(sid),
+          Bun.sleep(delay).then(() => send(sid, { messageId, text: 'x' }, { ackTimeoutMs: 5_000 })),
+        ]);
+        expect(stopped).toMatchObject({ status: 'fulfilled', value: { status: 'stopped' } });
+        if (sent.status === 'fulfilled') {
+          expect(sent.value.verdict).toBe('acknowledged');
+          expect(['acknowledged', 'completed', 'interrupted']).toContain(deliveryVerdict(sid, messageId));
+        } else {
+          expect(sent.reason).toBeInstanceOf(SessionStoppedError);
+          expect(['absent', 'failed']).toContain(deliveryVerdict(sid, messageId));
+        }
+        expect(readActorState(sid)?.phase).toBe('stopped');
+        expect(listPending(sid).filter((i) => i.kind === 'message')).toEqual([]);
+        expect(fakeProviderPids(sid)).toEqual([]);
+      }
+    },
+    T,
+  );
+
+  test(
+    'actor boot sweeps stale inbox temp files but keeps fresh ones',
+    async () => {
+      const sid = await newSession();
+      await crashActor(sid);
+      const dir = sessionPaths(sid).inbox;
+      const stale = path.join(dir, '.tmp-01STALESTALESTALESTALESTALE');
+      const fresh = path.join(dir, '.tmp-01FRESHFRESHFRESHFRESHFRESH');
+      fs.writeFileSync(stale, '{}');
+      fs.writeFileSync(fresh, '{}');
+      const old = new Date(Date.now() - 5 * 60_000);
+      fs.utimesSync(stale, old, old);
+      expect((await ensureAwake(sid)).status).toBe('started');
+      expect(fs.existsSync(stale)).toBe(false);
+      expect(fs.existsSync(fresh)).toBe(true);
+    },
+    T,
+  );
+
+  test(
     'stop with no live actor kills the orphaned provider and closes the open turn',
     async () => {
       const sid = await newSession({ ignoreStdinEofMs: 60_000, rules: [{ match: 'HANG', action: 'hang' }] });

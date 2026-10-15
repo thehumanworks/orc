@@ -34,8 +34,15 @@ import type { SessionPaths } from './layout.ts';
 import { assertValidSessionId } from './fsutil.ts';
 import { readSpawnSpec, writeSpawnSpec } from './spec.ts';
 import { JournalWriter, readJournalFile } from './journal.ts';
-import { listPendingDetailed, quarantineInboxItem, removeInboxItem } from './inbox.ts';
 import {
+  listPending,
+  listPendingDetailed,
+  quarantineInboxItem,
+  removeInboxItem,
+  sweepStaleInboxTmp,
+} from './inbox.ts';
+import {
+  DEFAULT_STOP_GRACE_MS,
   initialActorState,
   isLiveProcess,
   leaseLive,
@@ -50,8 +57,6 @@ import { ulidTime } from './ulid.ts';
 
 /** Provider must emit `ready` within this long (override: ORC_ACTOR_READY_TIMEOUT_MS). */
 const DEFAULT_READY_TIMEOUT_MS = 120_000;
-/** Provider close grace for stop/suspend when the stop item does not say. */
-export const DEFAULT_STOP_GRACE_MS = 5_000;
 /** Upper bound on waiting for an interrupted turn's outcome before closing the provider. */
 const INTERRUPT_BEFORE_CLOSE_MAX_MS = 2_000;
 
@@ -306,6 +311,8 @@ class Actor {
 
   private async boot(): Promise<void> {
     ensureSessionDirs(this.sid);
+    const swept = sweepStaleInboxTmp(this.sid);
+    if (swept > 0) this.log(`swept ${swept} stale inbox temp file(s)`);
     this.journal = JournalWriter.open(this.paths.journal);
     this.ledger = TurnLedger.from(readJournalFile(this.paths.journal));
     // Never two writers: providers left behind by crashed actors die first — the one in
@@ -713,6 +720,14 @@ class Actor {
           this.openTurn = undefined;
           this.append({ type: 'turn.interrupted', messageId: t.messageId, reason: o.turnReason });
           removeInboxItem(this.sid, t.ulid);
+        }
+        // Sticky stop: queued messages will never be delivered — drop them as a fact.
+        if (o.phase === 'stopped') {
+          for (const item of listPending(this.sid)) {
+            if (item.kind !== 'message' || this.ledger.intentUlids.has(item.ulid)) continue;
+            this.append({ type: 'inbox.dropped', ulid: item.ulid, messageId: item.messageId, reason: 'stopped' });
+            removeInboxItem(this.sid, item.ulid);
+          }
         }
         this.append({ type: 'actor.stopped', reason: o.reason, ...(o.error ? { error: o.error } : {}) });
       } catch (e) {

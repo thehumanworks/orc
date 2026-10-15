@@ -27,6 +27,9 @@ export { isLiveProcess, isZombie, probeProcess, terminateGroup } from './process
 
 export const ACTOR_LOCK_OPTIONS: LockOptions = { staleMs: 10_000, timeoutMs: 15_000 };
 
+/** Provider close grace for stop when the caller does not say (client + actor). */
+export const DEFAULT_STOP_GRACE_MS = 5_000;
+
 export function actorLockName(sessionId: string): string {
   return `actor-${sessionId}`;
 }

@@ -182,6 +182,8 @@ export type JournalEvent =
       info?: Record<string, unknown>;
     }
   | { type: 'inbox.accepted'; ulid: string; kind: InboxItem['kind']; messageId?: string }
+  /** A queued message removed undelivered (the session was stopped). Its verdict is `failed`. */
+  | { type: 'inbox.dropped'; ulid: string; messageId: string; reason: 'stopped' }
   /** Effect-sandwich intent: committed (fsync) BEFORE the message is written to the provider. */
   | { type: 'turn.intent'; messageId: string; ulid: string; text: string }
   | { type: 'turn.started'; messageId: string }
