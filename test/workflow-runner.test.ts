@@ -518,6 +518,20 @@ describe('owner fence: a different live owner is never overwritten', () => {
     expect(w.runner?.pid).toBe(process.pid);
   });
 
+  test('null start time on either side is a wildcard (pid match = same runner)', async () => {
+    const o = other();
+    await writeRun(baseRun({ id: 'f3', runner: runnerOf({ pid: o.pid, startTime: null }, 'f3') }));
+    await writeRunOwned(baseRun({ id: 'f3', runner: runnerOf(o, 'f3'), lease: makeLease() }));
+    await writeRun(baseRun({ id: 'f4', runner: runnerOf(o, 'f4') }));
+    await writeRunOwned(baseRun({ id: 'f4', runner: runnerOf({ pid: o.pid, startTime: null }, 'f4') }));
+    // stampRunner treats it as the runner already stamped → no write.
+    await writeRun(baseRun({ id: 'f5', status: 'failed', runner: runnerOf({ pid: DEAD_PID, startTime: null }, 'f5') }));
+    const rev = (await readRun('f5'))!.revision;
+    const same = await stampRunner('f5', runnerOf({ pid: DEAD_PID, startTime: 'proc:9' }, 'f5'));
+    expect(same.revision).toBe(rev);
+    expect(same.status).toBe('failed');
+  });
+
   test('no stored runner: a LIVE lease with a different ownerId → LiveOwnerError', async () => {
     const o = other();
     const live = makeLease({ ownerId: 'A', pid: o.pid, startTime: o.startTime });

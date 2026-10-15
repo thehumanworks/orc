@@ -620,7 +620,7 @@ export async function updateRunRetry(
  */
 function assertOwnerFence(current: WorkflowRun, run: WorkflowRun): void {
   if (current.runner) {
-    if (!(run.runner && sameProcess(current.runner, run.runner)) && isSameProcessAlive(current.runner)) {
+    if (!sameProcess(current.runner, run.runner) && isSameProcessAlive(current.runner)) {
       throw new LiveOwnerError(run.id, current.runner.pid);
     }
     return;
@@ -723,8 +723,12 @@ export async function beginRunRecovery(
   });
 }
 
-function sameProcess(a: ProcessIdentity | undefined, b: ProcessIdentity): boolean {
-  return !!a && a.pid === b.pid && (a.startTime ?? null) === (b.startTime ?? null);
+/** Same process: pids match and start times match — a null/unknown start time on either side is a wildcard. */
+function sameProcess(a: ProcessIdentity | undefined, b: ProcessIdentity | undefined): boolean {
+  if (!a || !b || a.pid !== b.pid) return false;
+  const ta = a.startTime ?? null;
+  const tb = b.startTime ?? null;
+  return ta === null || tb === null || ta === tb;
 }
 
 /**
