@@ -8,6 +8,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Stats } from 'node:fs';
 import { orcHome } from './paths.ts';
+import { ensurePrivateDir, PRIVATE_FILE_MODE } from './private-fs.ts';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_STALE_MS = 300_000;
@@ -73,7 +74,7 @@ async function acquireCleanupLock(lockPath: string, timeoutMs: number, pollMs: n
   const deadline = Date.now() + timeoutMs;
   while (true) {
     try {
-      const handle = await fs.open(lockPath, 'wx');
+      const handle = await fs.open(lockPath, 'wx', PRIVATE_FILE_MODE);
       try {
         await handle.writeFile(
           JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }),
@@ -135,14 +136,14 @@ export async function acquireLock(name: string, opts: LockOptions = {}): Promise
   const staleMs = opts.staleMs ?? DEFAULT_STALE_MS;
   const pollMs = opts.pollMs ?? DEFAULT_POLL_MS;
   const dir = locksBase(opts);
-  await fs.mkdir(dir, { recursive: true });
+  ensurePrivateDir(dir);
   const lockPath = path.join(dir, `${sanitizeLockName(name)}.lock`);
   const token = randomUUID();
   const deadline = Date.now() + timeoutMs;
 
   while (true) {
     try {
-      const handle = await fs.open(lockPath, 'wx');
+      const handle = await fs.open(lockPath, 'wx', PRIVATE_FILE_MODE);
       try {
         await handle.writeFile(
           JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }),

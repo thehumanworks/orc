@@ -110,11 +110,11 @@ export function readJsonFile<T>(filePath: string): T | undefined {
   }
 }
 
-/** mkdir -p with mode 0700, then chmod the leaf explicitly (mkdir modes are umask-filtered). */
-export function ensurePrivateDir(dir: string): void {
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  fs.chmodSync(dir, 0o700);
-}
+/**
+ * mkdir -p with mode 0700, then chmod explicitly (mkdir modes are umask-filtered): the
+ * leaf, and its ancestors inside ORC_HOME (src/private-fs.ts).
+ */
+export { ensurePrivateDir } from '../private-fs.ts';
 
 /** Last `maxBytes` of a text file ('' when missing). */
 export function readFileTail(filePath: string, maxBytes = 4_096): string {

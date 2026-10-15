@@ -26,6 +26,7 @@ import {
   beginRunRecovery,
 } from './runs.ts';
 import { assertValidRunId, runInstructionsDir, runResultPath, runAttemptDir } from './paths.ts';
+import { ensurePrivateDir, writePrivateFile } from './private-fs.ts';
 import { isSameProcessAlive } from './runtime/process.ts';
 import type { Turn } from './transcript.ts';
 import type { AgentState, ExecutionPolicy, Provider } from './types.ts';
@@ -586,9 +587,9 @@ export function stepOutcomeFromWait(
 async function dropInstructionFile(runId: string, stepId: string, body: string): Promise<string> {
   assertValidStepId(stepId);
   const dir = runInstructionsDir(runId);
-  await fs.mkdir(dir, { recursive: true });
+  ensurePrivateDir(dir);
   const file = path.join(dir, `${stepId}.md`);
-  await Bun.write(file, body);
+  await writePrivateFile(file, body);
   return file;
 }
 
@@ -895,7 +896,7 @@ const defaultExecStep: StepExecutor = async ({
   }
 
   await ensureArtifactDirs(runId);
-  await fs.mkdir(runAttemptDir(runId, attemptId), { recursive: true });
+  ensurePrivateDir(runAttemptDir(runId, attemptId));
   const resultPath = runResultPath(runId, attemptId);
 
   const spawnCwd = step.cwd ? path.resolve(step.cwd) : process.cwd();

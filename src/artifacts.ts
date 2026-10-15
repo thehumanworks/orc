@@ -17,6 +17,7 @@ import {
   assertValidArtifactName as pathAssertValidArtifactName,
 } from './paths.ts';
 import { isPathInsideRoot } from './workflow-path.ts';
+import { ensurePrivateDir, PRIVATE_FILE_MODE } from './private-fs.ts';
 
 /** Default max artifact size (32 MiB). */
 export const DEFAULT_MAX_ARTIFACT_BYTES = 32 * 1024 * 1024;
@@ -153,8 +154,8 @@ export function validateArtifactDecl(decl: {
 
 export async function ensureArtifactDirs(runId: string): Promise<void> {
   assertValidRunId(runId);
-  await fs.mkdir(runArtifactBlobsDir(runId), { recursive: true });
-  await fs.mkdir(runArtifactManifestsDir(runId), { recursive: true });
+  ensurePrivateDir(runArtifactBlobsDir(runId));
+  ensurePrivateDir(runArtifactManifestsDir(runId));
 }
 
 /**
@@ -307,7 +308,7 @@ export async function collectOutputArtifact(args: {
   const blob = runArtifactBlobPath(runId, digest);
   if (!(await Bun.file(blob).exists())) {
     const tmp = `${blob}.${process.pid}.${Date.now()}.tmp`;
-    await Bun.write(tmp, buf);
+    await fs.writeFile(tmp, buf, { mode: PRIVATE_FILE_MODE });
     await fs.rename(tmp, blob).catch(async () => {
       if (await Bun.file(blob).exists()) {
         await fs.unlink(tmp).catch(() => {});
@@ -344,9 +345,9 @@ export async function collectOutputArtifact(args: {
   };
 
   const mpath = runArtifactManifestPath(runId, decl.name);
-  await fs.mkdir(path.dirname(mpath), { recursive: true });
+  ensurePrivateDir(path.dirname(mpath));
   const mtmp = `${mpath}.${process.pid}.tmp`;
-  await Bun.write(mtmp, JSON.stringify(manifest, null, 2));
+  await fs.writeFile(mtmp, JSON.stringify(manifest, null, 2), { mode: PRIVATE_FILE_MODE });
   await fs.rename(mtmp, mpath);
   return manifest;
 }
@@ -451,7 +452,7 @@ export async function materializeInput(args: {
     );
   }
   const destRoot = runStepInputsDir(args.runId, args.stepId);
-  await fs.mkdir(destRoot, { recursive: true });
+  ensurePrivateDir(destRoot);
   const destName = args.destName ?? args.ref.name;
   if (destName.includes('..') || destName.includes('/') || destName.includes('\\')) {
     throw new ArtifactError('INVALID_PATH', `invalid dest name '${destName}'`);
@@ -462,6 +463,7 @@ export async function materializeInput(args: {
   }
   const blob = runArtifactBlobPath(args.runId, dig);
   await fs.copyFile(blob, dest);
+  await fs.chmod(dest, PRIVATE_FILE_MODE);
   const h = await sha256File(dest);
   if (h !== dig.toLowerCase()) {
     await fs.unlink(dest).catch(() => {});

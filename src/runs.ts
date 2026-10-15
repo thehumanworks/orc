@@ -6,6 +6,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { assertValidRunId, runsDir, runPath } from './paths.ts';
 import { withLock } from './lock.ts';
+import { ensurePrivateDir, writePrivateFile } from './private-fs.ts';
 import { isSameProcessAlive, processStartTime } from './runtime/process.ts';
 import type { ProcessIdentity } from './runtime/types.ts';
 import type {
@@ -489,7 +490,7 @@ function normalizeAttempt(raw: unknown): StepAttempt | null {
 async function writeRunUnlocked(run: WorkflowRun): Promise<void> {
   assertValidRunId(run.id);
   const dir = runsDir();
-  await fs.mkdir(dir, { recursive: true });
+  ensurePrivateDir(dir);
   const target = runPath(run.id);
   const tmp = path.join(dir, `.run.${randomUUID()}.tmp`);
   // The legacy tmux-runner marker is read-only: never persisted.
@@ -499,8 +500,8 @@ async function writeRunUnlocked(run: WorkflowRun): Promise<void> {
     schemaVersion: run.schemaVersion ?? WORKFLOW_SCHEMA_VERSION,
     revision: run.revision ?? 0,
   };
-  await Bun.write(tmp, JSON.stringify(stamped, null, 2));
-  await fs.rename(tmp, target);
+  // Owner-only: the plan holds step prompts.
+  await writePrivateFile(target, JSON.stringify(stamped, null, 2), { tmpPath: tmp });
 }
 
 export async function writeRun(run: WorkflowRun): Promise<void> {

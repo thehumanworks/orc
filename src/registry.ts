@@ -10,6 +10,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Stats } from 'node:fs';
 import { registryPath, orcHome } from './paths.ts';
+import { ensurePrivateDir, writePrivateFile, PRIVATE_FILE_MODE } from './private-fs.ts';
 import type { SessionRecord } from './types.ts';
 import { kernelLiveness } from './session-status.ts';
 import type { LivenessProbe } from './session-status.ts';
@@ -154,26 +155,24 @@ export async function readRegistry(): Promise<SessionRecord[]> {
   return readRegistryUnlocked();
 }
 
-/** Write the registry array atomically (tmp + rename). */
+/** Write the registry array atomically (tmp + rename), owner-only (0600 in a 0700 home). */
 async function writeRegistryUnlocked(records: SessionRecord[]): Promise<void> {
   const home = orcHome();
-  await fs.mkdir(home, { recursive: true });
-  const target = registryPath();
+  ensurePrivateDir(home);
   const tmp = path.join(home, `.registry.${randomUUID()}.tmp`);
-  await Bun.write(tmp, JSON.stringify(records, null, 2));
-  await fs.rename(tmp, target);
+  await writePrivateFile(registryPath(), JSON.stringify(records, null, 2), { tmpPath: tmp });
 }
 
 async function acquireRegistryLock(): Promise<() => Promise<void>> {
   const home = orcHome();
-  await fs.mkdir(home, { recursive: true });
+  ensurePrivateDir(home);
   const lock = path.join(home, '.registry.lock');
   const token = randomUUID();
   const deadline = Date.now() + REGISTRY_LOCK_TIMEOUT_MS;
 
   while (true) {
     try {
-      const handle = await fs.open(lock, 'wx');
+      const handle = await fs.open(lock, 'wx', PRIVATE_FILE_MODE);
       try {
         await handle.writeFile(
           JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }),
@@ -238,7 +237,7 @@ async function acquireRegistryCleanupLock(lock: string): Promise<() => Promise<v
 
   while (true) {
     try {
-      const handle = await fs.open(lock, 'wx');
+      const handle = await fs.open(lock, 'wx', PRIVATE_FILE_MODE);
       try {
         await handle.writeFile(
           JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }),

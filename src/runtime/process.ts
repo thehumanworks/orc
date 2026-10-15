@@ -8,6 +8,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import type { ProcessIdentity } from './types.ts';
+import { ensurePrivateDir } from '../private-fs.ts';
 
 export interface SpawnDetachedOptions {
   cwd: string;
@@ -25,7 +26,7 @@ export interface SpawnDetachedOptions {
  */
 export function spawnDetached(argv: string[], opts: SpawnDetachedOptions): ProcessIdentity {
   if (argv.length === 0) throw new Error('spawnDetached: empty argv');
-  fs.mkdirSync(path.dirname(opts.logPath), { recursive: true });
+  ensurePrivateDir(path.dirname(opts.logPath));
   const fd = fs.openSync(opts.logPath, 'a', 0o600);
   let proc: ReturnType<typeof Bun.spawn>;
   try {
