@@ -139,6 +139,8 @@ export async function enforceSpawnPolicy(args: {
   lineage: ExecutionLineage;
   policy?: ExecutionPolicy;
   isDelegation?: boolean;
+  /** Set when an existing session is being woken rather than a new one spawned. */
+  wake?: { sessionId: string };
 }): Promise<void> {
   const { lineage } = args;
   const rootId = lineage.rootRunId;
@@ -147,6 +149,7 @@ export async function enforceSpawnPolicy(args: {
   const { readRegistry } = await import('./registry.ts');
   const { assertPolicyAllowsSpawn } = await import('./policy.ts');
   const { readRun } = await import('./runs.ts');
+  const { countLiveSessions } = await import('./session-status.ts');
 
   const root = rootId ? await readRun(rootId) : null;
   const policy = mergePolicy(root?.policy, args.policy);
@@ -156,14 +159,53 @@ export async function enforceSpawnPolicy(args: {
     ? (await readRegistry()).filter((r) => r.rootRunId === rootId || r.parentRunId === rootId)
     : [];
 
+  if (args.wake) {
+    // Waking an existing session (send/resume): only the concurrency budget and the
+    // deadline apply — it already counts towards maxSessions and its depth was checked
+    // at spawn. The woken session itself is not live, so it is not in `live`.
+    const others = records.filter((r) => r.sessionId !== args.wake!.sessionId);
+    assertPolicyAllowsSpawn({
+      depth: 0,
+      policy:
+        policy.maxConcurrentSessions !== undefined ? { maxConcurrentSessions: policy.maxConcurrentSessions } : {},
+      deadlineAt: root?.deadlineAt,
+      rootSessions: [],
+      liveCount: countLiveSessions(others),
+      totalAfterSpawn: 0,
+    });
+    return;
+  }
+
   assertPolicyAllowsSpawn({
     depth: lineage.depth ?? 0,
     policy,
     deadlineAt: root?.deadlineAt,
     rootSessions: records,
+    liveCount: countLiveSessions(records),
     isDelegation: args.isDelegation || (lineage.depth ?? 0) > 0,
     totalAfterSpawn: records.length + 1,
   });
+}
+
+/**
+ * Policy hook for waking a session (send to a suspended session, `orc resume`): re-checks
+ * maxConcurrentSessions under the same `spawn-policy-<root>` lock agent() uses (D2).
+ * Returns undefined when the record carries no root/policy (nothing to enforce).
+ */
+export function wakePolicyHook(
+  rec: Pick<import('./types.ts').SessionRecord, 'sessionId' | 'rootRunId' | 'policy'>,
+): (() => Promise<void>) | undefined {
+  if (!rec.rootRunId && !rec.policy) return undefined;
+  return async () => {
+    const { withLock } = await import('./lock.ts');
+    await withLock(`spawn-policy-${rec.rootRunId ?? 'unrooted'}`, () =>
+      enforceSpawnPolicy({
+        lineage: { rootRunId: rec.rootRunId },
+        policy: rec.policy,
+        wake: { sessionId: rec.sessionId },
+      }),
+    );
+  };
 }
 
 /** Decrement is a no-op for registry-based counting; kept for kill-path symmetry. */

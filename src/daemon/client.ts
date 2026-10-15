@@ -4,7 +4,8 @@
  * parsed body. The CLI feeds the results to the SAME renderers as the local path, so the
  * `--host` output is identical to local (`--json` byte-for-byte).
  */
-import type { SessionRecord } from '../types.ts';
+import type { AgentState, SessionRecord, SessionStatus } from '../types.ts';
+import type { JournalEntry } from '../runtime/types.ts';
 import type { Turn } from '../transcript.ts';
 import type { TurnSelection } from '../transcript.ts';
 import type { WorkflowRun } from '../workflow.ts';
@@ -29,15 +30,50 @@ export function parseHostArg(raw: string, defaultPort = DEFAULT_DAEMON_PORT): Re
   return { host: trimmed, port: defaultPort };
 }
 
-/** Read shape of `GET /sessions/:id/read` (discriminated; the CLI renders each kind). */
-export type ReadResult =
+/**
+ * Wire version of the session views. v2 (actor runtime): raw/fallback reads and raw run
+ * logs carry the session `journal` (normalized JSONL entries) instead of the pre-actor `pane`;
+ * session views carry `status` running|suspended|dead plus `state`/`suspended`/`stopped`.
+ * `GET /health` reports it as `api`. The v1 (`pane`) shapes are kept in the unions so a
+ * v2 client still renders an older daemon's answers.
+ */
+export const DAEMON_API_VERSION = 2;
+
+/** v2 read shape of `GET /sessions/:id/read` (discriminated; the CLI renders each kind). */
+export type ReadResultV2 =
   | { kind: 'parsed'; id: string; turns: Turn[] }
-  | { kind: 'fallback'; id: string; pane: string }
-  | { kind: 'raw'; id: string; pane: string };
+  | { kind: 'fallback'; id: string; journal: JournalEntry[] }
+  | { kind: 'raw'; id: string; journal: JournalEntry[] };
+
+/** v1 (pre-actor daemon) raw/fallback reads. */
+export type ReadResultV1Pane = { kind: 'fallback' | 'raw'; id: string; pane: string };
+
+export type ReadResult = ReadResultV2 | ReadResultV1Pane;
+
+export type RawStepLog = { step: string; provider: string; journal: JournalEntry[] };
+/** v1 (pre-actor daemon) raw step log. */
+export type RawStepLogV1 = { step: string; provider: string; pane: string };
 
 export type LogsResult =
   | { kind: 'parsed'; logs: { step: string; provider: string; turns: Turn[] }[] }
-  | { kind: 'raw'; logs: { step: string; provider: string; pane: string }[] };
+  | { kind: 'raw'; logs: (RawStepLog | RawStepLogV1)[] };
+
+/** `GET /sessions` row / `GET /sessions/:id` body. */
+export type RemoteSessionView = SessionRecord & {
+  status?: SessionStatus;
+  state?: AgentState | string;
+  suspended?: boolean;
+  stopped?: boolean;
+};
+
+/** `POST /sessions/:id/send` body. */
+export interface RemoteSendResult {
+  ok: boolean;
+  id: string;
+  phase?: 'queued' | 'acknowledged' | 'unknown' | 'failed';
+  messageId?: string;
+  replayed?: boolean;
+}
 
 /**
  * Detached `run`/`resume`/`retry` response: the run id and the HOST-LOCAL runner log
@@ -134,8 +170,8 @@ export class DaemonClient {
     return this.request('POST', path, body ?? {});
   }
 
-  async health(): Promise<{ ok: boolean; version: string; host: string }> {
-    return this.get('/health') as Promise<{ ok: boolean; version: string; host: string }>;
+  async health(): Promise<{ ok: boolean; version: string; host: string; api?: number }> {
+    return this.get('/health') as Promise<{ ok: boolean; version: string; host: string; api?: number }>;
   }
 
   async whoami(): Promise<{
@@ -156,53 +192,32 @@ export class DaemonClient {
     workspace?: string;
     all?: boolean;
     dead?: boolean;
-  }): Promise<(SessionRecord & { status?: 'running' | 'dead' })[]> {
+  }): Promise<RemoteSessionView[]> {
     const q = new URLSearchParams();
     if (filter?.workspace) q.set('workspace', filter.workspace);
     if (filter?.all) q.set('all', '1');
     if (filter?.dead) q.set('dead', '1');
     const qs = q.toString();
-    return this.get(`/sessions${qs ? `?${qs}` : ''}`) as Promise<
-      (SessionRecord & { status?: 'running' | 'dead' })[]
-    >;
+    return this.get(`/sessions${qs ? `?${qs}` : ''}`) as Promise<RemoteSessionView[]>;
   }
 
   async spawn(body: Record<string, unknown>): Promise<SessionRecord> {
     return this.post('/sessions', body) as Promise<SessionRecord>;
   }
 
-  async getSession(
-    id: string,
-  ): Promise<SessionRecord & { status?: 'running' | 'dead'; state?: string }> {
-    return this.get(`/sessions/${encodeURIComponent(id)}`) as Promise<
-      SessionRecord & { status?: 'running' | 'dead'; state?: string }
-    >;
+  async getSession(id: string): Promise<RemoteSessionView> {
+    return this.get(`/sessions/${encodeURIComponent(id)}`) as Promise<RemoteSessionView>;
   }
 
   async send(
     id: string,
     prompt: string,
-    opts?: { messageId?: string },
-  ): Promise<{
-    ok: boolean;
-    id: string;
-    phase?: string;
-    attempts?: number;
-    messageId?: string;
-    payloadHash?: string;
-    replayed?: boolean;
-  }> {
+    opts?: { messageId?: string; wake?: boolean },
+  ): Promise<RemoteSendResult> {
     const body: Record<string, unknown> = { prompt };
     if (opts?.messageId) body.messageId = opts.messageId;
-    return this.post(`/sessions/${encodeURIComponent(id)}/send`, body) as Promise<{
-      ok: boolean;
-      id: string;
-      phase?: string;
-      attempts?: number;
-      messageId?: string;
-      payloadHash?: string;
-      replayed?: boolean;
-    }>;
+    if (opts?.wake === false) body.wake = false;
+    return this.post(`/sessions/${encodeURIComponent(id)}/send`, body) as Promise<RemoteSendResult>;
   }
 
   async wait(id: string, body: { for?: string; timeoutMs?: number }): Promise<WaitResult> {

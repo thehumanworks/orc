@@ -17,14 +17,16 @@ import {
   removeRecord,
 } from '../src/registry.ts';
 import { listSessions, pruneSessions } from '../src/index.ts';
-import type { Driver } from '../src/drivers/driver.ts';
+import type { LivenessProbe } from '../src/session-status.ts';
+import { registryPath } from '../src/paths.ts';
+import nodeFs from 'node:fs';
 import type { SessionRecord } from '../src/types.ts';
 
 /**
  * BUG 3 — kill() must MARK a record dead (keep it for transcript/metadata reads) rather
  * than hard-deleting it; --purge removes it; prune drops all dead records; list hides
- * dead by default. These run against an isolated ORC_HOME and a tmux session that does
- * not exist (kill-session on a missing name returns gracefully).
+ * dead by default. These run against an isolated ORC_HOME with records that have no
+ * kernel session (D15: kill skips the kernel) and an injected liveness probe.
  */
 
 const tmpHomes: string[] = [];
@@ -49,7 +51,6 @@ function rec(over: Partial<SessionRecord> = {}): SessionRecord {
     id: 'dead0001',
     sessionId: 'dead0001-0000-0000-0000-000000000000',
     provider: 'claude',
-    tmuxName: 'orc-claude-dead0001-doesnotexist',
     cwd: ws,
     workspace: ws,
     createdAt: new Date().toISOString(),
@@ -57,25 +58,20 @@ function rec(over: Partial<SessionRecord> = {}): SessionRecord {
   };
 }
 
-function livenessDriver(aliveNames: string[], throwNames: string[] = []): Driver {
-  const alive = new Set(aliveNames);
-  const throwing = new Set(throwNames);
-  return {
-    name: 'test-liveness',
-    spawn: async () => {},
-    capture: async () => '',
-    sendKeys: async () => {},
-    paste: async () => {},
-    attach: async () => 0,
-    attachCommand: () => '',
-    kill: async () => {},
-    isAlive: async (name: string) => {
-      if (throwing.has(name)) throw new Error(`liveness failed for ${name}`);
-      return alive.has(name);
-    },
-    list: async () => [],
-  } as Driver;
+/**
+ * Test liveness: ids in `running` are running, `suspended` are suspended, ids in `throws`
+ * make the probe throw (liveness unknowable), everything else is dead.
+ */
+function live(running: string[], throws: string[] = [], suspended: string[] = []): LivenessProbe {
+  return (r) => {
+    if (throws.includes(r.id)) throw new Error(`liveness failed for ${r.id}`);
+    if (running.includes(r.id)) return 'running';
+    if (suspended.includes(r.id)) return 'suspended';
+    return 'dead';
+  };
 }
+
+const OLD = new Date(Date.now() - 3_600_000).toISOString();
 
 async function runRegistryWorker(args: string[]): Promise<void> {
   const proc = Bun.spawn(['bun', registryWorker, ...args], {
@@ -133,10 +129,9 @@ describe('list hides dead by default (BUG 3)', () => {
 
   test('dead records hidden by default, shown with all/dead', async () => {
     const ws = '/tmp/ws-list-test';
-    const alive = rec({ id: 'alive001', tmuxName: 'orc-x-alive', workspace: ws, cwd: ws });
+    const alive = rec({ id: 'alive001', workspace: ws, cwd: ws });
     const killed = rec({
       id: 'dead0002',
-      tmuxName: 'orc-x-dead',
       workspace: ws,
       cwd: ws,
       status: 'dead',
@@ -145,7 +140,7 @@ describe('list hides dead by default (BUG 3)', () => {
     await upsertRecord(alive);
     await upsertRecord(killed);
 
-    const def = await listSessions({ workspace: ws });
+    const def = await listSessions({ workspace: ws, liveness: live(['alive001']) });
     expect(def.map((s) => s.id).sort()).toEqual(['alive001']);
 
     const withDead = await listSessions({ workspace: ws, dead: true });
@@ -180,7 +175,6 @@ describe('workspace-scoped session aliases', () => {
     const r = rec({
       id: 'alias001',
       alias: 'debugger',
-      tmuxName: 'orc-x-alias-live',
       workspace: ws,
       cwd: ws,
     });
@@ -188,7 +182,7 @@ describe('workspace-scoped session aliases', () => {
 
     const found = await findRecordByAlias(parseAliasSelector('@debugger')!, {
       defaultWorkspace: ws,
-      driver: livenessDriver(['orc-x-alias-live']),
+      liveness: live(['alias001']),
     });
 
     expect(found?.id).toBe('alias001');
@@ -201,7 +195,6 @@ describe('workspace-scoped session aliases', () => {
     const r = rec({
       id: 'alias002',
       alias: 'codex-debugger',
-      tmuxName: 'orc-x-alias-outside',
       workspace: ws,
       cwd: ws,
     });
@@ -209,7 +202,7 @@ describe('workspace-scoped session aliases', () => {
 
     const found = await findRecordByAlias(parseAliasSelector('@orc:codex-debugger')!, {
       defaultWorkspace: '/tmp/elsewhere',
-      driver: livenessDriver(['orc-x-alias-outside']),
+      liveness: live(['alias002']),
     });
 
     expect(found?.id).toBe('alias002');
@@ -219,14 +212,12 @@ describe('workspace-scoped session aliases', () => {
     const logical = rec({
       id: 'alias009',
       alias: 'debugger',
-      tmuxName: 'orc-x-alias-logical',
       workspace: 'orc',
       cwd: '/tmp/logical',
     });
     const basename = rec({
       id: 'alias010',
       alias: 'debugger',
-      tmuxName: 'orc-x-alias-basename',
       workspace: '/tmp/projects/orc',
       cwd: '/tmp/projects/orc',
     });
@@ -235,7 +226,7 @@ describe('workspace-scoped session aliases', () => {
 
     const found = await findRecordByAlias(parseAliasSelector('@orc:debugger')!, {
       defaultWorkspace: '/tmp/elsewhere',
-      driver: livenessDriver(['orc-x-alias-logical', 'orc-x-alias-basename']),
+      liveness: live(['alias009', 'alias010']),
     });
 
     expect(found?.id).toBe('alias009');
@@ -246,14 +237,12 @@ describe('workspace-scoped session aliases', () => {
     const active = rec({
       id: 'alias003',
       alias: 'reviewer',
-      tmuxName: 'orc-x-alias-active',
       workspace: ws,
       cwd: ws,
     });
     const killed = rec({
       id: 'alias004',
       alias: 'reviewer',
-      tmuxName: 'orc-x-alias-dead',
       workspace: ws,
       cwd: ws,
       status: 'dead',
@@ -265,47 +254,45 @@ describe('workspace-scoped session aliases', () => {
     await expect(
       assertAliasAvailable('reviewer', {
         workspace: ws,
-        driver: livenessDriver(['orc-x-alias-active']),
+        liveness: live(['alias003']),
       }),
     ).rejects.toThrow(/already in use/);
 
     const found = await findRecordByAlias(parseAliasSelector('@reviewer')!, {
       defaultWorkspace: ws,
-      driver: livenessDriver(['orc-x-alias-active']),
+      liveness: live(['alias003']),
     });
     expect(found?.id).toBe('alias003');
 
     expect(
       await findRecordByAlias(parseAliasSelector('@reviewer')!, {
         defaultWorkspace: ws,
-        driver: livenessDriver([]),
+        liveness: live([]),
       }),
     ).toBeNull();
     await expect(
-      assertAliasAvailable('reviewer', { workspace: ws, driver: livenessDriver([]) }),
+      assertAliasAvailable('reviewer', { workspace: ws, liveness: live([]) }),
     ).resolves.toBeUndefined();
   });
 
-  test('reserveRecord blocks a duplicate fresh alias reservation before tmux is alive', async () => {
+  test('reserveRecord blocks a duplicate fresh alias reservation before the actor is live', async () => {
     const ws = '/tmp/projects/orc';
     const first = rec({
       id: 'alias005',
       alias: 'builder',
       aliasReservedAt: new Date().toISOString(),
-      tmuxName: 'orc-x-alias-reserved-a',
       workspace: ws,
       cwd: ws,
     });
     const second = rec({
       id: 'alias006',
       alias: 'builder',
-      tmuxName: 'orc-x-alias-reserved-b',
       workspace: ws,
       cwd: ws,
     });
 
-    await reserveRecord(first, { driver: livenessDriver([]) });
-    await expect(reserveRecord(second, { driver: livenessDriver([]) })).rejects.toThrow(
+    await reserveRecord(first, { liveness: live([]) });
+    await expect(reserveRecord(second, { liveness: live([]) })).rejects.toThrow(
       /already in use/,
     );
   });
@@ -316,7 +303,6 @@ describe('workspace-scoped session aliases', () => {
       rec({
         id: 'alias007',
         alias: 'builder',
-        tmuxName: 'orc-x-alias-gone',
         workspace: ws,
         cwd: ws,
       }),
@@ -328,11 +314,10 @@ describe('workspace-scoped session aliases', () => {
           id: 'alias008',
           alias: 'builder',
           aliasReservedAt: new Date().toISOString(),
-          tmuxName: 'orc-x-alias-new',
           workspace: ws,
           cwd: ws,
         }),
-        { driver: livenessDriver([]) },
+        { liveness: live([]) },
       ),
     ).resolves.toBeUndefined();
   });
@@ -344,17 +329,16 @@ describe('prune drops dead records (BUG 3)', () => {
   });
 
   test('pruneSessions removes only dead records', async () => {
-    const alive = rec({ id: 'alive003', tmuxName: 'orc-x-a3' });
+    const alive = rec({ id: 'alive003' });
     const killed = rec({
       id: 'dead0003',
-      tmuxName: 'orc-x-d3',
       status: 'dead',
       killedAt: new Date().toISOString(),
     });
     await upsertRecord(alive);
     await upsertRecord(killed);
 
-    const removed = await pruneSessions({ driver: livenessDriver(['orc-x-a3']) });
+    const removed = await pruneSessions({ liveness: live(['alive003']) });
     expect(removed).toEqual(['dead0003']);
 
     const left = await readRegistry();
@@ -362,11 +346,11 @@ describe('prune drops dead records (BUG 3)', () => {
   });
 
   test('pruneSessions removes liveness-dead records without persisted dead status', async () => {
-    const alive = rec({ id: 'alive005', tmuxName: 'orc-x-live5' });
-    const stale = rec({ id: 'stale005', tmuxName: 'orc-x-stale5' });
+    const alive = rec({ id: 'alive005' });
+    // Old enough not to be a spawn in progress.
+    const stale = rec({ id: 'stale005', createdAt: OLD });
     const killed = rec({
       id: 'dead0005',
-      tmuxName: 'orc-x-dead5',
       status: 'dead',
       killedAt: new Date().toISOString(),
     });
@@ -374,7 +358,7 @@ describe('prune drops dead records (BUG 3)', () => {
     await upsertRecord(stale);
     await upsertRecord(killed);
 
-    const removed = await pruneSessions({ driver: livenessDriver(['orc-x-live5']) });
+    const removed = await pruneSessions({ liveness: live(['alive005']) });
     expect(removed.sort()).toEqual(['dead0005', 'stale005']);
 
     const left = await readRegistry();
@@ -382,33 +366,73 @@ describe('prune drops dead records (BUG 3)', () => {
   });
 
   test('pruneSessions returns [] when nothing dead', async () => {
-    await upsertRecord(rec({ id: 'alive004', tmuxName: 'orc-x-a4' }));
-    expect(await pruneSessions({ driver: livenessDriver(['orc-x-a4']) })).toEqual([]);
+    await upsertRecord(rec({ id: 'alive004' }));
+    expect(await pruneSessions({ liveness: live(['alive004']) })).toEqual([]);
   });
 
   test('pruneSessions keeps records when liveness cannot be determined', async () => {
-    const uncertain = rec({ id: 'maybe006', tmuxName: 'orc-x-throws6' });
+    const uncertain = rec({ id: 'maybe006' });
     await upsertRecord(uncertain);
 
-    expect(await pruneSessions({ driver: livenessDriver([], ['orc-x-throws6']) })).toEqual([]);
+    expect(await pruneSessions({ liveness: live([], ['maybe006']) })).toEqual([]);
     expect((await readRegistry()).map((r) => r.id)).toEqual(['maybe006']);
   });
 
   test('pruneSessions does not remove a replacement record from a stale liveness result', async () => {
-    const original = rec({ id: 'race007', tmuxName: 'orc-x-old7' });
-    const replacement = rec({ id: 'race007', tmuxName: 'orc-x-new7' });
+    const original = rec({ id: 'race007', createdAt: OLD });
+    const replacement = rec({ id: 'race007', sessionId: 'race007-1111-1111-1111-111111111111' });
     await upsertRecord(original);
 
-    const driver = {
-      ...livenessDriver([]),
-      isAlive: async () => {
-        await upsertRecord(replacement);
-        return false;
-      },
-    } as Driver;
+    // The record is replaced (same short id, new session) after liveness was judged and
+    // before the registry update: the replacement must survive.
+    const probe: LivenessProbe = () => {
+      nodeFs.writeFileSync(registryPath(), JSON.stringify([replacement]));
+      return 'dead';
+    };
 
-    expect(await pruneSessions({ driver })).toEqual([]);
+    expect(await pruneSessions({ liveness: probe })).toEqual([]);
     expect(await readRegistry()).toEqual([replacement]);
+  });
+
+  test('suspended sessions are kept unless suspended: true', async () => {
+    await upsertRecord(rec({ id: 'susp0008', createdAt: OLD }));
+    await upsertRecord(rec({ id: 'dead0008', createdAt: OLD }));
+    const probe = live([], [], ['susp0008']);
+    expect(await pruneSessions({ liveness: probe })).toEqual(['dead0008']);
+    expect((await readRegistry()).map((r) => r.id)).toEqual(['susp0008']);
+    expect(await pruneSessions({ liveness: probe, suspended: true })).toEqual(['susp0008']);
+    expect(await readRegistry()).toEqual([]);
+  });
+
+  test('a young record without runtime state (spawn in progress) is never pruned', async () => {
+    await upsertRecord(rec({ id: 'young009' }));
+    expect(await pruneSessions({ liveness: live([]) })).toEqual([]);
+    expect((await readRegistry()).map((r) => r.id)).toEqual(['young009']);
+  });
+
+  test('legacy tmux records normalise to dead and are pruned', async () => {
+    const legacy = {
+      id: 'legacy10',
+      sessionId: 'legacy10-0000-0000-0000-000000000000',
+      provider: 'codex',
+      tmuxName: 'orc-codex-legacy10',
+      instructionsPath: '/tmp/x/instructions.md',
+      transcriptSessionId: 'cdx-thread',
+      cwd: '/tmp/ws-kill-test',
+      workspace: '/tmp/ws-kill-test',
+      createdAt: new Date().toISOString(),
+    };
+    nodeFs.writeFileSync(registryPath(), JSON.stringify([legacy]));
+    const [r] = await readRegistry();
+    expect(r!.legacy).toBe('tmux');
+    expect(r!.status).toBe('dead');
+    expect(r!.legacyTmuxName).toBe('orc-codex-legacy10');
+    expect(r!.systemPromptPath).toBe('/tmp/x/instructions.md');
+    expect(r!.providerSessionId).toBe('cdx-thread');
+    expect('tmuxName' in r!).toBe(false);
+    // Hidden from the default list, pruned by default (kernel liveness).
+    expect((await listSessions({ workspace: '/tmp/ws-kill-test' })).map((s) => s.id)).toEqual([]);
+    expect(await pruneSessions()).toEqual(['legacy10']);
   });
 });
 
@@ -419,7 +443,7 @@ describe('registry mutations are serialized', () => {
 
   test('concurrent upsertRecord calls preserve all records', async () => {
     const records = Array.from({ length: 25 }, (_, i) =>
-      rec({ id: `up${String(i).padStart(6, '0')}`, tmuxName: `orc-x-up-${i}` }),
+      rec({ id: `up${String(i).padStart(6, '0')}` }),
     );
 
     await Promise.all(records.map((r) => upsertRecord(r)));
@@ -430,7 +454,7 @@ describe('registry mutations are serialized', () => {
 
   test('concurrent removeRecord calls do not resurrect records', async () => {
     const records = Array.from({ length: 25 }, (_, i) =>
-      rec({ id: `rm${String(i).padStart(6, '0')}`, tmuxName: `orc-x-rm-${i}` }),
+      rec({ id: `rm${String(i).padStart(6, '0')}` }),
     );
     for (const r of records) await upsertRecord(r);
 
@@ -441,7 +465,7 @@ describe('registry mutations are serialized', () => {
 
   test('separate processes serialize registry upserts and removals', async () => {
     const records = Array.from({ length: 12 }, (_, i) =>
-      rec({ id: `proc${String(i).padStart(4, '0')}`, tmuxName: `orc-x-proc-${i}` }),
+      rec({ id: `proc${String(i).padStart(4, '0')}` }),
     );
 
     await Promise.all(records.map((r) => runRegistryWorker(['upsert', JSON.stringify(r)])));
@@ -460,7 +484,7 @@ describe('registry mutations are serialized', () => {
     await fs.utimes(lock, old, old);
 
     const records = Array.from({ length: 8 }, (_, i) =>
-      rec({ id: `stale${String(i).padStart(3, '0')}`, tmuxName: `orc-x-stale-${i}` }),
+      rec({ id: `stale${String(i).padStart(3, '0')}` }),
     );
 
     await Promise.all(records.map((r) => runRegistryWorker(['upsert', JSON.stringify(r)])));

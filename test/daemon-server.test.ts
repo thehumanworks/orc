@@ -290,7 +290,6 @@ describe('daemon over a live loopback socket', () => {
       id: 'readtest',
       sessionId: 'readtest-0000-0000-0000-000000000000',
       provider: 'claude',
-      tmuxName: 'orc-claude-readtest',
       cwd: home,
       workspace: home,
       createdAt: new Date().toISOString(),

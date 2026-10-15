@@ -522,8 +522,14 @@ export function deriveSchedulerState(
     }
 
     // Resume re-opens non-success terminals so incomplete work can finish.
-    // Dependents of still-failed producers become blocked in the second pass.
-    if (opts.resume && !(opts.retrySet && opts.retrySet.size > 0)) {
+    // Dependents of still-failed producers become blocked in the second pass. An attempt
+    // whose instruction delivery is unknown is NOT re-opened: it was never proven
+    // undelivered, so only an explicit retry may send it again.
+    if (
+      opts.resume &&
+      !(opts.retrySet && opts.retrySet.size > 0) &&
+      a?.errorCategory !== 'delivery_unknown'
+    ) {
       if (
         a?.phase === 'blocked' ||
         a?.phase === 'skipped' ||

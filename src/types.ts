@@ -6,26 +6,29 @@ export type Provider = 'claude' | 'codex' | 'pi';
 
 export type SystemPromptMode = 'append' | 'replace';
 
-export type SessionStatus = 'running' | 'dead';
+/**
+ * Session lifecycle status (derived from the actor kernel, never stored except `dead`):
+ * - `running`   — the session's actor holds a live lease.
+ * - `suspended` — not live and not stopped, spawn.json present: resumable (an `orc send`
+ *   or `orc resume` wakes it).
+ * - `dead`      — stopped (killed / taken over), a legacy tmux record, or no spawn.json.
+ */
+export type SessionStatus = 'running' | 'suspended' | 'dead';
 
 /**
- * Classified state of an interactive agent session. This is the foundation for
- * orchestration, so the definitions are load-bearing — be precise:
+ * State of an agent session, derived from its durable journal (design §4.4). This is the
+ * foundation for orchestration, so the definitions are load-bearing:
  *
- * - `starting` — booted but not yet showing a ready composer (transient).
- * - `running`  — the assistant is actively working (a turn is in progress).
- * - `done`     — the turn has YIELDED: the composer is idle and ready for input.
- *   This means "ready for YOUR input," NOT "succeeded." It covers BOTH "finished the
- *   task" AND "asked a clarifying question and is waiting for your reply" — those two
- *   are pane-indistinguishable for claude/codex in yolo mode (both render as the idle
- *   composer with no working indicator), so a conversational question is reported as
- *   `done`, not `waiting`.
- * - `waiting`  — blocked specifically on a TUI MODAL that needs a response: a trust
- *   dialog, an approval/permission selection, or an update interstitial. (A
- *   conversational question is `done`, per above — it is not pane-distinguishable.)
- * - `failed`   — the process/pane is no longer alive. This is crash OR clean exit
- *   (e.g. `/exit`); pane-gone cannot distinguish them, so `failed` means "TERMINATED,"
- *   NOT "errored."
+ * - `starting` — the actor is up but the provider has not finished initialising.
+ * - `running`  — a turn is open, or messages are queued in the inbox.
+ * - `done`     — no open turn and nothing queued: the last turn YIELDED. This means
+ *   "ready for YOUR input," NOT "succeeded." It covers both "finished the task" and
+ *   "asked a clarifying question" (both end a turn normally).
+ * - `waiting`  — the provider asked for a permission/approval decision (should not happen
+ *   in the yolo modes orc launches; orc denies it so the turn ends).
+ * - `failed`   — the last turn failed, or the session is not live (stopped, crashed,
+ *   host rebooted, legacy). `orc state --json` adds `suspended: true` when it is
+ *   resumable and `stopped: true` when it was explicitly stopped.
  */
 export type AgentState = 'starting' | 'running' | 'done' | 'waiting' | 'failed';
 
@@ -84,14 +87,18 @@ export interface AgentOptions extends ExecutionLineage {
   workspace?: string;
   /** Create a fresh git worktree for this agent and use it as cwd. */
   worktree?: boolean | { branch?: string; path?: string };
-  /** Driver name; default 'tmux'. */
-  driver?: string;
-  /** Wait for boot before resolving (default true). */
+  /**
+   * Wait (bounded by `readyTimeoutMs`) for the provider to report ready before resolving
+   * and before sending `prompt` (default true). false → return as soon as the actor has
+   * started; an initial `prompt` is still durably queued (delivered once ready).
+   */
   waitForReady?: boolean;
+  /** Bound for the readiness wait (default 60000 ms). */
+  readyTimeoutMs?: number;
   /** Optional execution policy (merged with inherited root policy when lineage is set). */
   policy?: ExecutionPolicy;
   /**
-   * Extra environment variables threaded into the detached TUI process
+   * Extra environment variables threaded into the provider process
    * (e.g. ORC_RESULT_PATH). Merged after lineage env; does not override empty keys.
    */
   extraEnv?: Record<string, string>;
@@ -99,19 +106,21 @@ export interface AgentOptions extends ExecutionLineage {
 
 /**
  * Persisted record for a launched session. Stored as an array in ~/.orc/registry.json.
- * Optional lineage fields are absent on pre-phase-2 records (still valid).
+ * Optional lineage fields are absent on pre-phase-2 records (still valid). Runtime state
+ * (liveness, turns) lives in the kernel under ~/.orc/sessions/<sessionId>/.
  */
 export interface SessionRecord extends ExecutionLineage {
   /** Short handle (first 8 chars of sessionId). Used as the CLI handle. */
   id: string;
-  /** The uuid we generate at spawn (claude/pi --session-id; also the handle source). */
+  /** The uuid we generate at spawn (the kernel session id; claude/pi --session-id). */
   sessionId: string;
+  /** `actor` for every session launched on the tmux-free runtime. */
+  runtime?: 'actor';
   /**
-   * Provider-side session id discovered after boot. For claude/pi this equals sessionId.
-   * For codex (no --session-id at launch) this is the uuid discovered from the rollout file.
-   * Undefined until resolved.
+   * Provider-side session id (claude/pi: equals sessionId; codex: the server-assigned
+   * thread id), learned from the kernel once the provider is ready.
    */
-  transcriptSessionId?: string;
+  providerSessionId?: string;
   provider: Provider;
   model?: string;
   agentName?: string;
@@ -119,47 +128,42 @@ export interface SessionRecord extends ExecutionLineage {
   alias?: string;
   /** Transient pre-spawn reservation used to make alias creation race-resistant. */
   aliasReservedAt?: string;
-  tmuxName: string;
   /** realpath of the launch cwd (== worktree path if worktree). */
   cwd: string;
   worktreePath?: string;
   branch?: string;
   workspace: string;
   systemPromptMode?: SystemPromptMode;
-  /** For pi: the session-dir passed at launch, used to glob the transcript. */
+  /** For pi: the --session-dir, used to locate the transcript. */
   sessionDir?: string;
   /**
-   * Absolute path to an orc-owned Codex persona instructions file (outside the
-   * worktree). Present when a system/agent prompt was injected via
-   * `experimental_instructions_file`. Removed on pre-spawn failure and purge/cleanup.
+   * Absolute path of the orc-owned system prompt file (~/.orc/sessions/<sid>/
+   * system-prompt.md, 0600) the provider reads at launch. Present when a system prompt or
+   * a resolved (codex/pi) agent body applies. Removed with the session dir.
    */
-  instructionsPath?: string;
+  systemPromptPath?: string;
   createdAt: string;
   /**
-   * Lifecycle status. Absent (undefined) means alive/active. 'dead' marks a record
-   * that was explicitly killed: it is KEPT in the registry (not deleted) so transcript
-   * and metadata reads still resolve after kill (ARCHITECTURE: keep dead records for
-   * transcript reads). Hidden from `orc list` by default; shown with --all/--dead.
+   * Persisted only as `dead` (killed, taken over, or legacy). Absent means the kernel is
+   * authoritative (running / suspended / dead). Dead records are KEPT so transcript and
+   * journal reads still resolve; hidden from `orc list` by default.
    */
   status?: SessionStatus;
-  /** ISO timestamp set when the record was killed. */
+  /** ISO timestamp set when the record was killed or taken over. */
   killedAt?: string;
-  /**
-   * The on-disk transcript path, resolved and persisted at kill time. For codex (no
-   * preset session-id) this is captured BEFORE the tmux session + cwd are gone, so the
-   * transcript stays discoverable afterwards.
-   */
+  /** Why the session was stopped by orc (`kill` | `takeover`). */
+  stoppedBy?: 'kill' | 'takeover';
+  /** The on-disk provider transcript path, persisted at kill/takeover time. */
   transcriptPath?: string;
   /** Effective policy snapshot at spawn (for audit); optional. */
   policy?: ExecutionPolicy;
-}
-
-export interface PaneInfo {
-  name: string;
-  pid: number;
-  cwd: string;
-  command: string;
-  attached: boolean;
+  /**
+   * Set on records written by the pre-actor (tmux) orc: readable and prunable, never
+   * controlled. Normalised at read time (status forced to `dead`).
+   */
+  legacy?: 'tmux';
+  /** The tmux session name of a legacy record (read-only, informational). */
+  legacyTmuxName?: string;
 }
 
 /**
