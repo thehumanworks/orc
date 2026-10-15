@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
+  SessionStartError,
   SessionStoppedError,
   createSession,
   deliveryVerdict,
@@ -27,7 +28,7 @@ import {
   withActorLock,
   writeActorState,
 } from '../src/runtime/actor-state.ts';
-import { readSpawnSpec } from '../src/runtime/spec.ts';
+import { readSpawnSpec, writeSpawnSpec } from '../src/runtime/spec.ts';
 import { sessionPaths } from '../src/runtime/layout.ts';
 import { isPidAlive, selfArgv, spawnDetached } from '../src/runtime/process.ts';
 import type { FakeScript } from '../src/runtime/providers/fake.ts';
@@ -714,6 +715,51 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
   );
 
   test(
+    'failed resumes: sessionError surfaced, never a fresh fallback, auto-wake refused after 3 until forced',
+    async () => {
+      const sid = await newSession({ exitOnResume: 7 });
+      await send(sid, { messageId: 'r0', text: 'first' });
+      await waitCompleted(sid, 'r0');
+      await crashActor(sid);
+
+      // Wake 1 (via send): the provider rejects the resume → surfaced, message stays queued.
+      const r1 = await send(sid, { messageId: 'r1', text: 'one' }, { ackTimeoutMs: 2_000 });
+      expect(r1).toMatchObject({ verdict: 'queued', woke: true });
+      expect(r1.sessionError).toMatch(/provider exited before ready \(code=7/);
+      expect(r1.sessionError).toContain('no conversation found'); // actor.log tail
+      expect(readActorState(sid)).toMatchObject({ phase: 'suspended', startFailures: 1 });
+      // Wakes 2 and 3 (explicit ensureAwake): same.
+      for (const n of [2, 3]) {
+        const w = await ensureAwake(sid);
+        expect(w).toMatchObject({ status: 'started' });
+        expect((w as { sessionError?: string }).sessionError).toMatch(/code=7/);
+        expect(readActorState(sid)?.startFailures).toBe(n);
+      }
+      expect(deriveState(inspect(sid))).toMatchObject({ suspended: true, startFailures: 3 });
+      // Refused now: no new actor, the message is still queued and the reason is surfaced.
+      await expect(ensureAwake(sid)).rejects.toBeInstanceOf(SessionStartError);
+      const r2 = await send(sid, { messageId: 'r2', text: 'two' });
+      expect(r2).toMatchObject({ verdict: 'queued', woke: false });
+      expect(r2.sessionError).toMatch(/3 times in a row/);
+      expect(listPending(sid).map((i) => (i as { messageId?: string }).messageId)).toEqual(['r1', 'r2']);
+      // Never fell back to a fresh session.
+      expect(entries(sid, 'actor.started').map((e) => e.mode)).toEqual(['fresh', 'resume', 'resume', 'resume']);
+
+      // Explicit resume after fixing the provider: forced wake → ready → counter reset → delivered in order.
+      const spec = readSpawnSpec(sid)!;
+      writeSpawnSpec({ ...spec, fakeScript: {} });
+      const forced = await ensureAwake(sid, { force: true });
+      expect(forced).toMatchObject({ status: 'started' });
+      expect((forced as { sessionError?: string }).sessionError).toBeUndefined();
+      await waitCompleted(sid, 'r2');
+      expect(readActorState(sid)?.startFailures).toBeUndefined();
+      expect(entries(sid, 'turn.intent').map((e) => e.messageId)).toEqual(['r0', 'r1', 'r2']);
+      expect(entries(sid, 'actor.started').at(-1)?.mode).toBe('resume');
+    },
+    T,
+  );
+
+  test(
     'lease lost → the actor kills its provider and exits without touching state.json',
     async () => {
       const sid = await newSession();
@@ -748,7 +794,8 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
       const prevBin = process.env.ORC_CLAUDE_BIN;
       process.env.ORC_CLAUDE_BIN = path.join(root, 'no-such-claude-binary');
       try {
-        await createSession(spec);
+        // Fails fast with the provider's start error (not a silent success).
+        await expect(createSession(spec)).rejects.toBeInstanceOf(SessionStartError);
       } finally {
         if (prevBin === undefined) delete process.env.ORC_CLAUDE_BIN;
         else process.env.ORC_CLAUDE_BIN = prevBin;
@@ -757,6 +804,7 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
       expect(stopped).toMatchObject({ reason: 'error' });
       expect(String((stopped as { error?: string }).error)).toMatch(/claude|no-such-claude-binary|ENOENT/i);
       await waitFor(() => readActorState(spec.sessionId)?.phase === 'suspended', 'suspended');
+      expect(readActorState(spec.sessionId)?.startFailures).toBe(1);
 
       await expect(createSession(spec)).rejects.toThrow(/already exists/);
       await expect(createSession(fakeSpec(path.join(root, 'missing-dir')))).rejects.toThrow(/does not exist/);

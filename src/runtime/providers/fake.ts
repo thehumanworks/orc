@@ -69,6 +69,8 @@ export interface FakeScript {
   startDelayMs?: number;
   /** Exit immediately at start with this code (provider fails to start). */
   exitAtStart?: number;
+  /** Exit immediately with this code when started in RESUME mode (provider rejects the resume). */
+  exitOnResume?: number;
   /**
    * On stdin EOF keep running for this long before exiting (simulates a provider that
    * outlives its actor). Default: exit immediately on EOF.

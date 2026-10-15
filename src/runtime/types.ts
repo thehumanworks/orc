@@ -252,11 +252,20 @@ export interface ActorStateFile {
   /** Number of turns that reached turn.completed (resume needs >= 1 for codex). */
   completedTurns: number;
   stopReason?: string;
+  /**
+   * Consecutive actor starts that ended before the provider became ready (reset on
+   * `ready`). After MAX_CONSECUTIVE_START_FAILURES the session is not auto-woken.
+   */
+  startFailures?: number;
+  /** Why the last failed start failed. */
+  lastStartError?: string;
   updatedAt: string;
 }
 
 /** Lease timing (design §4.2). */
 export const LEASE_HEARTBEAT_MS = 5_000;
 export const LEASE_TTL_MS = 30_000;
+/** Consecutive failed starts after which a session is no longer auto-woken. */
+export const MAX_CONSECUTIVE_START_FAILURES = 3;
 /** Inbox poll interval — the correctness path; fs.watch is only a latency hint. */
 export const INBOX_POLL_MS = 250;

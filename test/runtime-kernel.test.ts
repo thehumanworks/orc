@@ -366,6 +366,12 @@ describe('deriveState', () => {
     expect(deriveState(view(opts))).toMatchObject(want);
   });
 
+  test('spawn.json without state.json → failed + suspended (resumable)', () => {
+    const v = view({ phase: 'missing' });
+    const d = deriveState({ ...v, exists: true });
+    expect(d).toMatchObject({ state: 'failed', phase: 'suspended', suspended: true, stopped: false });
+  });
+
   test('open turn → running; outcome → done; last failed → failed (live, not suspended)', () => {
     const j = [started, intent('a'), turnStarted('a')];
     expect(deriveState(view({ journal: j }))).toMatchObject({ state: 'running', openTurn: { messageId: 'a' } });

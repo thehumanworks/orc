@@ -151,6 +151,8 @@ class Actor {
    */
   private phase: ActorStateFile['phase'] = 'starting';
   private providerSessionId?: string;
+  private startFailures = 0;
+  private lastStartError?: string;
   private readonly handlers: Array<[string, (...args: unknown[]) => void]> = [];
 
   constructor(private readonly sid: string) {
@@ -215,6 +217,8 @@ class Actor {
       this.interruptCutoffMs = Number.isFinite(launchedAt) ? Math.min(launchedAt, Date.now()) : Date.now();
       if (st.provider) this.staleProvider = st.provider;
       this.stateCompletedTurns = st.completedTurns;
+      this.startFailures = st.startFailures ?? 0;
+      this.lastStartError = st.lastStartError;
       st.lease = {
         pid: this.pid,
         startTime: this.startTime,
@@ -242,6 +246,13 @@ class Actor {
       s.phase = this.phase;
       if (this.providerSessionId) s.providerSessionId = this.providerSessionId;
       if (this.providerId) s.provider = this.providerId;
+      if (this.startFailures > 0) {
+        s.startFailures = this.startFailures;
+        if (this.lastStartError) s.lastStartError = this.lastStartError;
+      } else {
+        delete s.startFailures;
+        delete s.lastStartError;
+      }
       mut(s);
       if (this.journal) s.lastSeq = Math.max(s.lastSeq, this.journal.lastSeq);
       s.completedTurns = Math.max(s.completedTurns, this.completedTurns());
@@ -424,6 +435,8 @@ class Actor {
           writeSpawnSpec(this.spec);
         }
         this.providerSessionId = ev.providerSessionId;
+        this.startFailures = 0;
+        this.lastStartError = undefined;
         if (!this.shuttingDown) {
           this.phase = 'running';
           await this.persist();
@@ -474,6 +487,7 @@ class Actor {
           void this.shutdown({
             phase: 'suspended',
             reason: 'provider-exit',
+            error: `provider exited${this.ready ? '' : ' before ready'} (code=${ev.code} signal=${ev.signal})`,
             stopReason: `provider-exit (code=${ev.code} signal=${ev.signal})`,
             turnReason: 'provider-exit',
             code: 0,
@@ -741,6 +755,11 @@ class Actor {
     if (owns) {
       const providerGone = !this.providerId || !isLiveProcess(this.providerId);
       this.phase = o.phase;
+      if (!this.ready && (o.reason === 'error' || o.reason === 'provider-exit')) {
+        // A start that never reached `ready` (e.g. a resume the provider rejects).
+        this.startFailures += 1;
+        this.lastStartError = o.error ?? o.stopReason;
+      }
       await this.persist(
         (s) => {
           s.stopReason = o.stopReason;

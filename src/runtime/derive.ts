@@ -261,6 +261,9 @@ export interface DerivedState {
   providerSessionId?: string;
   transcriptPath?: string;
   stopReason?: string;
+  /** Consecutive failed starts (provider never ready); auto-wake stops at the max. */
+  startFailures?: number;
+  lastStartError?: string;
 }
 
 /**
@@ -302,8 +305,18 @@ export function deriveState(view: SessionView): DerivedState {
   const tpath = view.spec?.transcriptPath ?? s.transcriptPath;
   if (tpath) out.transcriptPath = tpath;
   if (view.actor?.stopReason) out.stopReason = view.actor.stopReason;
+  if (view.actor?.startFailures) {
+    out.startFailures = view.actor.startFailures;
+    if (view.actor.lastStartError) out.lastStartError = view.actor.lastStartError;
+  }
 
-  if (!view.exists || !view.actor) return out;
+  if (!view.exists) return out;
+  if (!view.actor) {
+    // spawn.json without state.json (creation interrupted): resumable by a wake.
+    out.phase = 'suspended';
+    out.suspended = true;
+    return out;
+  }
   if (view.actor.phase === 'stopped') {
     out.stopped = true;
     return out;

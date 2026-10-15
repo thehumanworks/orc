@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { assertValidMessageId } from '../paths.ts';
 import { selfArgv, spawnDetached } from './process.ts';
-import { LEASE_HEARTBEAT_MS, LEASE_TTL_MS } from './types.ts';
+import { LEASE_HEARTBEAT_MS, LEASE_TTL_MS, MAX_CONSECUTIVE_START_FAILURES } from './types.ts';
 import type { ActorStateFile, ProcessIdentity, SpawnSpec } from './types.ts';
 import { ensureSessionDirs, sessionPaths } from './layout.ts';
 import { assertValidSessionId, readFileTail } from './fsutil.ts';
@@ -54,6 +54,24 @@ export class SessionStoppedError extends Error {
   constructor(readonly sessionId: string) {
     super(`session ${sessionId} is stopped (stop is sticky; it never wakes)`);
     this.name = 'SessionStoppedError';
+  }
+}
+
+/**
+ * The session's actor could not get its provider to `ready` — on create, or for
+ * MAX_CONSECUTIVE_START_FAILURES wakes in a row (auto-wake is then refused until an
+ * explicit `ensureAwake(sid, { force: true })`). Never retried as a fresh session.
+ */
+export class SessionStartError extends Error {
+  readonly code = 'ORC_SESSION_START_FAILED';
+  constructor(
+    readonly sessionId: string,
+    message: string,
+    readonly failures: number,
+    readonly lastError?: string,
+  ) {
+    super(message);
+    this.name = 'SessionStartError';
   }
 }
 
@@ -147,6 +165,8 @@ async function markStartFailed(sessionId: string, actor: ProcessIdentity): Promi
     if (!st || st.phase === 'stopped' || st.lease?.pid !== actor.pid || isLiveProcess(actor)) return;
     st.phase = 'suspended';
     st.stopReason = 'start-failed';
+    st.startFailures = (st.startFailures ?? 0) + 1;
+    st.lastStartError = 'actor exited before starting';
     delete st.lease;
     st.updatedAt = new Date().toISOString();
     writeActorState(st, { fsync: true });
@@ -154,18 +174,48 @@ async function markStartFailed(sessionId: string, actor: ProcessIdentity): Promi
 }
 
 /** Wait until `actor` journals actor.started; fail fast (with the log tail) if it dies. */
-async function waitForActorStarted(sessionId: string, actor: ProcessIdentity, timeoutMs: number): Promise<void> {
+/**
+ * Wait for a freshly spawned actor: first its actor.started (throws — with the actor.log
+ * tail — if it dies or times out before that), then the start outcome: provider.ready →
+ * ok; actor.stopped (error / provider exit) or the actor dying → `sessionError` (fail
+ * fast, never a silent `queued`). Still starting at the deadline → ok (the actor is up).
+ */
+async function waitForActorStart(
+  sessionId: string,
+  actor: ProcessIdentity,
+  timeoutMs: number,
+): Promise<{ sessionError?: string }> {
   const cursor = JournalCursor.forSession(sessionId);
-  const started = () => cursor.readNew().some((e) => e.type === 'actor.started' && e.pid === actor.pid);
   const deadline = Date.now() + timeoutMs;
+  let started = false;
+  const scan = (): { sessionError?: string } | undefined => {
+    for (const e of cursor.readNew()) {
+      if (!started) {
+        started = e.type === 'actor.started' && e.pid === actor.pid;
+        continue;
+      }
+      if (e.type === 'provider.ready') return {};
+      if (e.type === 'actor.stopped') {
+        if (e.reason === 'stop') return {};
+        return {
+          sessionError: `actor stopped during start (${e.reason}${e.error ? `: ${e.error}` : ''})${logTail(sessionId)}`,
+        };
+      }
+    }
+    return undefined;
+  };
   while (true) {
-    if (started()) return;
+    const outcome = scan();
+    if (outcome) return outcome;
     if (!isLiveProcess(actor)) {
-      if (started()) return;
+      const last = scan();
+      if (last) return last;
+      if (started) return { sessionError: `actor ${actor.pid} exited during start${logTail(sessionId)}` };
       await markStartFailed(sessionId, actor);
       throw new Error(`actor ${actor.pid} for session ${sessionId} exited before starting${logTail(sessionId)}`);
     }
     if (Date.now() >= deadline) {
+      if (started) return {};
       throw new Error(
         `timed out after ${timeoutMs}ms waiting for actor ${actor.pid} of session ${sessionId}${logTail(sessionId)}`,
       );
@@ -204,11 +254,19 @@ export async function createSession(
     writeSpawnSpec(spec);
     return spawnActorLocked(sid, initialActorState(sid));
   });
-  await waitForActorStarted(sid, actor, opts.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS);
+  const { sessionError } = await waitForActorStart(sid, actor, opts.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS);
+  if (sessionError) {
+    throw new SessionStartError(sid, `session ${sid} failed to start: ${sessionError}`, 1, sessionError);
+  }
   return { actor };
 }
 
 export interface EnsureAwakeOptions {
+  /**
+   * Wake even after MAX_CONSECUTIVE_START_FAILURES failed starts (an explicit resume).
+   * Without it such a session throws SessionStartError instead of being woken again.
+   */
+  force?: boolean;
   /** Policy hook run under the actor lock just before a spawn (never when already live). */
   beforeSpawn?: () => Promise<void>;
   startTimeoutMs?: number;
@@ -216,7 +274,8 @@ export interface EnsureAwakeOptions {
 
 export type EnsureAwakeResult =
   | { status: 'live'; actor: ProcessIdentity }
-  | { status: 'started'; actor: ProcessIdentity }
+  /** `sessionError`: the actor started but its provider failed before `ready` (it has exited). */
+  | { status: 'started'; actor: ProcessIdentity; sessionError?: string }
   | { status: 'stopped' };
 
 /**
@@ -235,6 +294,16 @@ export async function ensureAwake(sessionId: string, opts: EnsureAwakeOptions = 
       return { status: 'live', actor: { pid: st.lease.pid, startTime: st.lease.startTime } };
     }
     if (st.phase === 'stopped') return { status: 'stopped' };
+    const failures = st.startFailures ?? 0;
+    if (failures >= MAX_CONSECUTIVE_START_FAILURES && !opts.force) {
+      throw new SessionStartError(
+        sessionId,
+        `session ${sessionId} failed to start ${failures} times in a row (last: ${st.lastStartError ?? 'unknown'}); ` +
+          'not auto-waking — resume explicitly with ensureAwake(sid, { force: true })',
+        failures,
+        st.lastStartError,
+      );
+    }
     await opts.beforeSpawn?.();
     // Alive but lease expired = wedged actor: it must not keep writing.
     if (st.lease && isLiveProcess(st.lease)) await terminateGroup(st.lease, 1_000);
@@ -244,7 +313,12 @@ export async function ensureAwake(sessionId: string, opts: EnsureAwakeOptions = 
     return { status: 'started', actor: spawnActorLocked(sessionId, st) };
   });
   if (r.status === 'started') {
-    await waitForActorStarted(sessionId, r.actor, opts.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS);
+    const { sessionError } = await waitForActorStart(
+      sessionId,
+      r.actor,
+      opts.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS,
+    );
+    if (sessionError) return { ...r, sessionError };
   }
   return r;
 }
@@ -283,6 +357,11 @@ export interface SendResult {
   duplicate: boolean;
   /** This call spawned the actor. */
   woke: boolean;
+  /**
+   * The wake failed: the provider did not start (or auto-wake is refused after repeated
+   * failed starts). The message stays durably queued for an explicit resume.
+   */
+  sessionError?: string;
 }
 
 /** Coarse send verdict; `acked` = a turn.started exists for the message. */
@@ -379,11 +458,19 @@ export async function send(
   }
 
   let woke = false;
+  let sessionError: string | undefined;
   if (opts.wake !== false) {
-    const r = await ensureAwake(sessionId, {
-      ...(opts.beforeWake ? { beforeSpawn: opts.beforeWake } : {}),
-      ...(opts.startTimeoutMs !== undefined ? { startTimeoutMs: opts.startTimeoutMs } : {}),
-    });
+    let r: EnsureAwakeResult;
+    try {
+      r = await ensureAwake(sessionId, {
+        ...(opts.beforeWake ? { beforeSpawn: opts.beforeWake } : {}),
+        ...(opts.startTimeoutMs !== undefined ? { startTimeoutMs: opts.startTimeoutMs } : {}),
+      });
+    } catch (e) {
+      if (!(e instanceof SessionStartError)) throw e;
+      return { ulid, verdict: 'queued', delivery: 'queued', duplicate, woke: false, sessionError: e.message };
+    }
+    if (r.status === 'started' && r.sessionError) sessionError = r.sessionError;
     if (r.status === 'stopped') {
       // stop() landed between our phase check and the wake: never leave it queued.
       await dropIfUndelivered(sessionId, ulid);
@@ -401,7 +488,14 @@ export async function send(
     await dropIfUndelivered(sessionId, ulid);
     throw new SessionStoppedError(sessionId);
   }
-  return { ulid, verdict: coarseVerdict(delivery, acked), delivery, duplicate, woke };
+  return {
+    ulid,
+    verdict: coarseVerdict(delivery, acked),
+    delivery,
+    duplicate,
+    woke,
+    ...(sessionError ? { sessionError } : {}),
+  };
 }
 
 function isStopPhase(phase: ActorStateFile['phase'] | undefined): boolean {

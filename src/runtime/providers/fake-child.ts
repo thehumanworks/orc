@@ -37,6 +37,10 @@ function emit(ev: Record<string, unknown>): void {
 }
 
 if (typeof script.exitAtStart === 'number') process.exit(script.exitAtStart);
+if (typeof script.exitOnResume === 'number' && mode === 'resume') {
+  process.stderr.write(`fake-child: no conversation found for ${providerSessionId}\n`);
+  process.exit(script.exitOnResume);
+}
 
 interface Turn {
   messageId: string;
