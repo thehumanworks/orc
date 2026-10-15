@@ -5,6 +5,7 @@
  *   bun scripts/verify-runtime/all.ts [--providers claude,codex,pi] [--claude-model M]
  *       [--codex-model M] [--pi-model M] [--keep]
  *       [--claude-bin P] [--codex-bin P] [--pi-bin P] [--no-runtime-gates] [--no-workflow]
+ *       [--results <file>]   (default: <repo>/verify-results.json)
  *
  * 1. Preflight: OS/arch, bun, each provider's binary + version (a missing provider is SKIP,
  *    never a failure). A `tmux` shim that logs its argv and exits 127 is first on PATH for
@@ -35,6 +36,7 @@ type Provider = (typeof PROVIDERS)[number];
 
 interface Args {
   providers: Provider[];
+  results?: string;
   model: Partial<Record<Provider, string>>;
   bin: Partial<Record<Provider, string>>;
   keep: boolean;
@@ -44,7 +46,7 @@ interface Args {
 
 const USAGE = `usage: bun scripts/verify-runtime/all.ts [--providers claude,codex,pi] [--claude-model M]
        [--codex-model M] [--pi-model M] [--keep] [--claude-bin P] [--codex-bin P] [--pi-bin P]
-       [--no-runtime-gates] [--no-workflow]`;
+       [--no-runtime-gates] [--no-workflow] [--results <file>]`;
 
 function parseArgs(argv: string[]): Args {
   const a: Args = { providers: [...PROVIDERS], model: {}, bin: {}, keep: false, runtimeGates: true, workflow: true };
@@ -65,7 +67,8 @@ function parseArgs(argv: string[]): Args {
       a.providers = list as Provider[];
     } else if (pm) {
       a[pm[2] as 'model' | 'bin'][pm[1] as Provider] = val();
-    } else if (k === '--keep') a.keep = true;
+    } else if (k === '--results') a.results = path.resolve(val());
+    else if (k === '--keep') a.keep = true;
     else if (k === '--no-runtime-gates') a.runtimeGates = false;
     else if (k === '--no-workflow') a.workflow = false;
     else if (k === '-h' || k === '--help') {
@@ -712,7 +715,7 @@ async function main(): Promise<number> {
       `${r.provider.padEnd(wp)}  ${r.check.padEnd(wc)}  ${r.status.padEnd(6)}  ${`${(r.ms / 1000).toFixed(1)}s`.padStart(7)}  ${r.detail}`,
     );
   }
-  const resultsPath = path.join(REPO, 'verify-results.json');
+  const resultsPath = args.results ?? path.join(REPO, 'verify-results.json');
   const results = {
     tool: 'scripts/verify-runtime/all.ts',
     ok,
