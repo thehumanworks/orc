@@ -3,15 +3,20 @@
  *
  *   claude -p --input-format stream-json --output-format stream-json --verbose --replay-user-messages
  *
- * Verified against Claude Code CLI **2.1.299** (live probes, 2026-10-14). Shapes mirrored
+ * Verified against Claude Code CLI **2.1.299** (live probes, 2026-10-14) and re-verified,
+ * shapes identical, against **2.1.300** (2026-10-15). Shapes mirrored
  * from `@anthropic-ai/claude-agent-sdk@0.3.299` `sdk.d.ts` (no runtime dependency — orc speaks
  * the wire protocol directly). Only the messages and fields orc reads or writes are listed;
  * every other field or message type the CLI sends is ignored (forward compatibility), so
  * all stdout shapes are deliberately loose (`[k: string]: unknown`).
  */
 
-/** CLI version this file (and the contract test) was verified against. */
-export const CLAUDE_PROTOCOL_VERIFIED_VERSION = '2.1.299';
+/**
+ * CLI version this file (and the live contract test) was last verified against. Purely
+ * informational: the runtime never refuses another version (it only reports the running
+ * one in `ready.info.claude_code_version`); the live suite flags drift in ONE dedicated test.
+ */
+export const CLAUDE_PROTOCOL_VERIFIED_VERSION = '2.1.300';
 
 // ---------------------------------------------------------------------------------
 // Shared

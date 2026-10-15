@@ -154,7 +154,7 @@ describe.skipIf(!LIVE)(`claude runtime — LIVE contract (claude ${CLAUDE_PROTOC
   let launchA: ProviderLaunch;
 
   test(
-    'fresh start → ready from initialize (pid, version, idle); --append-system-prompt-file accepted',
+    'fresh start → ready from initialize (pid, idle); --append-system-prompt-file accepted',
     async () => {
       launchA = launch({ sessionId: sid, systemPrompt: appendPrompt });
       const rt = await start(launchA);
@@ -163,7 +163,7 @@ describe.skipIf(!LIVE)(`claude runtime — LIVE contract (claude ${CLAUDE_PROTOC
       expect(A.events[0]).toBe(ready);
       expect(ready.providerSessionId).toBe(sid);
       expect(ready.info?.pid).toBe(rt.pid);
-      expect(ready.info?.claude_code_version).toBe(CLAUDE_PROTOCOL_VERIFIED_VERSION);
+      expect(typeof ready.info?.claude_code_version).toBe('string'); // equality: dedicated test below
       expect(ready.info?.session_state).toBe('idle');
       expect(ready.info?.current_permission_mode).toBe('bypassPermissions');
       expect(rt.argv).toContain('--append-system-prompt-file');
@@ -209,10 +209,24 @@ describe.skipIf(!LIVE)(`claude runtime — LIVE contract (claude ${CLAUDE_PROTOC
       expect(info?.skillsCount).toBeGreaterThan(0);
       expect(info?.agents).toContain('general-purpose');
       expect(typeof info?.apiKeySource).toBe('string');
-      expect(info?.claudeCodeVersion).toBe(CLAUDE_PROTOCOL_VERIFIED_VERSION);
       expect(info?.permissionMode).toBe('bypassPermissions');
     },
     TURN_MS,
+  );
+
+  test(
+    `CLI version drift: running claude is the verified ${CLAUDE_PROTOCOL_VERIFIED_VERSION}`,
+    () => {
+      // The ONLY version-equality assertion: drift fails here, once, by name, while every
+      // wire-level assertion above/below still runs. On failure: re-verify the protocol
+      // against the new CLI, then bump CLAUDE_PROTOCOL_VERIFIED_VERSION.
+      const ready = A.events.find((e) => e.type === 'ready') as Ev<'ready'> | undefined;
+      expect({
+        initialize: ready?.info?.claude_code_version,
+        systemInit: A.rt.initInfo?.claudeCodeVersion,
+      }).toEqual({ initialize: CLAUDE_PROTOCOL_VERIFIED_VERSION, systemInit: CLAUDE_PROTOCOL_VERIFIED_VERSION });
+    },
+    5_000,
   );
 
   test(

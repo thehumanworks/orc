@@ -315,6 +315,16 @@ describe('ClaudeStreamMapper edge rules (synthetic lines)', () => {
     expect(c.costUsd).toBeCloseTo(0.5, 10);
   });
 
+  test('a foreign-uuid result does not advance the cost base (its spend lands in the next own delta)', () => {
+    const m = mk();
+    m.beginTurn('a');
+    m.handleLine(res({ subtype: 'success', is_error: false, total_cost_usd: 0.1, user_message_uuid: 'a' }));
+    m.beginTurn('b');
+    expect(m.handleLine(res({ subtype: 'success', is_error: false, total_cost_usd: 0.3, user_message_uuid: 'stray' })).events).toEqual([]);
+    const b = m.handleLine(res({ subtype: 'success', is_error: false, total_cost_usd: 0.4, user_message_uuid: 'b' })).events[1] as { costUsd?: number };
+    expect(b.costUsd).toBeCloseTo(0.3, 10); // 0.4 - 0.1, includes the stray 0.2
+  });
+
   test('initialize error is fatal; second turn while open throws; abortTurn clears', () => {
     const m = mk();
     m.noteControlRequest('i1', 'initialize');
@@ -408,8 +418,8 @@ describe('claude argv', () => {
   });
 });
 
-describe('claude env policy (decision 7)', () => {
-  test('strips inherited CLAUDE_CODE_* except auth/proxy/limits/timeouts + ORC_CLAUDE_KEEP_ENV', () => {
+describe('claude env policy (tightened keep-list; supersedes decision 7 regex)', () => {
+  test('strips inherited CLAUDE_CODE_* (incl. host feature toggles) except auth/proxy/limits/timeouts/opt-outs + ORC_CLAUDE_KEEP_ENV', () => {
     const base: Record<string, string | undefined> = {
       PATH: '/usr/bin',
       HOME: '/home/u',
@@ -433,18 +443,33 @@ describe('claude env policy (decision 7)', () => {
       CLAUDE_CODE_FOO: 'listed-in-keep',
       CLAUDE_CODE_BAR: 'listed-in-keep',
       CLAUDE_CODE_BAZ: 'not-listed',
+      // stripped: host feature toggles (formerly kept by the broad USE_/MAX_/DISABLE_ prefixes)
+      CLAUDE_CODE_USE_CCR_V2: '1',
+      CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH: '2',
+      CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH: '100',
+      CLAUDE_CODE_DISABLE_BACKGROUND_TASKS: '1',
+      CLAUDE_CODE_DISABLE_WORKFLOWS: '1',
+      CLAUDE_CODE_DISABLE_BUILTIN_ANTMCP: '1',
       // kept by regex
       CLAUDE_CODE_USE_BEDROCK: '1',
+      CLAUDE_CODE_USE_VERTEX: '1',
       CLAUDE_CODE_OAUTH_TOKEN: 'tok',
+      CLAUDE_CODE_OAUTH_401_WAIT_MS: '10',
       CLAUDE_CODE_API_KEY_HELPER_TTL_MS: '1',
       CLAUDE_CODE_SKIP_BEDROCK_AUTH: '1',
+      CLAUDE_CODE_SKIP_VERTEX_AUTH: '1',
+      CLAUDE_CODE_MAX_OUTPUT_TOKENS: '8000',
       CLAUDE_CODE_MAX_RETRIES: '3',
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+      CLAUDE_CODE_DISABLE_TELEMETRY: '1',
+      CLAUDE_CODE_DISABLE_AUTOUPDATER: '1',
+      CLAUDE_CODE_DISABLE_ERROR_REPORTING: '1',
       CLAUDE_CODE_EXTRA_BODY: '{}',
       CLAUDE_CODE_PROXY_RESOLVES_HOSTS: '1',
       CLAUDE_CODE_CLIENT_CERT: '/c',
       CLAUDE_CODE_API_TIMEOUT_MS: '1000',
       CLAUDE_CODE_SYNC_PLUGINS_INSTALL_TIMEOUT_MS: '5',
+      CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES: '2',
       ORC_CLAUDE_KEEP_ENV: ' CLAUDE_CODE_FOO , CLAUDE_CODE_BAR,',
     };
     const env = buildClaudeEnv(base, { ORC_SESSION_ID: 's1', ORC_PARENT_SESSION_ID: 'p1', CLAUDE_CODE_EXPLICIT: 'from-spec' });
@@ -461,6 +486,12 @@ describe('claude env policy (decision 7)', () => {
       'CLAUDE_CODE_ORGANIZATION_UUID',
       'CLAUDE_CODE_SKIP_PLUGIN_MCP_SERVERS',
       'CLAUDE_CODE_BAZ',
+      'CLAUDE_CODE_USE_CCR_V2',
+      'CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH',
+      'CLAUDE_CODE_MAX_MCP_DESCRIPTION_LENGTH',
+      'CLAUDE_CODE_DISABLE_BACKGROUND_TASKS',
+      'CLAUDE_CODE_DISABLE_WORKFLOWS',
+      'CLAUDE_CODE_DISABLE_BUILTIN_ANTMCP',
       'UNDEFINED_VAR',
     ]) {
       expect(env).not.toHaveProperty(k);
@@ -474,16 +505,24 @@ describe('claude env policy (decision 7)', () => {
       'ANTHROPIC_BASE_URL',
       'CLAUDECODE',
       'CLAUDE_CODE_USE_BEDROCK',
+      'CLAUDE_CODE_USE_VERTEX',
       'CLAUDE_CODE_OAUTH_TOKEN',
+      'CLAUDE_CODE_OAUTH_401_WAIT_MS',
       'CLAUDE_CODE_API_KEY_HELPER_TTL_MS',
       'CLAUDE_CODE_SKIP_BEDROCK_AUTH',
+      'CLAUDE_CODE_SKIP_VERTEX_AUTH',
+      'CLAUDE_CODE_MAX_OUTPUT_TOKENS',
       'CLAUDE_CODE_MAX_RETRIES',
       'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
+      'CLAUDE_CODE_DISABLE_TELEMETRY',
+      'CLAUDE_CODE_DISABLE_AUTOUPDATER',
+      'CLAUDE_CODE_DISABLE_ERROR_REPORTING',
       'CLAUDE_CODE_EXTRA_BODY',
       'CLAUDE_CODE_PROXY_RESOLVES_HOSTS',
       'CLAUDE_CODE_CLIENT_CERT',
       'CLAUDE_CODE_API_TIMEOUT_MS',
       'CLAUDE_CODE_SYNC_PLUGINS_INSTALL_TIMEOUT_MS',
+      'CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES',
       'CLAUDE_CODE_FOO',
       'CLAUDE_CODE_BAR',
     ]) {

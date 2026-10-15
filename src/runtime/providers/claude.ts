@@ -1,7 +1,7 @@
 /**
  * claude provider runtime: `claude -p` over the stream-json stdio protocol (no PTY, no
- * tmux). Verified against Claude Code 2.1.299 (see ./claude-protocol.ts and the contract
- * test test/claude-runtime.live.test.ts).
+ * tmux). Verified against Claude Code 2.1.299 and 2.1.300 (see ./claude-protocol.ts and the
+ * contract test test/claude-runtime.live.test.ts). Never refuses other CLI versions.
  *
  * Process: spawned detached (own process group, pgid === pid) with stdin/stdout pipes and
  * stderr → `provider.stderr.log` next to `launch.rawLogPath`. Every protocol line, both
@@ -95,13 +95,16 @@ export function buildClaudeArgv(spec: SpawnSpec, resume: boolean, bin = 'claude'
 }
 
 /**
- * Inherited `CLAUDE_CODE_*` variables that survive stripping (auth, proxy, limits,
- * timeouts). Everything else under `CLAUDE_CODE_*` is removed: a parent claude session's
- * vars (ENTRYPOINT, SESSION_ID, INCLUDE_PARTIAL_MESSAGES, REMOTE, …) change the child's
- * output and identity.
+ * Inherited `CLAUDE_CODE_*` variables that survive stripping: auth/backend selection
+ * (Bedrock/Vertex, OAuth, API key, SKIP_*_AUTH), proxy + client cert, request limits and
+ * timeouts, and the user's privacy opt-outs. Everything else under `CLAUDE_CODE_*` is
+ * removed — a parent claude session's identity/output vars (ENTRYPOINT, SESSION_ID,
+ * INCLUDE_PARTIAL_MESSAGES, REMOTE, …) and host feature toggles (DISABLE_BACKGROUND_TASKS,
+ * DISABLE_WORKFLOWS, USE_CCR_V2, MAX_SUBAGENT_SPAWN_DEPTH, …) — so the child behaves like
+ * a standalone CLI. Escape hatch: ORC_CLAUDE_KEEP_ENV.
  */
 export const CLAUDE_ENV_KEEP_RE =
-  /^CLAUDE_CODE_(USE_|OAUTH|API_KEY|SKIP_[A-Z_]*AUTH|MAX_|DISABLE_|EXTRA_|PROXY|CLIENT_CERT|[A-Z_]*TIMEOUT)/;
+  /^CLAUDE_CODE_(USE_(BEDROCK|VERTEX)|OAUTH|API_KEY|SKIP_[A-Z_]*AUTH|MAX_OUTPUT_TOKENS|MAX_RETRIES|DISABLE_(NONESSENTIAL_TRAFFIC|TELEMETRY|AUTOUPDATER|ERROR_REPORTING)|EXTRA_|PROXY|CLIENT_CERT|[A-Z_]*TIMEOUT[A-Z_]*)/;
 
 /**
  * Child env: `base` (the kernel's full env) minus stripped `CLAUDE_CODE_*` (except
@@ -345,6 +348,8 @@ export class ClaudeStreamMapper {
   private onResult(msg: ClaudeResult, out: ClaudeMapResult): void {
     const errors = Array.isArray(msg.errors) ? msg.errors.filter((e) => typeof e === 'string') : [];
     if (!this.open || !this.isForOpen(msg.user_message_uuid, msg.user_message_uuids)) {
+      // Deliberately does NOT advance the cost base: a foreign/stray result's spend is
+      // still inside the cumulative total, so it lands in the next own turn's delta.
       if (!this.ready && !this.open) this.startupErrors.push(...errors);
       out.notes.push({ ignoredResult: { user_message_uuid: msg.user_message_uuid ?? null, subtype: msg.subtype } });
       return;
@@ -580,7 +585,8 @@ export class ClaudeRuntime implements ProviderRuntime {
   }
 
   async interrupt(): Promise<void> {
-    if (!this.mapper.openMessageId || this.exited) return; // idle → no-op
+    // Idle, closing or closed → no-op (nothing written, nothing raw-logged).
+    if (!this.mapper.openMessageId || this.exited || this.closing) return;
     await this.control('interrupt');
   }
 

@@ -227,13 +227,19 @@ describe('claude runtime I/O (fake claude)', () => {
       await tap1.done;
       expect(await waitUntil(() => !groupAlive(rt1.pid), 3_000)).toBe(true);
 
-      const rt2 = await start(launch());
+      const l2 = launch();
+      const rt2 = await start(l2);
       const tap2 = new Tap(rt2);
       await rt2.send('h1', 'HANG forever');
       await tap2.waitFor((e) => e.type === 'turn.started');
       const t0 = Date.now();
-      await rt2.close({ graceMs: 300 });
+      const closing = rt2.close({ graceMs: 300 });
+      await rt2.interrupt(); // while closing (turn still open) → no-op
+      await closing;
       expect(Date.now() - t0).toBeLessThan(4_000);
+      await rt2.interrupt(); // after close → no-op
+      const rawText = fs.readFileSync(l2.rawLogPath, 'utf8');
+      expect(rawText).not.toContain('\\"subtype\\":\\"interrupt\\"');
       await tap2.done;
       const last = tap2.events.at(-1) as Extract<ProviderEvent, { type: 'exited' }>;
       expect(last.type).toBe('exited');
