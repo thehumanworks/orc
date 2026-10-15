@@ -21,6 +21,7 @@ import {
   validateWorkflowDef,
 } from '../workflow.ts';
 import {
+  awaitRunnerHandoff,
   currentRunnerInfo,
   followRunnerLog,
   launchDetachedRecovery,
@@ -727,7 +728,7 @@ async function cmdWorkflowRun(args: string[]): Promise<number> {
   // `--detach` and self-report this process as the run's `runner` (the runner
   // re-persists the record from scratch, stamping its own identity on the lease).
   const runId = values['run-id'] as string | undefined;
-  const runner = runId ? startDetachedRunner(runId, 'run') : undefined;
+  const runner = runId ? await startDetachedRunner(runId, 'run') : undefined;
   const term = trapRunnerTermination();
   try {
     // Stream step events to stdout in human mode; --json prints only the final record.
@@ -754,11 +755,18 @@ async function cmdWorkflowRun(args: string[]): Promise<number> {
 
 /**
  * A detached runner (`--run-id` / `--runner`) reports itself: a separator line in its
- * log (resumed/retried runners append to the same file) and its `runner` identity.
+ * log (resumed/retried runners append to the same file) and its `runner` identity —
+ * after waiting for the launcher's stamp, so its first owning write follows the handoff.
  */
-function startDetachedRunner(runId: string, action: string): ReturnType<typeof currentRunnerInfo> {
+async function startDetachedRunner(
+  runId: string,
+  action: string,
+): Promise<ReturnType<typeof currentRunnerInfo>> {
   const runner = currentRunnerInfo(runId);
   process.stdout.write(`# orc runner pid=${runner.pid} action=${action} run=${runId} at ${runner.startedAt}\n`);
+  if (!(await awaitRunnerHandoff(runId))) {
+    process.stdout.write(`# orc runner pid=${runner.pid}: launcher handoff not confirmed; proceeding\n`);
+  }
   return runner;
 }
 
@@ -1044,6 +1052,7 @@ async function cmdWorkflowResume(args: string[]): Promise<number> {
     return 1;
   }
   const asRunner = values.runner === true;
+  const runner = asRunner ? await startDetachedRunner(runId, 'resume') : undefined;
   if (!(await assertNoLiveOwner(runId, json, { asRunner }))) return 1;
   if (!file) {
     printError(
@@ -1061,7 +1070,7 @@ async function cmdWorkflowResume(args: string[]): Promise<number> {
     try {
       const run = await resumeWorkflow(runId, def, {
         sourcePath: absPath,
-        runner: asRunner ? startDetachedRunner(runId, 'resume') : undefined,
+        runner,
         signal: term.signal,
         onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
       });
@@ -1093,6 +1102,7 @@ async function cmdWorkflowRetry(args: string[]): Promise<number> {
     return 1;
   }
   const asRunner = values.runner === true;
+  const runner = asRunner ? await startDetachedRunner(runId, 'retry') : undefined;
   if (!(await assertNoLiveOwner(runId, json, { asRunner }))) return 1;
   if (!file) {
     printError(
@@ -1112,7 +1122,7 @@ async function cmdWorkflowRetry(args: string[]): Promise<number> {
       const run = await retryWorkflow(runId, def, {
         sourcePath: absPath,
         stepId,
-        runner: asRunner ? startDetachedRunner(runId, 'retry') : undefined,
+        runner,
         signal: term.signal,
         onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
       });

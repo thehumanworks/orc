@@ -10,6 +10,7 @@ import type { FileHandle } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { orcHome, runnerLogPath } from './paths.ts';
 import {
+  isPidAlive,
   isSameProcessAlive,
   processStartTime,
   selfArgv,
@@ -214,6 +215,28 @@ export function trapRunnerTermination(opts?: { forceExitMs?: number }): {
   };
   process.on('SIGTERM', onTerm);
   return { signal: ac.signal, dispose: () => process.off('SIGTERM', onTerm) };
+}
+
+/**
+ * Detached-runner handoff (called by the runner before it takes ownership): wait until
+ * the launcher has stamped THIS process as the run's `runner`, so the runner's first
+ * owning write never races the stamp (and the owner fence never sees the launcher's
+ * placeholder lease as a rival). Gives up — returning false, letting the owner fence
+ * decide — when the launcher is gone without stamping, or after `timeoutMs`.
+ */
+export async function awaitRunnerHandoff(
+  runId: string,
+  opts?: { timeoutMs?: number; pollMs?: number },
+): Promise<boolean> {
+  const launcher = process.ppid;
+  const deadline = Date.now() + (opts?.timeoutMs ?? 10_000);
+  while (true) {
+    const run = await readRun(runId).catch(() => null);
+    if (run?.runner?.pid === process.pid) return true;
+    if (!run || process.ppid !== launcher || !isPidAlive(launcher)) return false;
+    if (Date.now() >= deadline) return false;
+    await Bun.sleep(opts?.pollMs ?? 20);
+  }
 }
 
 export interface FollowRunnerLogOptions {

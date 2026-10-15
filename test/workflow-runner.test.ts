@@ -44,6 +44,7 @@ import {
 import type { SpawnDetachedOptions } from '../src/runtime/process.ts';
 import type { ProcessIdentity } from '../src/runtime/types.ts';
 import {
+  awaitRunnerHandoff,
   followRunnerLog,
   launchDetachedRecovery,
   launchDetachedRun,
@@ -495,6 +496,73 @@ describe('assertRecoveryAllowed / stampRunner', () => {
 });
 
 // ───────────────────────────────────────────────────────────────────────────────────
+describe('owner fence: a different live owner is never overwritten', () => {
+  beforeEach(() => freshHome());
+  /** Another LIVE process (our parent: the shell running bun test). */
+  const other = (): ProcessIdentity => ({ pid: process.ppid, startTime: processStartTime(process.ppid) });
+
+  test('stored runner is another live process → LiveOwnerError (with or without our runner)', async () => {
+    expect(isSameProcessAlive(other())).toBe(true);
+    await writeRun(baseRun({ id: 'f1', runner: runnerOf(other(), 'f1'), lease: makeLease() }));
+    const before = fs.readFileSync(runPath('f1'), 'utf8');
+    await expect(
+      writeRunOwned(baseRun({ id: 'f1', runner: runnerOf(self(), 'f1'), lease: makeLease() })),
+    ).rejects.toBeInstanceOf(LiveOwnerError);
+    await expect(writeRunOwned(baseRun({ id: 'f1', lease: makeLease() }))).rejects.toBeInstanceOf(LiveOwnerError);
+    expect(fs.readFileSync(runPath('f1'), 'utf8')).toBe(before);
+  });
+
+  test('stored runner dead → the new owner may write', async () => {
+    await writeRun(baseRun({ id: 'f2', runner: runnerOf({ pid: DEAD_PID, startTime: null }, 'f2') }));
+    const w = await writeRunOwned(baseRun({ id: 'f2', runner: runnerOf(self(), 'f2'), lease: makeLease() }));
+    expect(w.runner?.pid).toBe(process.pid);
+  });
+
+  test('no stored runner: a LIVE lease with a different ownerId → LiveOwnerError', async () => {
+    const o = other();
+    const live = makeLease({ ownerId: 'A', pid: o.pid, startTime: o.startTime });
+    await writeRun(baseRun({ id: 'f6', lease: live }));
+    await expect(
+      writeRunOwned(baseRun({ id: 'f6', lease: makeLease({ ownerId: 'B' }) })),
+    ).rejects.toBeInstanceOf(LiveOwnerError);
+    await writeRunOwned(baseRun({ id: 'f6', lease: makeLease({ ownerId: 'A' }) })); // same owner
+    // Expired or dead-owner leases are no fence.
+    await writeRun(baseRun({ id: 'f7', lease: { ...live, expiresAt: new Date(Date.now() - 1).toISOString() } }));
+    await writeRunOwned(baseRun({ id: 'f7', lease: makeLease({ ownerId: 'B' }) }));
+    await writeRun(baseRun({ id: 'f8', lease: makeLease({ ownerId: 'A', pid: DEAD_PID }) }));
+    await writeRunOwned(baseRun({ id: 'f8', lease: makeLease({ ownerId: 'B' }) }));
+  });
+
+  test('in-process resume uses one owner id for the recovery stamp and the run', async () => {
+    let fail = true;
+    const exec: StepExecutor = async ({ step }) => ({ ...okResult(step.id), ok: !fail });
+    const first = await runWorkflow(oneStep, { runId: 'f9', execStep: exec });
+    expect(first.status).toBe('failed');
+    fail = false;
+    const { resumeWorkflow } = await import('../src/workflow.ts');
+    const resumed = await resumeWorkflow('f9', oneStep, { execStep: exec });
+    expect(resumed.status).toBe('done');
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────────────
+describe('awaitRunnerHandoff', () => {
+  beforeEach(() => freshHome());
+
+  test('true once stamped as this process; false without a record; false at timeout', async () => {
+    expect(await awaitRunnerHandoff('h0', { timeoutMs: 50 })).toBe(false); // no record
+    await writeRun(baseRun({ id: 'h1', lease: makeLease() }));
+    const t0 = Date.now();
+    expect(await awaitRunnerHandoff('h1', { timeoutMs: 120, pollMs: 10 })).toBe(false);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(100);
+    const waiting = awaitRunnerHandoff('h1', { timeoutMs: 3_000, pollMs: 10 });
+    await Bun.sleep(60);
+    await stampRunner('h1', runnerOf(self(), 'h1'));
+    expect(await waiting).toBe(true);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────────────
 describe('launch helpers (injected spawner): spawn first, then stamp (D7)', () => {
   beforeEach(() => freshHome());
 
@@ -719,6 +787,35 @@ describe('real detached runner processes', () => {
       const disk = (await readRun('rc1'))!;
       expect(disk.status).toBe('cancelled');
       expect(disk.revision).toBe(cancelled.revision);
+    },
+    20_000,
+  );
+
+  test(
+    'SIGSTOP past the lease, superseded by a new runner, SIGCONT: the stale runner cannot overwrite it',
+    async () => {
+      const leaseMs = 400;
+      const r1 = await startBlockingRunner('ss1', leaseMs);
+      process.kill(r1.pid, 'SIGSTOP');
+      try {
+        await waitFor(
+          async () => (await reconcileRun((await readRun('ss1'))!)).status === 'orphaned',
+          5_000,
+          'stopped R1 orphaned after lease expiry',
+        );
+        expect(isSameProcessAlive(r1)).toBe(true); // stopped, not dead
+        const stamped = await stampRunner('ss1', runnerOf(self(), 'ss1')); // R2 takes over
+        expect(stamped.status).toBe('running');
+      } finally {
+        process.kill(r1.pid, 'SIGCONT');
+      }
+      // R1's next heartbeat hits the owner fence → it stops writing and exits.
+      await waitFor(() => !isPidAlive(r1.pid), 5_000, 'superseded R1 exits');
+      const disk = (await readRun('ss1'))!;
+      expect(disk.status).toBe('running');
+      expect(disk.runner?.pid).toBe(process.pid);
+      expect(disk.lease?.pid).toBe(process.pid);
+      expect(fs.readFileSync(runnerLogPath('ss1'), 'utf8')).toContain('exit finished running');
     },
     20_000,
   );

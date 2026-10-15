@@ -612,9 +612,30 @@ export async function updateRunRetry(
 }
 
 /**
- * Owning-runner write. Refuses to downgrade ANY finalized status to non-final, and never
+ * Owner fence (two owners must never both write): the stored record's owner wins while it
+ * is alive. Stored `runner` that is a DIFFERENT live process than `run.runner` → refuse;
+ * no stored runner but a LIVE stored lease with a different ownerId → refuse. A stale
+ * owner (e.g. SIGSTOPped past its lease, then superseded by a resume) thus cannot
+ * overwrite its successor when it wakes up.
+ */
+function assertOwnerFence(current: WorkflowRun, run: WorkflowRun): void {
+  if (current.runner) {
+    if (!(run.runner && sameProcess(current.runner, run.runner)) && isSameProcessAlive(current.runner)) {
+      throw new LiveOwnerError(run.id, current.runner.pid);
+    }
+    return;
+  }
+  const lease = current.lease;
+  if (lease && lease.ownerId !== run.lease?.ownerId && isLeaseLive(lease)) {
+    throw new LiveOwnerError(run.id, lease.pid ?? 0);
+  }
+}
+
+/**
+ * Owning-runner write. Refuses to downgrade ANY finalized status to non-final, never
  * overwrites a `cancelled` run with another status (a runner finishing concurrently
- * with `orc workflow cancel` must not resurrect it as done/failed).
+ * with `orc workflow cancel` must not resurrect it as done/failed), and refuses to
+ * write over a different live owner (LiveOwnerError; see assertOwnerFence).
  * Resume/retry must call `beginRunRecovery` first to explicitly reopen failed/orphaned
  * (or cancelled with allowCancelled) into a controlled running recovery state.
  */
@@ -631,6 +652,7 @@ export async function writeRunOwned(run: WorkflowRun): Promise<WorkflowRun> {
         (current.status === 'failed' || current.status === 'orphaned');
       if (!reopen) throw new FinalizedRunError(run.id, current.status);
     }
+    if (current) assertOwnerFence(current, run);
     const rev = current ? (current.revision ?? 0) + 1 : (run.revision ?? 0);
     const stamped: WorkflowRun = { ...run, schemaVersion: WORKFLOW_SCHEMA_VERSION, revision: rev };
     await writeRunUnlocked(stamped);
