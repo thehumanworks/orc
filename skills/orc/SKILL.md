@@ -2,14 +2,15 @@
 name: orc
 description: >-
   Act as the orchestrator of a fleet of coding subagents to deliver a task, using the `orc`
-  CLI/SDK (it launches claude/codex/pi agents as detached, reattachable tmux sessions). Use this
-  whenever the user prefixes a task with /orc, OR asks to orchestrate / delegate / parallelize /
-  fan out work across multiple agents, run a multi-step or repeatable agent workflow (code review,
-  migration, release, large refactor), spin up specialized or reusable subagents, get a second
-  opinion from a different model, or do broad codebase work that benefits from several agents in
-  parallel worktrees — even if they don't say the word "orchestrate". When triggered, YOU become
-  the orchestrator: decompose the task, spawn subagents (preferring diverse providers), steer them,
-  verify their work, and clean up every session and worktree when done.
+  CLI/SDK (it runs claude/codex/pi agents as durable, detached sessions you can steer, read,
+  wait on and resume). Use this whenever the user prefixes a task with /orc, OR asks to
+  orchestrate / delegate / parallelize / fan out work across multiple agents, run a multi-step or
+  repeatable agent workflow (code review, migration, release, large refactor), spin up
+  specialized or reusable subagents, get a second opinion from a different model, or do broad
+  codebase work that benefits from several agents in parallel worktrees — even if they don't say
+  the word "orchestrate". When triggered, YOU become the orchestrator: decompose the task, spawn
+  subagents (preferring diverse providers), steer them, verify their work, and clean up every
+  session and worktree when done.
 ---
 
 # orc — orchestrate a fleet of coding subagents
@@ -27,28 +28,29 @@ the merge calls. You delegate the *doing*.
 
 **Right-size first.** Orchestration earns its keep on work that is parallelizable, multi-step, or
 diversity-sensitive. If the coordination overhead would exceed the task's value — a typo fix, a
-one-line change, a quick lookup — just do it directly (or hand it to a single subagent). Don't spin
-up a worktree, a reviewer, and a cleanup pass for negative value. Match the machinery to the task.
+one-line change, a quick lookup — just do it directly (or hand it to a single subagent). Match the
+machinery to the task.
 
-`orc` drives real coding-agent CLIs (`claude`, `codex`, `pi`) as **interactive, detached, reattachable**
-tmux sessions, so a subagent's work is never opaque — you (or the user) can read or attach to any
-session at any time, and sessions outlive this one. Full command surface: **`references/orc-cli.md`**
-(read it when you need a flag you don't remember). The essentials:
+`orc` runs real coding-agent CLIs (`claude`, `codex`, `pi`) as **durable, detached sessions**: one
+actor process per session drives the CLI over its structured protocol and journals everything. A
+subagent's work is never opaque — you (or the user) can read its transcript or follow its journal
+at any time — and sessions outlive this one. Exact flags, exit codes and JSON shapes:
+**`references/orc-cli.md`**. The essentials:
 
 ```
 orc spawn -p <claude|codex|pi> [--prompt P|-|@file] [--agent NAME] [--alias NAME] [--worktree] [--cwd DIR] --json
-orc send  <id|@alias> [PROMPT|-|@file] # follow-up / steer (multi-line safe)
-orc state <id|@alias>                # starting|running|done|waiting|failed (one shot)
-orc wait  <id|@alias> [--for done|settled] # BLOCK until it settles (debounced — reliable)
-orc read  <id|@alias> [--full|--index N] # latest parsed turn by default; --full transcript; --raw live pane
-orc list  [--all] [--json]           # what's running ( hygiene: audit before you finish )
-orc kill  <id|@alias> [--worktree] [--purge]; orc prune [--worktree]
-orc workflow (run|list|status|logs|attach|resume|retry|cancel|cleanup) run <file.ts> [--detach] [--max-concurrency N]; orc workflow logs <runId> [--step id]
-# DAG fleet: steps may set needs:['depId']; maxConcurrency>1 runs ready roots concurrently (default 1 = sequential)
+orc send  <id|@alias> [PROMPT|-|@file] [--idempotency-key K]  # steer; exit 3 = delivery unknown
+orc state <id|@alias> --json         # starting|running|done|waiting|failed (+ stopped/suspended)
+orc wait  <id|@alias> [--for done|settled] [--timeout SEC]  # BLOCK until it settles
+orc read  <id|@alias> [--full|--index N|--raw]  # latest parsed turn; --full transcript; --raw journal
+orc list  [--all] --json             # running + suspended here; --all adds dead + other workspaces
+orc kill  <id|@alias> [--worktree] [--purge]; orc prune [--worktree] [--suspended]
+orc resume <id|@alias>; orc takeover <id|@alias>   # hand back / hand to a human
+orc workflow run <file.ts> [--detach] [--max-concurrency N]; orc workflow logs <runId> [--step id]
 ```
 
-Prefer `--json` everywhere (you're a machine consumer). `orc spawn --json` returns the record so you
-can immediately `orc send`/`orc wait` by id.
+Prefer `--json` everywhere (you're a machine consumer). `orc spawn --json` returns the record so
+you can immediately `orc send` / `orc wait` by id.
 
 ## The orchestration loop
 
@@ -56,9 +58,10 @@ can immediately `orc send`/`orc wait` by id.
    or must run in sequence (implement → review → fix). Independent units → spawn in parallel. Sequential
    units → a pipeline you gate with `orc wait`.
 2. **Spawn**, preferring **diverse providers** (see below) and an isolated **`--worktree`** for anything
-   that edits code. Deliver instructions reliably (see "Delivering large prompts").
-3. **Steer.** Watch progress with `orc read` / `orc wait`; send corrections with `orc send`; keep a
-   subagent's context lean with `/compact` and give it a durable objective with `/goal` (see "Steering").
+   that edits code. Deliver long specs as files (see "Delivering large specs").
+3. **Steer.** Watch progress with `orc read` / `orc wait`; send corrections with `orc send`; on claude,
+   keep a long-running subagent's context lean with `/compact` and give it a durable objective with
+   `/goal` (see "Steering").
 4. **Verify** — never trust a subagent's self-report. Run its tests, read its diff, ideally have a
    *different-provider* agent review it.
 5. **Integrate** — review and merge worktree branches yourself.
@@ -69,11 +72,32 @@ Keep parallel fan-out to what you can actually **supervise** — a handful of se
 verify well beats a dozen you can't track. If a task has more independent units than that, batch them.
 
 `orc wait` is the spine of reliable orchestration: it blocks until an agent reaches `done`/`waiting`/
-`failed` (debounced, so a gap between tool calls isn't misread as finished). Sequence steps with it
-instead of sleeping or guessing. Note `done` means "the turn yielded, ready for input" — NOT
-necessarily "succeeded"; an agent that asks a question and stops also reads as `done`. So gate
-success on a **hard signal** (a commit appeared, tests pass, a file exists), then read the transcript
-to confirm.
+`failed`, derived from the session journal (a gap between tool calls is never misread as the end of
+a turn). After `orc send` returns, the state is `running` until that turn ends, so `send` then
+`wait` is race-free — never sleep or guess. Note `done` means "the turn yielded, ready for input" —
+NOT necessarily "succeeded"; an agent that asks a question and stops also reads as `done`. So gate
+success on a **hard signal** (a commit appeared, tests pass, a file exists), then read the
+transcript to confirm.
+
+## Session lifecycle (what the states mean for you)
+
+| you see | meaning | do |
+| --- | --- | --- |
+| `state: done` | turn yielded | read it; verify; send the next instruction |
+| `state: running` | turn open or message queued | `orc wait` |
+| `state: waiting` | provider asked for a permission (rare in yolo; orc denies it) | read it; re-instruct |
+| `state: failed`, `stopped: false`, `suspended: false` | the last turn failed | read the error (`orc state --json` → `lastTurn.error`); resend or respawn |
+| `state: failed`, `suspended: true` | actor gone (crash/reboot); status `suspended` | just `orc send` — it wakes and resumes the same conversation |
+| `state: failed`, `stopped: true` | killed or taken over; status `dead` | `orc resume <id>` if you still need it |
+
+- `orc send` exits **0** when the message was `acknowledged` or durably `queued`, **3** when delivery
+  is `unknown` (cut before the provider acked it; orc never re-sends it), **1** on failure. On 3:
+  `orc read` to see whether it landed, then send again **with a new key**.
+- For sends you may retry (scripts, loops), pass `--idempotency-key <stable-key>`: a repeat with the
+  same text is a no-op that returns `replayed: true`.
+- `orc takeover <id>` stops orc's actor and prints the provider's own resume command for a human;
+  `orc resume <id>` hands it back. There is no live TUI to attach to; `orc attach <id>` follows the
+  journal read-only.
 
 ## Choose your structure: ad-hoc orchestration vs. a versioned workflow
 
@@ -86,7 +110,8 @@ to confirm.
   + per-step logs (`orc workflow logs`) make it inspectable. Start from **`assets/workflow-template.ts`**.
 
   Rule of thumb: if you'd run this shape of task more than ~twice, make it a workflow. Each step's
-  success should gate on a hard signal, not just `state === 'done'` — the template shows the pattern.
+  success should gate on a hard signal (`verify`, a `done` predicate, or a worktree commit), not just
+  `state === 'done'` — the template shows the pattern. `resume`/`retry` need the workflow file.
 
 ## Prefer provider diversity
 
@@ -124,27 +149,28 @@ Treat these definitions as **living artifacts**: when a specialized subagent und
 role, the standards it holds, what to focus on, and what "done" means for it. (`--agent` and a raw
 `--system-prompt` are mutually exclusive; use `--agent` for anything reusable.)
 
-## Steering interactive subagents
+## Steering subagents
 
-Subagents run as **interactive** sessions, so you can collaborate with them mid-task — this is the
+Subagents are long-lived conversations, so you can collaborate with them mid-task — this is the
 whole point of orc over headless one-shots:
 
 - **`orc send <id> "..."`** — give a correction, answer a question, add a constraint, or redirect.
-  Read `orc read <id>` first to see where it is.
-- **`/compact`** — when a long-running subagent's context is bloated (lots of exploration, big tool
-  outputs), send `/compact` to make it summarize and free up room so it keeps reasoning sharply.
-  Reach for this before a subagent starts going in circles or forgetting earlier decisions.
-- **`/goal <objective>`** — give a subagent a *persistent* objective it keeps working toward across
-  turns (the goal holds until met). Good for "keep fixing failures until the suite is green" or
-  "iterate on this until the benchmark passes" — the subagent won't stop at the first plausible stop.
-- A stuck subagent (no progress, `state` flapping, or `waiting`) is a steer signal: nudge it, give it
-  the missing context, or kill it and respawn with a sharper prompt. Don't let it spin.
-
-Deliver a slash command with `orc send <id> "/compact"` — `orc send` just *types* the literal text
-into the subagent's interactive session and presses Enter. Whether a given command exists is up to
-that subagent's own CLI, not orc: **Claude Code** supports `/compact` and `/goal`; `codex` and `pi`
-have their own command sets — so match the command to the provider. The leverage is that you can
-drive these interactive commands programmatically, exactly as a human would.
+  Read `orc read <id>` first to see where it is. A message sent while a turn is running is queued
+  and delivered when that turn ends.
+- **`/compact`** (claude) — when a long-running subagent's context is bloated (lots of exploration,
+  big tool outputs), `orc send <id> "/compact"`. Verified through orc: the turn completes with an
+  empty result and the earlier conversation survives as a summary. Reach for this before a
+  subagent starts going in circles or forgetting earlier decisions.
+- **`/goal <condition>`** (claude) — `orc send <id> "/goal all tests in test/ pass"` gives the
+  subagent a persistent objective: claude keeps working within that turn until the condition holds,
+  then the turn completes (`orc wait` returns). Good for "keep fixing failures until the suite is
+  green". Still verify the condition yourself.
+- Slash commands reach the provider as the message text. Only claude's `/compact` and `/goal` are
+  verified; interactive pickers and `/login` don't work, and codex/pi slash commands are unverified
+  (assume they arrive as plain text).
+- A stuck subagent (no progress across several reads, repeated failed turns, or `waiting`) is a steer
+  signal: nudge it, give it the missing context, or kill it and respawn with a sharper prompt. Don't
+  let it spin.
 
 ## Verify, don't trust
 
@@ -158,7 +184,7 @@ real value or confident slop.
 
 When several subagents touch the **same repo in parallel**, give each its own `--worktree` so they
 don't collide — each gets an isolated checkout on its own branch. Then you review each branch's diff
-and merge the good ones. Two consequences to remember:
+and merge the good ones. Things to remember:
 
 - `--worktree` requires the cwd to be inside a git repo (orc errors otherwise).
 - A fresh worktree has no `node_modules`/deps — tell the subagent to install first if it needs to
@@ -170,15 +196,17 @@ and merge the good ones. Two consequences to remember:
 ## Session hygiene — clean up when done
 
 Leaving sessions and worktrees lying around is the most common way orchestration turns into a mess:
-orphaned tmux sessions, stale worktrees, and (for `codex`) leftover trust entries pile up. So, as a
-standing discipline:
+idle actors and provider processes, stale worktrees and branches pile up.
+So, as a standing discipline:
 
-- **Audit before you finish:** `orc list --all` — anything you spawned and no longer need is a leak.
-- **Kill what you're done with:** `orc kill <id>` (keeps the record so you can still read its
-  transcript), or `orc kill <id> --purge` to drop the record entirely.
+- **Audit before you finish:** `orc list --all --json` — anything you spawned that is `running` or
+  `suspended` and no longer needed is a leak (a suspended session wakes on the next send).
+- **Kill what you're done with:** `orc kill <id>` (keeps the record and journal so you can still
+  read it), or `orc kill <id> --purge` to drop the record and session dir entirely.
 - **Remove worktrees and branches:** `orc kill <id> --worktree` per session, or `orc prune --worktree`
-  to sweep all dead ones. That removes the *worktree* but leaves the *branch* — delete merged/abandoned
-  branches yourself with `git worktree prune && git branch -D <branch>`.
+  to sweep all dead ones. `orc prune` never removes `suspended` sessions unless `--suspended`. Removing
+  a worktree leaves the *branch* — delete merged/abandoned branches yourself with
+  `git worktree prune && git branch -D <branch>`.
 - **End state:** when the task is delivered, `orc list --all` should show nothing you left running by
   accident, and `git worktree list` should be back to just the main checkout.
 
@@ -186,15 +214,14 @@ Make the final cleanup an explicit step of every orchestration, the same way you
 opened. If you used throwaway state for experiments, set `ORC_HOME` to a temp dir so it never touches
 the user's real `~/.orc`.
 
-## Delivering large prompts (gotcha)
+## Delivering large specs
 
-A large initial `--prompt` (or `orc send`) can fail to deliver cleanly — e.g. Claude Code collapses a
-big multi-line paste into a `[Pasted text]` chip that the send-verifier can't confirm, so the send
-errors. For anything large (a detailed spec), **write it to a file and send a short pointer**:
-`orc spawn -p claude --worktree` (no prompt) → then
-`orc send <id> "Read <abs-path-to-spec.md> in full and carry it out."` Keep the spec OUTSIDE the
-worktree so the subagent can't accidentally commit it. Short prompts inline are fine. (The
-`orc workflow` runner already file-drops step instructions over ~1KB for exactly this reason.)
+Prompts of any size and any number of lines are delivered verbatim as ONE message (`orc send <id>
+@spec.md` works). For a detailed spec, still prefer **a file and a short pointer**:
+`orc spawn -p claude --worktree` (no prompt) → `orc send <id> "Read <abs-path-to-spec.md> in full
+and carry it out."` The spec stays reviewable and reusable across agents, and keeping it OUTSIDE the
+worktree means the subagent can't accidentally commit it. (The `orc workflow` runner does this
+automatically for step prompts over 1 KiB.)
 
 ## A minimal end-to-end shape
 
@@ -204,8 +231,9 @@ REC=$(orc spawn -p claude --worktree --json)            # capture the whole reco
 ID=$(echo "$REC" | jq -r .id)
 WT=$(echo "$REC" | jq -r .worktreePath)                 # the isolated checkout path
 BR=$(echo "$REC" | jq -r .branch)                       # its branch
-orc send "$ID" "Read /tmp/spec.md and implement it; commit when done."
-orc wait "$ID" --for settled                            # block until it yields
+orc send "$ID" "Read /tmp/spec.md and implement it; commit when done." --idempotency-key impl-1
+orc wait "$ID" --for settled --timeout 1800             # block until it yields (exit 1 = timed out)
+orc state "$ID" --json                                  # done? or failed (lastTurn.error)?
 orc read "$ID"                                          # see what it did (token-efficient)
 # verify: a SECOND provider reviews the SAME branch (run it IN that worktree)
 RV=$(orc spawn -p codex --cwd "$WT" --prompt "Review the diff on this branch for correctness; be adversarial." --json | jq -r .id)
