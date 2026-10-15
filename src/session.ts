@@ -103,13 +103,13 @@ export interface AttachOptions {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-/** A stopped session refused a send; carries the `orc resume` hint. */
 /** What `provider.ready` reported (Session.awaitReady). */
 export interface ProviderReadyInfo {
   providerSessionId: string;
   transcriptPath?: string;
 }
 
+/** A stopped session refused a send; carries the `orc resume` hint. */
 export class SessionNotControllableError extends Error {
   constructor(
     message: string,

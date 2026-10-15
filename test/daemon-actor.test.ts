@@ -6,7 +6,11 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import fs from 'node:fs';
 import path from 'node:path';
-import { serveDaemon } from '../src/daemon/server.ts';
+import { httpStatusFor, serveDaemon } from '../src/daemon/server.ts';
+import { PolicyViolationError } from '../src/policy.ts';
+import { SessionNotControllableError } from '../src/session.ts';
+import { SessionStartError, SessionStoppedError } from '../src/runtime/client.ts';
+import { remoteSendExitCode } from '../src/cli/index.ts';
 import { DaemonClient } from '../src/daemon/client.ts';
 import { FAKE_PROVIDER_ENV } from '../src/agent.ts';
 import { writeRun, WORKFLOW_SCHEMA_VERSION } from '../src/runs.ts';
@@ -59,8 +63,8 @@ async function call(method: string, p: string, body?: unknown): Promise<{ status
   return { status: res.status, json: await res.json() };
 }
 
-async function orcRemote(args: string[]): Promise<{ code: number; out: string; err: string }> {
-  const proc = Bun.spawn([process.execPath, CLI, '--host', `127.0.0.1:${server.port}`, ...args], {
+async function orcRemote(args: string[], port = server.port): Promise<{ code: number; out: string; err: string }> {
+  const proc = Bun.spawn([process.execPath, CLI, '--host', `127.0.0.1:${port}`, ...args], {
     cwd: work,
     env: { ...process.env, ORC_DAEMON_SECRET: 's3cret' },
     stdout: 'pipe',
@@ -92,6 +96,12 @@ describe('daemon session routes on the actor runtime', () => {
       expect(s2.json).toMatchObject({ phase: 'acknowledged', replayed: true });
       const bad = await call('POST', `/sessions/${id}/send`, { prompt: 'x', wake: 'no' });
       expect(bad.status).toBe(400);
+      // Same idempotency key, different prompt → 409 (not a 500).
+      const conflict = await call('POST', `/sessions/${id}/send`, { prompt: 'something else', messageId: 'dk-1' });
+      expect(conflict.status).toBe(409);
+      // Invalid option combination → 400 (not a 500).
+      const badSpawn = await call('POST', '/sessions', { provider: 'claude', cwd: work, agent: 'x', systemPrompt: 'y' });
+      expect(badSpawn.status).toBe(400);
 
       const raw = await call('GET', `/sessions/${id}/read?raw=1`);
       expect(raw.json.kind).toBe('raw');
@@ -137,9 +147,73 @@ describe('daemon session routes on the actor runtime', () => {
       const after = await call('GET', `/sessions/${id}`);
       expect(after.json).toMatchObject({ status: 'dead', stopped: true, state: 'failed' });
       const refused = await call('POST', `/sessions/${id}/send`, { prompt: 'nope' });
-      expect(refused.status).toBeGreaterThanOrEqual(400);
+      expect(refused.status).toBe(409);
       expect(refused.json.error).toMatch(/orc resume/);
     },
     T,
   );
+
+  test(
+    'the --host CLI tolerates a v1 (pre-actor) daemon: `submitted` sends succeed, pane reads print',
+    async () => {
+      const v1 = Bun.serve({
+        hostname: '127.0.0.1',
+        port: 0,
+        fetch(req) {
+          const u = new URL(req.url);
+          if (u.pathname.endsWith('/send')) return Response.json({ ok: true, id: 'abc', phase: 'submitted', messageId: 'k1' });
+          if (u.pathname.endsWith('/read')) {
+            return Response.json(
+              u.searchParams.get('raw') ? { kind: 'raw', id: 'abc', pane: 'RAW PANE' } : { kind: 'fallback', id: 'abc', pane: 'FB PANE\n' },
+            );
+          }
+          return Response.json({ error: 'not found' }, { status: 404 });
+        },
+      });
+      try {
+        const sent = await orcRemote(['send', 'abc', 'hi', '--idempotency-key', 'k1'], v1.port);
+        expect(sent.code).toBe(0);
+        expect(sent.out).toContain('abc');
+        const sentJson = await orcRemote(['send', 'abc', 'hi', '--json'], v1.port);
+        expect(sentJson.code).toBe(0);
+        expect(JSON.parse(sentJson.out)).toMatchObject({ phase: 'submitted' });
+        const raw = await orcRemote(['read', 'abc', '--raw'], v1.port);
+        expect(raw).toMatchObject({ code: 0, out: 'RAW PANE\n' });
+        expect(JSON.parse((await orcRemote(['read', 'abc', '--raw', '--json'], v1.port)).out)).toEqual({ id: 'abc', pane: 'RAW PANE' });
+        const fb = await orcRemote(['read', 'abc'], v1.port);
+        expect(fb).toMatchObject({ code: 0, out: 'FB PANE\n' });
+        expect(JSON.parse((await orcRemote(['read', 'abc', '--json'], v1.port)).out)).toEqual({
+          id: 'abc',
+          fallback: true,
+          pane: 'FB PANE\n',
+        });
+      } finally {
+        v1.stop(true);
+      }
+    },
+    T,
+  );
+});
+
+describe('daemon error → HTTP status mapping', () => {
+  test('policy 403; stopped / message conflict / legacy 409; unknown 404; start failure 502; else 500', () => {
+    expect(httpStatusFor(new PolicyViolationError('nope'))).toBe(403);
+    expect(httpStatusFor(new SessionNotControllableError('x', 'ORC_SESSION_STOPPED'))).toBe(409);
+    expect(httpStatusFor(new SessionNotControllableError('x', 'ORC_MESSAGE_CONFLICT'))).toBe(409);
+    expect(httpStatusFor(new SessionNotControllableError('x', 'ORC_SESSION_LEGACY'))).toBe(409);
+    expect(httpStatusFor(new SessionNotControllableError('x', 'ORC_SESSION_UNKNOWN'))).toBe(404);
+    expect(httpStatusFor(new SessionStoppedError('sid-12345678'))).toBe(409);
+    expect(httpStatusFor(new SessionStartError('sid-12345678', 'boom', 1))).toBe(502);
+    expect(httpStatusFor(new Error('boom'))).toBe(500);
+  });
+
+  test('remote send exit codes accept v1 phases', () => {
+    expect(remoteSendExitCode(undefined)).toBe(0);
+    expect(remoteSendExitCode('submitted')).toBe(0);
+    expect(remoteSendExitCode('acknowledged')).toBe(0);
+    expect(remoteSendExitCode('queued')).toBe(0);
+    expect(remoteSendExitCode('unknown')).toBe(3);
+    expect(remoteSendExitCode('failed')).toBe(1);
+    expect(remoteSendExitCode('prepared')).toBe(1);
+  });
 });
