@@ -128,9 +128,12 @@ codes. Each runtime appends its raw protocol lines to `provider.jsonl`.
 Wire types are vendored and version-pinned (`*-protocol.ts`, `src/codex/protocol.ts`); contract
 tests pin each mapping. The codex harness (`src/codex/`): credentials (`auth.ts`: orc store →
 pi's `auth.json` → `OPENAI_API_KEY`; refreshes written back to their source), model choice
-(`models.ts`: `--model` → session model → first model the account lists), tools (`tools.ts`:
+(`models.ts`: `--model` → session model → the live default: first model the ChatGPT account lists,
+or with an API key the newest chat model in pi-ai's catalog; cached 10 min), tools (`tools.ts`:
 read/write/edit/bash/ls), the pi-format session file (`session-file.ts`), `orc login`
-(`login.ts`), and an offline `--self-test` for compiled binaries.
+(`login.ts`), and an offline `--self-test` for compiled binaries. There is no context compaction
+yet: a context-window overflow fails the turn with "start a new session". Sessions from the removed
+app-server runtime (provider session id ≠ orc session id) are `dead` and refuse resume.
 claude strips inherited `CLAUDE_CODE_*` variables except auth/backend settings
 (`ORC_CLAUDE_KEEP_ENV` adds more). Permission requests in yolo mode are journaled, then denied.
 
@@ -150,8 +153,13 @@ claude strips inherited `CLAUDE_CODE_*` variables except auth/backend settings
   `failed` (with `stopped` or `suspended`); actor `starting` → `starting`; pending permission →
   `waiting`; open turn or queued message → `running`; last turn failed → `failed`; else `done`.
 - **Status** (`session-status.ts`): `running` (lease live), `suspended` (not live, not stopped,
-  spawn.json present), `dead` (stopped, legacy, marked dead, or no spawn.json). A young record
-  without spawn.json is a spawn in progress: listed, counted against concurrency, never pruned.
+  spawn.json present), `spawning` (a record younger than 10 min without spawn.json: listed,
+  counted against concurrency, never pruned; `state` reads `starting`), `dead` (stopped, legacy,
+  marked dead, a codex app-server session, or no spawn.json past the grace).
+- **Prune** (`index.ts` `pruneSessions`): re-judges each candidate under its `actor-<sid>` lock and
+  removes the record and dir while holding it, so a concurrent `orc resume` (reopen under the same
+  lock) either wins or finds nothing. Keeps running/spawning; suspended only with `--suspended`
+  (its stop is finalised in that lock section); taken-over sessions only with `--taken-over`.
 - **Registry** (`registry.ts`): `~/.orc/registry.json`, an array of `SessionRecord`, mutated under
   a lock and written atomically. Records persist only `status: 'dead'`; everything else comes from
   the kernel. Pre-actor records normalise to `dead` + `legacy: 'tmux'` (readable, never controlled).
@@ -170,14 +178,19 @@ claude strips inherited `CLAUDE_CODE_*` variables except auth/backend settings
 - **Daemon** (`src/daemon/`): `Bun.serve` exposing the SDK as JSON (`/sessions…`, `/workflows…`,
   `/health`, `/whoami`), bound to the tailscale IP by default. Auth is fail-closed and scoped
   (tailnet allowlist, bearer tokens, legacy secret). `GET /health` reports `api: 2`; raw reads
-  return the journal. Details: `DESIGN-daemon.md`.
+  return the journal. Errors map to statuses (`httpStatusFor`): 400 invalid request, 403 policy
+  violation, 404 `ORC_SESSION_UNKNOWN` / unknown run, 409 `ORC_SESSION_STOPPED` /
+  `ORC_MESSAGE_CONFLICT` / `ORC_SESSION_LEGACY` / run state, 502 `ORC_SESSION_START_FAILED`,
+  else 500. The `--host` client still reads v1 (`pane`, `submitted`) answers. Details:
+  `DESIGN-daemon.md`.
 
 ## Workflows
 
 - **Runs** (`runs.ts`, `run-schema.ts`): `~/.orc/runs/<runId>.json`, schema 5, monotonic `revision`,
   CAS writes under a run lock. The validated plan and its digest are persisted before any side
   effect; attempts record phases `queued → spawning → dispatched → running → verifying →
-  succeeded|failed|waiting|cancelled|abandoned` (+ scheduler-owned `blocked`/`skipped`).
+  succeeded|failed|waiting|cancelled|abandoned` (+ scheduler-owned `blocked`/`skipped`);
+  each transition is emitted once, forward only.
 - **Runner** (`workflow.ts`, `workflow-scheduler.ts`): a bounded DAG launch loop
   (`min(maxConcurrency, policy.maxConcurrentSessions)`); each step spawns an agent, delivers its
   instructions (over 1 KiB → file under `~/.orc/runs/<runId>/` + pointer), waits on the journal
@@ -189,9 +202,10 @@ claude strips inherited `CLAUDE_CODE_*` variables except auth/backend settings
   heartbeats an owner lease. Reconcile: lease fresh and runner alive → `running`; else `orphaned`.
   Finalized runs are never downgraded. `cancel` SIGTERMs a live runner.
 - **Recovery**: `resume` skips successes and adopts in-flight steps whose instruction reached a
-  still-resumable session; `retry` appends attempts; `cancel --cascade` and `cleanup` only touch
-  sessions proven owned (`rootRunId` / `parentRunId`). Lineage and policy propagate through `ORC_*`
-  env vars.
+  still-resumable session, but never relaunches around a session a human took over (the attempt
+  fails `taken_over` until `orc resume` + `retry`); `retry` appends attempts; `cancel --cascade`
+  and `cleanup` only touch sessions proven owned (`rootRunId` / `parentRunId`). Lineage and
+  policy propagate through `ORC_*` env vars.
 
 ## Storage and privacy
 
@@ -199,9 +213,11 @@ claude strips inherited `CLAUDE_CODE_*` variables except auth/backend settings
 ~/.orc/                     (ORC_HOME)             0700
   registry.json, peers.json                         0600
   locks/                                            0700, lock files 0600
+  auth/chatgpt.json, auth/device-id (ORC_AUTH_DIR)  0700 / 0600 (codex login)
+  cache/codex-models.json                           0600 (model ids per account)
   sessions/<sid>/                                   0700
     spawn.json, state.json, journal.jsonl, provider.jsonl, actor.log,
-    system-prompt.md, inbox/<ULID>.json             0600
+    system-prompt.md, codex-session.jsonl, inbox/<ULID>.json   0600
   transcripts/pi/<sid>/                             0700
   runs/<runId>.json                                 0600 (plan holds step prompts)
   runs/<runId>/  runner.log, <step>.md drops, attempts/, artifacts/, inputs/   0700 / 0600
@@ -211,11 +227,18 @@ The journal holds full prompt and reply text. orc sets these modes explicitly (c
 and open modes are umask-filtered) and tightens older state on its next write
 (`src/private-fs.ts`). `kill --purge` and `prune` remove a session's dir.
 
+Locks (`src/lock.ts`, registry lock) are `open('wx')` files recording `{pid, startTime, host,
+token}`. A lock whose owner is provably gone (dead pid, zombie, or a recycled pid with another
+start time) is reclaimed on the next poll; one with no recorded owner, or an owner on another host,
+after 5 min. Removal happens under `<lock>.cleanup` after re-reading the owner.
+
 ## Testing and verification
 
 - `bun test`: pure logic, the kernel against the scripted `fake` provider (crash, torn tail,
-  stale-provider kill, two senders → one actor), provider mappers over captured CLI output,
-  workflows, daemon routes/auth. The CLI suite shadows `tmux` on `PATH` and fails if it is called.
+  stale-provider kill, two senders → one actor), provider mappers over captured CLI output, the
+  codex harness against a local fake OpenAI server (Responses, models, OAuth token), workflows,
+  daemon routes/auth. The CLI suite shadows `tmux` on `PATH` and fails if it is called.
+- `bun run check:compile`: compiles orc and runs `orc __codex-harness --self-test`.
 - `bun run typecheck` covers `src`, `test`, `scripts/verify-runtime` and `scripts/dogfood`.
 - Live gates, on an authenticated host: `bun run verify:live` (`scripts/verify-runtime/all.ts`) —
   per-provider runtime gates, CLI end-to-end including SIGKILL → suspended → wake and
