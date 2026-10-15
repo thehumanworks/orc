@@ -380,6 +380,74 @@ describe('orc login chatgpt (offline: fake auth + token endpoints)', () => {
   );
 
   test(
+    'a pasted redirect URL completes the login (remote browser); a wrong one is rejected',
+    async () => {
+      if (!(await callbackPortFree())) {
+        console.warn('[codex-kernel] port 1455 busy: pasted-redirect login test skipped');
+        return;
+      }
+      const home = fs.mkdtempSync(path.join(root, 'login-paste-'));
+      const env = { ...cliEnv(), ORC_HOME: path.join(home, 'orc') };
+      const p = Bun.spawn([process.execPath, cliEntryPath(), 'login', 'chatgpt', '--no-browser'], {
+        cwd: root,
+        env,
+        stdin: 'pipe',
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      let out = '';
+      const reader = (async () => {
+        const dec = new TextDecoder();
+        for await (const c of p.stdout) out += dec.decode(c);
+      })();
+      await waitFor(() => /https:\/\/auth\.openai\.com\/\S+/.test(out) || undefined, 'authorize URL', 15_000);
+      const url = new URL(/https:\/\/auth\.openai\.com\/\S+/.exec(out)![0]);
+      const state = url.searchParams.get('state')!;
+      p.stdin.write(`http://127.0.0.1:1455/auth/callback?code=pasted-code&state=${encodeURIComponent(state)}&client_id=app_pasted\n`);
+      await p.stdin.flush();
+      const code = await p.exited;
+      await reader;
+      expect(code).toBe(0);
+      const cred = JSON.parse(fs.readFileSync(path.join(home, 'orc', 'auth', 'chatgpt.json'), 'utf8')).openai;
+      expect(cred.clientId).toBe('app_pasted');
+      expect(fs.statSync(path.join(home, 'orc', 'auth', 'device-id')).mode & 0o777).toBe(0o600);
+      expect(fake.tokenRequests().at(-1)!.get('code')).toBe('pasted-code');
+      expect(await callbackPortFree()).toBe(true);
+    },
+    T,
+  );
+
+  test(
+    '--import-pi copies pi\'s login into orc\'s store; logout removes only orc\'s copy',
+    async () => {
+      const home = fs.mkdtempSync(path.join(root, 'import-'));
+      const pi = path.join(home, 'pi');
+      fs.mkdirSync(pi, { recursive: true });
+      const cred = { type: 'oauth', access: 'tok-pi-import', refresh: 'rt-pi-import', expires: Date.now() + 3_600_000, clientId: 'app_pi_i', scopes: ['chatgpt.tokens.use.direct'] };
+      fs.writeFileSync(path.join(pi, 'auth.json'), JSON.stringify({ openai: cred }), { mode: 0o600 });
+      const env = { ...cliEnv(), ORC_HOME: path.join(home, 'orc'), PI_CODING_AGENT_DIR: pi };
+      const run = async (args: string[]) => {
+        const p = Bun.spawn([process.execPath, cliEntryPath(), ...args], { cwd: root, env, stdout: 'pipe', stderr: 'pipe' });
+        const [o, e] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
+        return { code: await p.exited, out: o + e };
+      };
+      expect(JSON.parse((await run(['login', 'status', '--json'])).out).active).toBe('pi');
+      const imp = await run(['login', 'chatgpt', '--import-pi']);
+      expect(imp.code).toBe(0);
+      expect(imp.out).toContain('refresh independently');
+      expect(JSON.parse(fs.readFileSync(path.join(home, 'orc', 'auth', 'chatgpt.json'), 'utf8')).openai).toEqual(cred);
+      expect(JSON.parse((await run(['login', 'status', '--json'])).out).active).toBe('orc');
+      const out = await run(['logout', 'chatgpt']);
+      expect(out.code).toBe(0);
+      expect(out.out).toContain("pi's ChatGPT login");
+      expect(fs.existsSync(path.join(home, 'orc', 'auth', 'chatgpt.json'))).toBe(false);
+      expect(JSON.parse(fs.readFileSync(path.join(pi, 'auth.json'), 'utf8')).openai).toEqual(cred);
+      expect(JSON.parse((await run(['login', 'status', '--json'])).out).active).toBe('pi');
+    },
+    T,
+  );
+
+  test(
     'an expired pi credential is refreshed by the harness against the token endpoint and written back to pi',
     async () => {
       const auth = path.join(orcHome, 'auth', 'chatgpt.json');
