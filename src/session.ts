@@ -15,7 +15,7 @@ import type { AgentState, Provider, SessionRecord, SessionStatus } from './types
 import { releaseSessionPolicy, wakePolicyHook } from './lineage.ts';
 import { sessionStatusOf } from './session-status.ts';
 import { renderJournalEntry } from './journal-render.ts';
-import { nativeResumeCommand, resolveTranscriptPath } from './provider-cli.ts';
+import { nativeResumeCommand, nativeResumeNote, resolveTranscriptPath } from './provider-cli.ts';
 import {
   SessionStoppedError,
   deriveState,
@@ -89,6 +89,8 @@ export interface TakeoverResult {
   cwd: string;
   /** The provider's own resume command (`cd <cwd> && …`). Handback: `orc resume <id>`. */
   command: string;
+  /** Extra guidance for running `command` (codex: continued in pi, which needs its own login). */
+  note?: string;
   providerSessionId?: string;
   transcriptPath?: string;
 }
@@ -613,6 +615,7 @@ export class Session {
       id: this.id,
       cwd: spec.cwd,
       command: nativeResumeCommand(spec),
+      ...(nativeResumeNote(spec) ? { note: nativeResumeNote(spec)! } : {}),
       ...(spec.providerSessionId ? { providerSessionId: spec.providerSessionId } : {}),
       ...(this.record.transcriptPath ? { transcriptPath: this.record.transcriptPath } : {}),
     };

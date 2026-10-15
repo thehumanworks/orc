@@ -5,12 +5,14 @@
  *   running    actor lease live
  *   suspended  not live, not stopped, spawn.json present → resumable
  *   spawning   young reservation whose spawn.json is not written yet (spawn in progress)
- *   dead       stopped (kill/takeover), legacy tmux record, record marked dead, or no
- *              spawn.json (past the spawn grace)
+ *   dead       stopped (kill/takeover), legacy tmux record, record marked dead, no
+ *              spawn.json (past the spawn grace), or a codex session from the removed
+ *              codex app-server runtime that is not running (it cannot be resumed)
  */
 import { readSpawnSpec } from './runtime/spec.ts';
 import { readActorState } from './runtime/actor-state.ts';
 import { leaseLive } from './runtime/client.ts';
+import { isLegacyCodexSpec } from './runtime/providers/codex.ts';
 import type { SessionRecord, SessionStatus } from './types.ts';
 
 /** How liveness is observed. Injectable (tests); default = the kernel. */
@@ -24,9 +26,11 @@ export function sessionStatusOf(
 ): SessionStatus {
   if (rec.legacy) return 'dead';
   try {
-    if (!readSpawnSpec(rec.sessionId)) return isSpawnPending(rec) ? 'spawning' : 'dead';
+    const spec = readSpawnSpec(rec.sessionId);
+    if (!spec) return isSpawnPending(rec) ? 'spawning' : 'dead';
     const st = readActorState(rec.sessionId);
     if (leaseLive(st)) return 'running';
+    if (isLegacyCodexSpec(spec)) return 'dead';
     if (rec.status === 'dead' || st?.phase === 'stopped') return 'dead';
     return 'suspended';
   } catch {

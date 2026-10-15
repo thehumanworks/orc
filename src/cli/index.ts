@@ -625,10 +625,10 @@ async function cmdTakeover(args: string[]): Promise<number> {
   }
   try {
     const t = await session.takeover();
-    if (json) printJson({ id: t.id, cwd: t.cwd, command: t.command });
+    if (json) printJson({ id: t.id, cwd: t.cwd, command: t.command, ...(t.note ? { note: t.note } : {}) });
     else {
       process.stdout.write(
-        `# orc stopped ${t.id}; continue it yourself with:\n${t.command}\n# hand it back with: orc resume ${t.id}\n`,
+        `# orc stopped ${t.id}; continue it yourself with:\n${t.command}\n${t.note ? `# ${t.note}\n` : ''}# hand it back with: orc resume ${t.id}\n`,
       );
     }
     return 0;
@@ -2224,6 +2224,11 @@ export function resolveCommand(raw: string | undefined): string {
 async function main(): Promise<number> {
   // Hidden: the detached per-session actor (src/runtime/actor-main.ts). Not a user command.
   if (process.argv[2] === '__actor') return (await import('../runtime/actor-main.ts')).runActorMain(process.argv.slice(3));
+  // Hidden: the codex harness child the codex runtime spawns (src/codex/harness.ts), and its
+  // offline `--self-test` (used to check a compiled binary).
+  if (process.argv[2] === '__codex-harness') {
+    return (await import('../codex/harness.ts')).runCodexHarnessMain(process.argv.slice(3));
+  }
   // Peel a global `--host <h>` (it may precede the subcommand) BEFORE per-command parsing,
   // which is strict on unknown options. When present, the command runs over HTTP.
   const { host, rest: argv } = extractHostFlag(process.argv.slice(2));

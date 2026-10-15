@@ -1,7 +1,0 @@
-{"dir":"send","msg":{"method":"initialize","id":0,"params":{"clientInfo":{"name":"orc","title":"orc (S3 probe)","version":"0.0.1"},"capabilities":{"experimentalApi":true}}}}
-{"dir":"recv","msg":{"id":0,"result":{"userAgent":"orc/0.162.1 (Ubuntu 24.4.0; x86_64) linux (orc; 0.0.1)","codexHome":"/tmp/orc-codex-fixture/home","platformFamily":"unix","platformOs":"linux"}}}
-{"dir":"recv","msg":{"method":"configWarning","params":{"summary":"Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.","details":null},"emittedAtMs":1791995366158}}
-{"dir":"recv","msg":{"method":"remoteControl/status/changed","params":{"status":"disabled","serverName":"vm","installationId":"d71dbc1e-62f8-4cc8-b742-142416f70cc7","environmentId":null},"emittedAtMs":1791995366158}}
-{"dir":"send","msg":{"method":"initialized"}}
-{"dir":"send","msg":{"method":"thread/resume","id":1,"params":{"threadId":"01a13b3f-48f3-7c32-abe2-1c2d25b7e438","excludeTurns":true}}}
-{"dir":"recv","msg":{"error":{"code":-32600,"message":"no rollout found for thread id 01a13b3f-48f3-7c32-abe2-1c2d25b7e438"},"id":1}}

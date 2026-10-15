@@ -1,22 +1,33 @@
 #!/usr/bin/env bun
 /**
- * LIVE gate for orc's codex runtime (src/runtime/providers/codex.ts) against a REAL,
- * authenticated `codex app-server`. Depends only on the runtime — not on orc's session layer.
+ * LIVE gate for orc's codex runtime (src/runtime/providers/codex.ts → the in-house codex
+ * harness, src/codex/harness.ts) against the REAL OpenAI Responses API. Depends only on the
+ * runtime — not on orc's session layer.
  *
- *   bun scripts/verify-runtime/codex.ts [--model <name>] [--codex-bin <path>]
+ *   bun scripts/verify-runtime/codex.ts [--model <id>] [--orc-bin <path>]
  *                                       [--turn-timeout <seconds>] [--keep]
  *
- * Uses your normal codex auth/config (CODEX_HOME or ~/.codex; the run appears in your codex
- * session history) and a fresh temp cwd. Steps: fresh start → multi-line one-word turn →
- * second turn → interrupt a long third turn → close → resume → history check → close.
- * Prints a PASS/FAIL table and exits non-zero on any failure. Never prints env or
+ * Uses your normal credentials, in the harness's order: `orc login chatgpt`
+ * ($ORC_HOME/auth/chatgpt.json), else pi's ChatGPT login (~/.pi/agent/auth.json), else
+ * OPENAI_API_KEY. Without --model the harness picks the first model your account lists.
+ * `--orc-bin` runs the harness from a compiled orc binary instead of this checkout.
+ * Steps: preflight (credential + live model list) → fresh start → multi-line one-word turn
+ * → tool turn (write a file) → interrupt a long turn → close → resume → history check →
+ * close. Prints a PASS/FAIL table and exits non-zero on any failure. Never prints env or
  * credentials; the raw protocol log is kept on failure (or with --keep) for debugging.
  */
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { CODEX_PROTOCOL_VERIFIED_VERSION, codexRuntime } from '../../src/runtime/providers/codex.ts';
-import type { ProviderEvent, ProviderRuntime, SpawnSpec } from '../../src/runtime/types.ts';
+import { createModels } from '@earendil-works/pi-ai';
+import { openaiProvider } from '@earendil-works/pi-ai/providers/openai';
+import { registerBunOAuthFlows } from '@earendil-works/pi-ai/bun-oauth';
+import { resolveCodexAuth } from '../../src/codex/auth.ts';
+import { listLiveModels } from '../../src/codex/models.ts';
+import { PI_AI_VERSION } from '../../src/codex/harness.ts';
+import { codexRuntime, codexStderrLogPath, createCodexRuntime } from '../../src/runtime/providers/codex.ts';
+import type { ProviderEvent, ProviderRuntime, ProviderRuntimeFactory, SpawnSpec } from '../../src/runtime/types.ts';
+import { parsePi } from '../../src/transcript.ts';
 
 // ------------------------------------------------------------------------------------
 // args
@@ -24,7 +35,7 @@ import type { ProviderEvent, ProviderRuntime, SpawnSpec } from '../../src/runtim
 
 interface Args {
   model?: string;
-  codexBin?: string;
+  orcBin?: string;
   turnTimeoutMs: number;
   keep: boolean;
 }
@@ -39,11 +50,11 @@ function parseArgs(argv: string[]): Args {
       return v;
     };
     if (k === '--model') a.model = val();
-    else if (k === '--codex-bin') a.codexBin = val();
+    else if (k === '--orc-bin' || k === '--codex-bin') a.orcBin = path.resolve(val());
     else if (k === '--turn-timeout') a.turnTimeoutMs = Number(val()) * 1_000;
     else if (k === '--keep') a.keep = true;
     else if (k === '-h' || k === '--help') {
-      console.log('usage: bun scripts/verify-runtime/codex.ts [--model <name>] [--codex-bin <path>] [--turn-timeout <s>] [--keep]');
+      console.log('usage: bun scripts/verify-runtime/codex.ts [--model <id>] [--orc-bin <path>] [--turn-timeout <s>] [--keep]');
       process.exit(0);
     } else throw new Error(`unknown argument: ${k}`);
   }
@@ -63,7 +74,7 @@ interface Row {
 }
 const rows: Row[] = [];
 
-/** Keep details short and single-line; they come from model output or codex errors only. */
+/** Keep details short and single-line; they come from model output or provider errors only. */
 function clip(s: string, n = 90): string {
   const one = s.replace(/\s+/g, ' ').trim();
   return one.length > n ? `${one.slice(0, n - 1)}…` : one;
@@ -108,7 +119,7 @@ class Session {
     for (;;) {
       const hit = this.events.find(pred);
       if (hit) return hit;
-      if (this.events.some((e) => e.type === 'exited')) throw new Error(`codex exited while waiting for ${what}`);
+      if (this.events.some((e) => e.type === 'exited')) throw new Error(`the harness exited while waiting for ${what}`);
       if (Date.now() > end) throw new Error(`timed out after ${Math.round(ms / 1000)}s waiting for ${what}`);
       await Bun.sleep(25);
     }
@@ -146,8 +157,7 @@ async function runTurn(s: Session, messageId: string, text: string, timeoutMs: n
   try {
     return await s.outcome(messageId, timeoutMs);
   } catch (e) {
-    // codex keeps a turn open indefinitely while it cannot reach the model ("Reconnecting...
-    // waiting for network"): interrupt it so the following checks still run.
+    // Interrupt a turn that outlived the timeout so the following checks still run.
     await s.rt.interrupt().catch(() => {});
     await s.outcome(messageId, 30_000).catch(() => {});
     throw e;
@@ -179,7 +189,7 @@ async function main(): Promise<number> {
   fs.mkdirSync(stateDir, { recursive: true });
   const rawLogPath = path.join(stateDir, 'provider.jsonl');
   const env: Record<string, string> = { ...(process.env as Record<string, string>) };
-  if (args.codexBin) env.ORC_CODEX_BIN = args.codexBin;
+  const factory: ProviderRuntimeFactory = args.orcBin ? createCodexRuntime({ argv: [args.orcBin] }) : codexRuntime;
   const spec: SpawnSpec = {
     version: 1,
     sessionId: crypto.randomUUID(),
@@ -190,7 +200,7 @@ async function main(): Promise<number> {
     ...(args.model ? { model: args.model } : {}),
   };
   const T = args.turnTimeoutMs;
-  console.log(`orc codex runtime live gate (runtime verified against codex ${CODEX_PROTOCOL_VERIFIED_VERSION})`);
+  console.log(`orc codex harness live gate (pi-ai ${PI_AI_VERSION}; harness: ${args.orcBin ?? 'this checkout'})`);
   console.log(`cwd: ${cwd}${args.model ? `  model: ${args.model}` : ''}`);
 
   let current: Session | null = null;
@@ -200,58 +210,72 @@ async function main(): Promise<number> {
   process.on('SIGINT', onSignal);
   process.on('SIGTERM', onSignal);
 
-  let threadId = '';
   let transcriptPath: string | undefined;
+  let model = '';
   const first = 'PINEAPPLE';
   try {
-    // ---- fresh session -------------------------------------------------------------
-    const started = await step('fresh start → ready', async () => {
-      const rt = await codexRuntime.start({ spec, resume: false, env, rawLogPath });
+    const ok = await step('preflight: credential + live model list', async () => {
+      registerBunOAuthFlows();
+      const auth = await resolveCodexAuth(env);
+      const models = createModels({ credentials: auth.store });
+      models.setProvider(openaiProvider());
+      try {
+        const listed = await listLiveModels({ models, accountKey: auth.accountKey, force: true });
+        return `${auth.label}; ${listed.ids.length} models, first: ${listed.ids.slice(0, 3).join(', ')}`;
+      } catch (e) {
+        if (args.model) return `${auth.label}; listing failed (${(e as Error).message}) — using --model`;
+        throw e;
+      }
+    });
+    const started = ok && (await step('fresh start → ready', async () => {
+      const rt = await factory.start({ spec, resume: false, env, rawLogPath });
       current = new Session(rt);
-      const ready = await current.waitFor((e) => e.type === 'ready', 30_000, 'ready');
+      const ready = await current.waitFor((e) => e.type === 'ready', 60_000, 'ready');
       if (ready.type !== 'ready') throw new Error('unreachable');
-      threadId = ready.providerSessionId;
       transcriptPath = ready.transcriptPath;
       const info = ready.info ?? {};
-      return `codex ${String(info.cliVersion)}, model ${String(info.model)}, thread ${threadId.slice(0, 8)}…`;
-    });
+      model = String(info.model);
+      return `model ${model} (${String(info.modelSource)}), auth ${String(info.authSource)}, thinking ${String(info.thinkingLevel)}`;
+    }));
     if (started && current) {
       const s: Session = current;
       await step('turn 1: multi-line prompt → one-word reply', async () => {
         const prompt = [
-          'orc runtime live check (codex). This message spans several lines.',
+          'orc runtime live check (codex harness). This message spans several lines.',
           `Line 2 has "double quotes", 'single quotes', a backslash \\ and unicode: ✓ 日本語 🚀.`,
           '',
           `Reply with exactly one word and nothing else: ${first}`,
         ].join('\n');
         return expectCompletedWord(await runTurn(s, 'verify-1', prompt, T), s, 'verify-1', first);
       });
-      await step('transcript (thread.path) exists', async () => {
-        if (!transcriptPath) throw new Error('ready carried no transcriptPath');
-        if (!fs.existsSync(transcriptPath)) throw new Error(`missing: ${transcriptPath}`);
-        return path.basename(transcriptPath);
+      await step('transcript (codex-session.jsonl) parses', async () => {
+        if (!transcriptPath || !fs.existsSync(transcriptPath)) throw new Error(`missing: ${transcriptPath}`);
+        const turns = parsePi(fs.readFileSync(transcriptPath, 'utf8'));
+        if (!turns.some((t) => t.role === 'assistant')) throw new Error('no assistant turn in the transcript');
+        return `${path.basename(transcriptPath)}: ${turns.length} turns`;
       });
-      await step('turn 2: second turn', async () =>
-        expectCompletedWord(
-          await runTurn(s, 'verify-2', 'Reply with exactly one word and nothing else: SECOND', T),
+      await step('turn 2: tool use (write a file in the cwd)', async () => {
+        const ev = await runTurn(
           s,
           'verify-2',
-          'SECOND',
-        ),
-      );
-      await step('turn 3: interrupt a long turn → turn.interrupted', async () => {
-        await s.rt.send(
-          'verify-3',
-          'Write every integer from 1 to 5000 in words, one per line, with no other text. Do not use tools.',
+          'Use your write tool to create a file named codeword.txt in the current directory containing exactly the word SECOND (no newline). Then reply with exactly one word and nothing else: DONE',
+          T,
         );
+        const detail = expectCompletedWord(ev, s, 'verify-2', 'DONE');
+        const file = path.join(cwd, 'codeword.txt');
+        if (!fs.existsSync(file)) throw new Error('codeword.txt was not created');
+        if (fs.readFileSync(file, 'utf8').trim() !== 'SECOND') throw new Error('codeword.txt has unexpected content');
+        return `${detail}; codeword.txt written`;
+      });
+      await step('turn 3: interrupt a long turn → turn.interrupted', async () => {
+        await s.rt.send('verify-3', 'Write every integer from 1 to 5000 in words, one per line, with no other text. Do not use tools.');
         await s.waitFor((e) => e.type === 'turn.started' && e.messageId === 'verify-3', 60_000, 'turn.started');
         await Bun.sleep(1_500); // let the model get going
         const t0 = Date.now();
         await s.rt.interrupt();
         const ev = await s.outcome('verify-3', 60_000);
         if (ev.type !== 'turn.interrupted') throw new Error(`expected turn.interrupted, got ${ev.type}`);
-        const acked = s.events.some((e) => e.type === 'interrupt.acked');
-        if (!acked) throw new Error('no interrupt.acked');
+        if (!s.events.some((e) => e.type === 'interrupt.acked')) throw new Error('no interrupt.acked');
         return `interrupted ${Date.now() - t0}ms after interrupt()`;
       });
       await step('close → exited, process group gone', async () => {
@@ -265,13 +289,20 @@ async function main(): Promise<number> {
       current = null;
 
       // ---- resume ------------------------------------------------------------------
-      const resumed = await step('resume → ready with the same thread', async () => {
-        const rt = await codexRuntime.start({ spec: { ...spec, providerSessionId: threadId }, resume: true, env, rawLogPath });
+      const resumed = await step('resume → ready (history loaded, same model)', async () => {
+        const rt = await factory.start({
+          spec: { ...spec, providerSessionId: spec.sessionId, ...(transcriptPath ? { transcriptPath } : {}) },
+          resume: true,
+          env,
+          rawLogPath,
+        });
         current = new Session(rt);
-        const ready = await current.waitFor((e) => e.type === 'ready', 30_000, 'ready');
+        const ready = await current.waitFor((e) => e.type === 'ready', 60_000, 'ready');
         if (ready.type !== 'ready') throw new Error('unreachable');
-        if (ready.providerSessionId !== threadId) throw new Error(`thread changed: ${ready.providerSessionId}`);
-        return `thread ${threadId.slice(0, 8)}… resumed`;
+        const info = ready.info ?? {};
+        if (info.mode !== 'resume') throw new Error(`mode ${String(info.mode)}`);
+        if (String(info.model) !== model) throw new Error(`model changed: ${String(info.model)}`);
+        return `${String(info.messageCount)} messages loaded`;
       });
       if (resumed && current) {
         const r: Session = current;
@@ -306,7 +337,8 @@ async function main(): Promise<number> {
   const failed = rows.filter((r) => !r.ok).length;
   if (failed > 0 || args.keep) {
     console.log(`\nraw protocol log: ${rawLogPath}`);
-    console.log(`codex stderr log: ${path.join(stateDir, 'provider.stderr.log')}`);
+    console.log(`harness stderr log: ${codexStderrLogPath(rawLogPath)}`);
+    if (transcriptPath) console.log(`session file: ${transcriptPath}`);
   } else {
     fs.rmSync(root, { recursive: true, force: true });
   }

@@ -1,5 +1,8 @@
 import { describe, test, expect } from 'bun:test';
-import { nativeResumeCommand, shellQuote } from '../src/provider-cli.ts';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { nativeResumeCommand, nativeResumeNote, shellQuote } from '../src/provider-cli.ts';
 import type { SpawnSpec } from '../src/runtime/types.ts';
 
 const base: SpawnSpec = {
@@ -29,10 +32,23 @@ describe('nativeResumeCommand (orc takeover)', () => {
     );
   });
 
-  test('codex: codex resume <threadId>', () => {
-    expect(nativeResumeCommand({ ...base, provider: 'codex', providerSessionId: 'thr_abc' })).toBe(
-      `cd '/work/my repo' && codex resume thr_abc`,
-    );
+  test('codex: pi --session <harness session file> (+ a pi login note); legacy app-server sessions have none', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orc-pcli-'));
+    try {
+      const file = path.join(dir, 'codex-session.jsonl');
+      fs.writeFileSync(file, '{"type":"session"}\n');
+      const spec = { ...base, provider: 'codex' as const, providerSessionId: base.sessionId, transcriptPath: file };
+      expect(nativeResumeCommand(spec)).toBe(`cd '/work/my repo' && pi --session ${file}`);
+      expect(nativeResumeNote(spec)).toContain('pi');
+      expect(nativeResumeNote({ ...base, provider: 'claude' })).toBeNull();
+      // Missing session file, or a session from the removed codex app-server runtime.
+      expect(nativeResumeCommand({ ...spec, transcriptPath: path.join(dir, 'gone', 'codex-session.jsonl') })).toBe(
+        "# provider 'codex' has no native resume command",
+      );
+      expect(nativeResumeCommand({ ...spec, providerSessionId: 'thr_abc' })).toBe("# provider 'codex' has no native resume command");
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test('pi: the runtime resume flags minus --mode rpc', () => {

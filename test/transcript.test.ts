@@ -54,11 +54,11 @@ describe('pi transcript resolution', () => {
   });
 });
 
-describe('codex transcript resolution (thread.path only)', () => {
-  test('uses the path the runtime recorded (spawn.json transcriptPath)', async () => {
+describe('codex transcript resolution (the harness session file only)', () => {
+  test('uses the harness session file the runtime recorded (spawn.json / record transcriptPath)', async () => {
     const dir = await mkTmp();
-    const file = path.join(dir, 'rollout-2026-10-15T00-00-00-11111111-2222-3333-4444-555555555555.jsonl');
-    await fs.writeFile(file, '{"type":"session_meta"}\n');
+    const file = path.join(dir, 'codex-session.jsonl');
+    await fs.writeFile(file, '{"type":"session","version":3,"id":"x","timestamp":"t","cwd":"/w"}\n');
     const r = rec({ provider: 'codex', cwd: dir, workspace: dir });
     expect(
       resolveTranscriptPath(r, {
@@ -75,11 +75,18 @@ describe('codex transcript resolution (thread.path only)', () => {
     expect(resolveTranscriptPath({ ...r, transcriptPath: file })).toBe(file);
   });
 
-  test('no recorded path → null (no cwd+mtime search)', () => {
+  test('a legacy app-server rollout path is not a transcript (dropped support)', async () => {
+    const dir = await mkTmp();
+    const rollout = path.join(dir, 'rollout-2026-10-15T00-00-00-11111111-2222-3333-4444-555555555555.jsonl');
+    await fs.writeFile(rollout, '{"type":"session_meta"}\n');
+    expect(resolveTranscriptPath(rec({ provider: 'codex', transcriptPath: rollout }))).toBeNull();
+  });
+
+  test('no recorded path and no session file → null', () => {
     expect(resolveTranscriptPath(rec({ provider: 'codex' }))).toBeNull();
   });
 
   test('a recorded path that no longer exists is ignored', () => {
-    expect(resolveTranscriptPath(rec({ provider: 'codex', transcriptPath: '/nonexistent/rollout.jsonl' }))).toBeNull();
+    expect(resolveTranscriptPath(rec({ provider: 'codex', transcriptPath: '/nonexistent/codex-session.jsonl' }))).toBeNull();
   });
 });
