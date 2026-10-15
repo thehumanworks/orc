@@ -2024,6 +2024,8 @@ export function resolveCommand(raw: string | undefined): string {
 }
 
 async function main(): Promise<number> {
+  // Hidden: the detached per-session actor (src/runtime/actor-main.ts). Not a user command.
+  if (process.argv[2] === '__actor') return (await import('../runtime/actor-main.ts')).runActorMain(process.argv.slice(3));
   // Peel a global `--host <h>` (it may precede the subcommand) BEFORE per-command parsing,
   // which is strict on unknown options. When present, the command runs over HTTP.
   const { host, rest: argv } = extractHostFlag(process.argv.slice(2));
