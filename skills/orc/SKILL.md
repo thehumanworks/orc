@@ -131,9 +131,9 @@ coincidence. Concretely:
 All three (`claude`, `codex`, `pi`) drive the same lifecycle; pick by strength and for diversity, not
 convenience. But only **one** provider is required — don't assume all three are available: claude
 and pi need their CLI on `PATH`; codex needs an OpenAI credential (`orc login status` shows it; no
-codex CLI is involved). A spawn fails if its provider is unavailable. If only one is available, diversify *within* it: use a
-different model (`-m`) or a different persona (`--agent`) for the implement vs. review roles, so a
-*different agent* still checks the work.
+codex CLI is involved). A spawn fails if its provider is unavailable. If only one is available,
+diversify *within* it: use a different model (`-m`) or a different persona (`--agent`) for the
+implement vs. review roles, so a *different agent* still checks the work.
 
 ## Specialized, reusable subagents
 
