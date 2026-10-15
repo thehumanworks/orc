@@ -3,6 +3,23 @@
 Live checks for orc's tmux-free actor runtime. Run them on an authenticated macOS or Linux
 host.
 
+## Step by step on a Mac
+
+Needs Bun ≥ 1.3, git and a signed-in `claude` (2.1.300 verified). Optional: `pi` 1.2.0 for the
+pi rows, and an OpenAI credential for the codex rows (codex is orc's built-in harness; the
+`codex` CLI is not used). Anything missing is reported SKIP, not FAIL.
+
+```sh
+git clone -b feat/actor-runtime https://github.com/thehumanworks/orc.git && cd orc
+bun install
+bun src/cli/index.ts login status        # codex credential: orc login → pi's login → OPENAI_API_KEY
+bun src/cli/index.ts login chatgpt       # optional, only if status shows none (prints the default model)
+bun scripts/verify-runtime/all.ts --claude-model haiku \
+    [--codex-model <model-id>] [--pi-model <provider>/<model-id>]
+```
+
+Exit 0 means no FAIL. Share `verify-results.json` (repo root; no secrets, no env, home as `~`).
+
 ## One command
 
 ```sh
@@ -15,11 +32,12 @@ own default model, and the run prints a note for each one.
 | flag | meaning |
 |---|---|
 | `--providers claude,codex,pi` | which providers to check (default: all three) |
-| `--claude-model M` / `--codex-model M` / `--pi-model M` | model per provider (default: the provider's own default — for codex the first model your account lists; pass a cheap one) |
+| `--claude-model M` / `--codex-model M` / `--pi-model M` | model per provider (default: the provider's own default — for codex the first model your ChatGPT account lists, or with an API key the newest chat model pi-ai knows; pass a cheap one) |
 | `--keep` | keep the temp root for debugging: each ORC_HOME's registry and workflow runner log, the tmux shim log, and this run's claude transcripts. Sessions are still killed and pruned, so their journals are gone either way. |
 | `--claude-bin P` / `--pi-bin P` | use another executable (a `.ts` file runs with bun), e.g. `--pi-bin test/fixtures/pi-chat-fake.ts`. codex has no binary (it is orc's built-in harness); `--codex-bin` is rejected |
 | `--no-runtime-gates`, `--no-e2e`, `--no-workflow` | skip those sections |
 | `--results FILE` | where to write the JSON (default `verify-results.json` in the repo root, gitignored) |
+| `-h`, `--help` | usage |
 
 It exits 1 if any check fails. A provider whose binary is missing (codex: no OpenAI credential)
 is reported as SKIP, not as a failure. Expect a few cents with haiku. Codex and pi use their
@@ -66,10 +84,12 @@ this run's claude transcripts.
 
 ## Per-provider runtime gates
 
-These check the runtime layer only, without orc's session layer:
+These check the runtime layer only, without orc's session layer. The codex gate: credential +
+live model list → fresh start → multi-line one-word turn → tool turn (writes a file) → interrupt a
+long turn → close → resume → history check → close.
 
 ```sh
 bun scripts/verify-runtime/claude.ts [--model haiku] [--keep]
-bun scripts/verify-runtime/codex.ts  [--model M] [--orc-bin P] [--keep]   # P: a compiled orc to run the harness from
+bun scripts/verify-runtime/codex.ts  [--model M] [--orc-bin P] [--turn-timeout S] [--keep]   # P: a compiled orc to run the harness from
 bun scripts/verify-runtime/pi.ts     [--model provider/id] [--bin P] [--keep]
 ```
