@@ -44,12 +44,14 @@ import {
 import type { SpawnDetachedOptions } from '../src/runtime/process.ts';
 import type { ProcessIdentity } from '../src/runtime/types.ts';
 import {
+  awaitRunnerHandoff,
   followRunnerLog,
   launchDetachedRecovery,
   launchDetachedRun,
   RunnerSpawnError,
 } from '../src/workflow-runner.ts';
 import { serveDaemon } from '../src/daemon/server.ts';
+import { renderRunDetail } from '../src/cli/output.ts';
 
 const CLI = path.resolve(import.meta.dir, '..', 'src', 'cli', 'index.ts');
 const POLICY_FAIL_WF = path.join(import.meta.dir, 'fixtures', 'policy-fail-workflow.ts');
@@ -205,6 +207,36 @@ describe('schema v5: runner + legacy tmux-runner normalization', () => {
     expect(both.runner).toEqual(runner);
     expect(both.legacyRunnerTmux).toBeUndefined();
   });
+
+  test('status rendering: a legacy runner is "resumable" only when the run is', () => {
+    expect(renderRunDetail(baseRun({ status: 'done', legacyRunnerTmux: 'orc-wf-x' }))).toContain(
+      'runner:     legacy tmux runner (gone)',
+    );
+    expect(renderRunDetail(baseRun({ status: 'cancelled', legacyRunnerTmux: 'orc-wf-x' }))).not.toContain(
+      'resumable',
+    );
+    expect(renderRunDetail(baseRun({ status: 'orphaned', legacyRunnerTmux: 'orc-wf-x' }))).toContain(
+      'legacy tmux runner (gone; resumable)',
+    );
+  });
+
+  test('readRun never sees a torn record while a writer atomically rewrites it', async () => {
+    await writeRun(baseRun({ id: 'tr1' }));
+    let done = false;
+    const writer = (async () => {
+      for (let i = 0; i < 200; i++) await writeRun(baseRun({ id: 'tr1', name: i % 2 ? 'n' : 'n'.repeat(4_000) }));
+      done = true;
+    })();
+    let reads = 0;
+    let nulls = 0;
+    while (!done) {
+      reads++;
+      if ((await readRun('tr1')) === null) nulls++;
+    }
+    await writer;
+    expect(reads).toBeGreaterThan(50);
+    expect(nulls).toBe(0);
+  }, 20_000);
 
   test('lease startTime round-trips (pid-reuse guard)', () => {
     const lease = makeLease();
@@ -477,6 +509,87 @@ describe('assertRecoveryAllowed / stampRunner', () => {
 });
 
 // ───────────────────────────────────────────────────────────────────────────────────
+describe('owner fence: a different live owner is never overwritten', () => {
+  beforeEach(() => freshHome());
+  /** Another LIVE process (our parent: the shell running bun test). */
+  const other = (): ProcessIdentity => ({ pid: process.ppid, startTime: processStartTime(process.ppid) });
+
+  test('stored runner is another live process → LiveOwnerError (with or without our runner)', async () => {
+    expect(isSameProcessAlive(other())).toBe(true);
+    await writeRun(baseRun({ id: 'f1', runner: runnerOf(other(), 'f1'), lease: makeLease() }));
+    const before = fs.readFileSync(runPath('f1'), 'utf8');
+    await expect(
+      writeRunOwned(baseRun({ id: 'f1', runner: runnerOf(self(), 'f1'), lease: makeLease() })),
+    ).rejects.toBeInstanceOf(LiveOwnerError);
+    await expect(writeRunOwned(baseRun({ id: 'f1', lease: makeLease() }))).rejects.toBeInstanceOf(LiveOwnerError);
+    expect(fs.readFileSync(runPath('f1'), 'utf8')).toBe(before);
+  });
+
+  test('stored runner dead → the new owner may write', async () => {
+    await writeRun(baseRun({ id: 'f2', runner: runnerOf({ pid: DEAD_PID, startTime: null }, 'f2') }));
+    const w = await writeRunOwned(baseRun({ id: 'f2', runner: runnerOf(self(), 'f2'), lease: makeLease() }));
+    expect(w.runner?.pid).toBe(process.pid);
+  });
+
+  test('null start time on either side is a wildcard (pid match = same runner)', async () => {
+    const o = other();
+    await writeRun(baseRun({ id: 'f3', runner: runnerOf({ pid: o.pid, startTime: null }, 'f3') }));
+    await writeRunOwned(baseRun({ id: 'f3', runner: runnerOf(o, 'f3'), lease: makeLease() }));
+    await writeRun(baseRun({ id: 'f4', runner: runnerOf(o, 'f4') }));
+    await writeRunOwned(baseRun({ id: 'f4', runner: runnerOf({ pid: o.pid, startTime: null }, 'f4') }));
+    // stampRunner treats it as the runner already stamped → no write.
+    await writeRun(baseRun({ id: 'f5', status: 'failed', runner: runnerOf({ pid: DEAD_PID, startTime: null }, 'f5') }));
+    const rev = (await readRun('f5'))!.revision;
+    const same = await stampRunner('f5', runnerOf({ pid: DEAD_PID, startTime: 'proc:9' }, 'f5'));
+    expect(same.revision).toBe(rev);
+    expect(same.status).toBe('failed');
+  });
+
+  test('no stored runner: a LIVE lease with a different ownerId → LiveOwnerError', async () => {
+    const o = other();
+    const live = makeLease({ ownerId: 'A', pid: o.pid, startTime: o.startTime });
+    await writeRun(baseRun({ id: 'f6', lease: live }));
+    await expect(
+      writeRunOwned(baseRun({ id: 'f6', lease: makeLease({ ownerId: 'B' }) })),
+    ).rejects.toBeInstanceOf(LiveOwnerError);
+    await writeRunOwned(baseRun({ id: 'f6', lease: makeLease({ ownerId: 'A' }) })); // same owner
+    // Expired or dead-owner leases are no fence.
+    await writeRun(baseRun({ id: 'f7', lease: { ...live, expiresAt: new Date(Date.now() - 1).toISOString() } }));
+    await writeRunOwned(baseRun({ id: 'f7', lease: makeLease({ ownerId: 'B' }) }));
+    await writeRun(baseRun({ id: 'f8', lease: makeLease({ ownerId: 'A', pid: DEAD_PID }) }));
+    await writeRunOwned(baseRun({ id: 'f8', lease: makeLease({ ownerId: 'B' }) }));
+  });
+
+  test('in-process resume uses one owner id for the recovery stamp and the run', async () => {
+    let fail = true;
+    const exec: StepExecutor = async ({ step }) => ({ ...okResult(step.id), ok: !fail });
+    const first = await runWorkflow(oneStep, { runId: 'f9', execStep: exec });
+    expect(first.status).toBe('failed');
+    fail = false;
+    const { resumeWorkflow } = await import('../src/workflow.ts');
+    const resumed = await resumeWorkflow('f9', oneStep, { execStep: exec });
+    expect(resumed.status).toBe('done');
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────────────
+describe('awaitRunnerHandoff', () => {
+  beforeEach(() => freshHome());
+
+  test('true once stamped as this process; false without a record; false at timeout', async () => {
+    expect(await awaitRunnerHandoff('h0', { timeoutMs: 50 })).toBe(false); // no record
+    await writeRun(baseRun({ id: 'h1', lease: makeLease() }));
+    const t0 = Date.now();
+    expect(await awaitRunnerHandoff('h1', { timeoutMs: 120, pollMs: 10 })).toBe(false);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(100);
+    const waiting = awaitRunnerHandoff('h1', { timeoutMs: 3_000, pollMs: 10 });
+    await Bun.sleep(60);
+    await stampRunner('h1', runnerOf(self(), 'h1'));
+    expect(await waiting).toBe(true);
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────────────────
 describe('launch helpers (injected spawner): spawn first, then stamp (D7)', () => {
   beforeEach(() => freshHome());
 
@@ -524,7 +637,7 @@ describe('launch helpers (injected spawner): spawn first, then stamp (D7)', () =
     const before = fs.readFileSync(runPath('rs1'), 'utf8');
     const calls: Call[] = [];
     await expect(
-      launchDetachedRecovery('resume', 'rs1', '/abs/wf.ts', { spawn: failingSpawner(calls) }),
+      launchDetachedRecovery('resume', 'rs1', oneStep, '/abs/wf.ts', { spawn: failingSpawner(calls) }),
     ).rejects.toBeInstanceOf(RunnerSpawnError);
     expect(calls).toHaveLength(1);
     expect(fs.readFileSync(runPath('rs1'), 'utf8')).toBe(before);
@@ -533,7 +646,7 @@ describe('launch helpers (injected spawner): spawn first, then stamp (D7)', () =
   test('detached retry: argv carries --step and --runner; cancelled run reopened after spawn', async () => {
     await writeRun(baseRun({ id: 'rt1', status: 'cancelled', cancelledAt: 'x', finishedAt: 'x' }));
     const calls: Call[] = [];
-    const launch = await launchDetachedRecovery('retry', 'rt1', '/abs/wf.ts', {
+    const launch = await launchDetachedRecovery('retry', 'rt1', oneStep, '/abs/wf.ts', {
       spawn: fakeSpawner(calls),
       stepId: 'a',
     });
@@ -545,13 +658,28 @@ describe('launch helpers (injected spawner): spawn first, then stamp (D7)', () =
     expect(rec.runner?.pid).toBe(DEAD_PID);
   });
 
+  test('detached resume/retry with a mismatched definition is rejected before any spawn', async () => {
+    await writeRun(baseRun({ id: 'dg1', status: 'failed', definitionDigest: 'not-this-plan' }));
+    await writeRun(baseRun({ id: 'dg2', status: 'failed' }));
+    const before = fs.readFileSync(runPath('dg1'), 'utf8');
+    const calls: Call[] = [];
+    await expect(
+      launchDetachedRecovery('resume', 'dg1', oneStep, '/abs/wf.ts', { spawn: fakeSpawner(calls) }),
+    ).rejects.toThrow(/digest mismatch/);
+    await expect(
+      launchDetachedRecovery('retry', 'dg2', oneStep, '/abs/wf.ts', { spawn: fakeSpawner(calls), stepId: 'zz' }),
+    ).rejects.toThrow(/no step 'zz'/);
+    expect(calls).toHaveLength(0);
+    expect(fs.readFileSync(runPath('dg1'), 'utf8')).toBe(before);
+  });
+
   test('detached resume/retry on a done run is rejected before any spawn', async () => {
     await writeRun(baseRun({ id: 'dn1', status: 'done' }));
     const before = fs.readFileSync(runPath('dn1'), 'utf8');
     for (const action of ['resume', 'retry'] as const) {
       const calls: Call[] = [];
       await expect(
-        launchDetachedRecovery(action, 'dn1', '/abs/wf.ts', { spawn: fakeSpawner(calls) }),
+        launchDetachedRecovery(action, 'dn1', oneStep, '/abs/wf.ts', { spawn: fakeSpawner(calls) }),
       ).rejects.toBeInstanceOf(FinalizedRunError);
       expect(calls).toHaveLength(0);
     }
@@ -563,10 +691,10 @@ describe('launch helpers (injected spawner): spawn first, then stamp (D7)', () =
     await writeRun(baseRun({ id: 'cn1', status: 'cancelled' }));
     const calls: Call[] = [];
     await expect(
-      launchDetachedRecovery('resume', 'lv1', '/abs/wf.ts', { spawn: fakeSpawner(calls) }),
+      launchDetachedRecovery('resume', 'lv1', oneStep, '/abs/wf.ts', { spawn: fakeSpawner(calls) }),
     ).rejects.toBeInstanceOf(LiveOwnerError);
     await expect(
-      launchDetachedRecovery('resume', 'cn1', '/abs/wf.ts', { spawn: fakeSpawner(calls) }),
+      launchDetachedRecovery('resume', 'cn1', oneStep, '/abs/wf.ts', { spawn: fakeSpawner(calls) }),
     ).rejects.toThrow(/cancelled/);
     expect(calls).toHaveLength(0);
   });
@@ -648,6 +776,19 @@ describe('daemon detached routes (injected spawner)', () => {
     expect(JSON.stringify(view)).not.toContain('runnerTmux');
   });
 
+  test('POST /workflows/run {detach}: a post-validation failure (stamp race) → 500, not 400', async () => {
+    const call = start((argv) => {
+      // The run is finalized underneath the launcher before it can stamp the runner.
+      const runId = argv[argv.indexOf('--run-id') + 1]!;
+      const rec = JSON.parse(fs.readFileSync(runPath(runId), 'utf8'));
+      fs.writeFileSync(runPath(runId), JSON.stringify({ ...rec, status: 'done' }));
+      return { pid: DEAD_PID, startTime: null };
+    });
+    const res = await call('/workflows/run', { detach: true, file: POLICY_FAIL_WF });
+    expect(res.status).toBe(500);
+    expect(((await res.json()) as { error: string }).error).toMatch(/finalized \(done\)/);
+  });
+
   test('POST /workflows/run {detach}: spawn failure → 500 and the run is finalized failed', async () => {
     const call = start(() => {
       throw new Error('nope');
@@ -703,6 +844,56 @@ describe('real detached runner processes', () => {
       expect(disk.revision).toBe(cancelled.revision);
     },
     20_000,
+  );
+
+  test(
+    'SIGSTOP past the lease, superseded by a new runner, SIGCONT: the stale runner cannot overwrite it',
+    async () => {
+      const leaseMs = 400;
+      const r1 = await startBlockingRunner('ss1', leaseMs);
+      process.kill(r1.pid, 'SIGSTOP');
+      try {
+        await waitFor(
+          async () => (await reconcileRun((await readRun('ss1'))!)).status === 'orphaned',
+          5_000,
+          'stopped R1 orphaned after lease expiry',
+        );
+        expect(isSameProcessAlive(r1)).toBe(true); // stopped, not dead
+        const stamped = await stampRunner('ss1', runnerOf(self(), 'ss1')); // R2 takes over
+        expect(stamped.status).toBe('running');
+      } finally {
+        process.kill(r1.pid, 'SIGCONT');
+      }
+      // R1's next heartbeat hits the owner fence → it stops writing and exits.
+      await waitFor(() => !isPidAlive(r1.pid), 5_000, 'superseded R1 exits');
+      const disk = (await readRun('ss1'))!;
+      expect(disk.status).toBe('running');
+      expect(disk.runner?.pid).toBe(process.pid);
+      expect(disk.lease?.pid).toBe(process.pid);
+      expect(fs.readFileSync(runnerLogPath('ss1'), 'utf8')).toContain('exit finished running');
+    },
+    20_000,
+  );
+
+  test(
+    'trapRunnerTermination.dispose() clears the force-exit backstop',
+    async () => {
+      const mod = path.resolve(import.meta.dir, '..', 'src', 'workflow-runner.ts');
+      const script = [
+        `import { trapRunnerTermination } from ${JSON.stringify(mod)};`,
+        `const t = trapRunnerTermination({ forceExitMs: 100 });`,
+        `process.kill(process.pid, 'SIGTERM');`,
+        `while (!t.signal.aborted) await Bun.sleep(5);`,
+        `t.dispose();`,
+        `await Bun.sleep(400);`,
+        `console.log('alive');`,
+      ].join('\n');
+      const p = Bun.spawn([process.execPath, '-e', script], { stdout: 'pipe', stderr: 'pipe' });
+      const [out, code] = await Promise.all([new Response(p.stdout).text(), p.exited]);
+      expect(code).toBe(0);
+      expect(out).toContain('alive');
+    },
+    10_000,
   );
 
   test(

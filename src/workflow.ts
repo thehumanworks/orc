@@ -1282,11 +1282,7 @@ async function runWorkflowOwned(
         run = await writeRunOwned(run);
         emit({ type: 'lease-heartbeat', runId, expiresAt: run.lease!.expiresAt, ownerId });
       } catch (e) {
-        if (e instanceof FinalizedRunError) {
-          cancelled = true;
-          stopNewLaunches = true;
-          return;
-        }
+        if (onWriteRefused(e)) return;
         throw e;
       }
     });
@@ -1398,13 +1394,27 @@ async function runWorkflowOwned(
       run = await writeRunOwned(run);
       return true;
     } catch (e) {
-      if (e instanceof FinalizedRunError) {
-        cancelled = true;
-        stopNewLaunches = true;
-        return false;
-      }
+      if (onWriteRefused(e)) return false;
       throw e;
     }
+  };
+
+  /**
+   * A write was refused. Finalized/cancelled → stop like a cancel. Another LIVE owner
+   * holds the record (we were superseded, e.g. resumed elsewhere while we were stopped
+   * past our lease) → step aside exactly like an abort: no further writes, return now.
+   */
+  const onWriteRefused = (e: unknown): boolean => {
+    if (e instanceof LiveOwnerError) {
+      stopRunner();
+      return true;
+    }
+    if (e instanceof FinalizedRunError) {
+      cancelled = true;
+      stopNewLaunches = true;
+      return true;
+    }
+    return false;
   };
 
   // ── Lease heartbeat (D1): renew on a timer through the serialized write path so a
@@ -1427,10 +1437,11 @@ async function runWorkflowOwned(
       }
       if (cancelled) stopHeartbeat();
     });
+  // Deliberately NOT unref'd: an owning runner stays alive while it owns the record; the
+  // interval is cleared on every exit path (stopHeartbeat / releaseLifecycle).
   life.heartbeat = setInterval(() => {
     void heartbeat();
   }, heartbeatMs);
-  (life.heartbeat as { unref?: () => void }).unref?.();
 
   // ── Abort (D5): stop launching, stop heartbeating, never write again, return promptly.
   let aborted = false;
@@ -1438,14 +1449,15 @@ async function runWorkflowOwned(
   const abortWake = new Promise<void>((resolve) => {
     wakeOnAbort = resolve;
   });
+  const stopRunner = () => {
+    aborted = true;
+    cancelled = true;
+    stopNewLaunches = true;
+    stopHeartbeat();
+    wakeOnAbort();
+  };
   if (opts.signal) {
-    const onAbort = () => {
-      aborted = true;
-      cancelled = true;
-      stopNewLaunches = true;
-      stopHeartbeat();
-      wakeOnAbort();
-    };
+    const onAbort = () => stopRunner();
     opts.signal.addEventListener('abort', onAbort, { once: true });
     life.disposers.push(() => opts.signal?.removeEventListener('abort', onAbort));
     if (opts.signal.aborted) onAbort();
@@ -1546,11 +1558,7 @@ async function runWorkflowOwned(
         await safeWriteOwned();
       });
     } catch (e) {
-      if (e instanceof FinalizedRunError) {
-        cancelled = true;
-        stopNewLaunches = true;
-        return;
-      }
+      if (onWriteRefused(e)) return;
       const msg = (e as Error).message;
       result = {
         id: rawStep.id,
@@ -1661,9 +1669,10 @@ async function runWorkflowOwned(
   }
 
   if (aborted) {
-    // Terminated (SIGTERM after cancel, or a plain kill): let an in-progress write land,
-    // then stop WITHOUT writing — a cancelled/finalized status stays as written; a
-    // still-`running` record reconciles to orphaned once this process is gone.
+    // Terminated (SIGTERM after cancel, or a plain kill) or superseded by another live
+    // owner: let an in-progress write land, then stop WITHOUT writing — a
+    // cancelled/finalized status or the new owner's record stays as written; a
+    // still-`running` record of ours reconciles to orphaned once this process is gone.
     stopHeartbeat();
     await persistChain;
     return (await readRun(runId)) ?? run;
@@ -1694,7 +1703,7 @@ async function runWorkflowOwned(
     try {
       run = await writeRunOwned(run);
     } catch (e) {
-      if (!(e instanceof FinalizedRunError)) throw e;
+      if (!(e instanceof FinalizedRunError || e instanceof LiveOwnerError)) throw e;
       const again = await readRun(runId);
       if (again) {
         emit({ type: 'run-done', runId, status: again.status, run: again });
@@ -1719,8 +1728,9 @@ async function runWorkflowOwned(
   try {
     run = await writeRunOwned(run);
   } catch (e) {
-    // Cancelled concurrently (after the last loop check): the cancel stands.
-    if (!(e instanceof FinalizedRunError)) throw e;
+    // Cancelled concurrently (after the last loop check) or superseded by another live
+    // owner: their record stands.
+    if (!(e instanceof FinalizedRunError || e instanceof LiveOwnerError)) throw e;
     const disk = await readRun(runId);
     if (!disk) throw e;
     emit({ type: 'run-done', runId, status: disk.status, run: disk });
@@ -1868,6 +1878,22 @@ export async function loadWorkflowFile(file: string): Promise<{ def: WorkflowDef
   return { def: mod.default, absPath };
 }
 
+/**
+ * Definition preconditions shared by resume/retry and their detached launchers: the
+ * definition must match the run's persisted plan digest (and supply any function `done`
+ * predicates), and a retry `stepId` must exist. Throws; nothing is written.
+ */
+export function assertRecoveryDefinition(
+  existing: WorkflowRun,
+  def: WorkflowDef,
+  opts?: { stepId?: string; sourcePath?: string },
+): void {
+  assertDigestMatches(existing, def, opts?.sourcePath ?? existing.sourcePath ?? existing.workflowSourcePath);
+  if (opts?.stepId && !def.steps.some((s) => s.id === opts.stepId)) {
+    throw new Error(`run '${existing.id}' has no step '${opts.stepId}'`);
+  }
+}
+
 function assertDigestMatches(existing: WorkflowRun, def: WorkflowDef, sourcePath?: string): void {
   // A run-time/CLI override is persisted in the original plan and intentionally
   // need not be repeated in the source definition on resume or retry.
@@ -1915,9 +1941,11 @@ export async function resumeWorkflow(
   const sourcePath =
     opts.workflowSourcePath ?? opts.sourcePath ?? existing.sourcePath ?? existing.workflowSourcePath;
   assertDigestMatches(existing, def, sourcePath);
+  // One owner id for the recovery stamp AND the run, so the owner fence sees one owner.
+  const ownerId = opts.ownerId ?? randomUUID().slice(0, 8);
   if (existing.status === 'failed' || existing.status === 'orphaned') {
     existing = await beginRunRecovery(runId, {
-      ownerId: opts.ownerId,
+      ownerId,
       leaseMs: opts.leaseMs,
       runner: opts.runner,
       reason: 'resume',
@@ -1934,7 +1962,7 @@ export async function resumeWorkflow(
     runner: opts.runner,
     signal: opts.signal,
     leaseMs: opts.leaseMs,
-    ownerId: opts.ownerId,
+    ownerId,
     rootRunId: existing.rootRunId ?? existing.id,
     parentRunId: existing.parentRunId,
   });
@@ -1955,13 +1983,14 @@ export async function retryWorkflow(
     const found = def.steps.some((s) => s.id === opts.stepId);
     if (!found) throw new Error(`run '${runId}' has no step '${opts.stepId}'`);
   }
+  const ownerId = opts.ownerId ?? randomUUID().slice(0, 8);
   if (
     existing.status === 'failed' ||
     existing.status === 'orphaned' ||
     existing.status === 'cancelled'
   ) {
     existing = await beginRunRecovery(runId, {
-      ownerId: opts.ownerId,
+      ownerId,
       leaseMs: opts.leaseMs,
       runner: opts.runner,
       reason: 'retry',
@@ -1979,7 +2008,7 @@ export async function retryWorkflow(
     runner: opts.runner,
     signal: opts.signal,
     leaseMs: opts.leaseMs,
-    ownerId: opts.ownerId,
+    ownerId,
     rootRunId: existing.rootRunId ?? existing.id,
     parentRunId: existing.parentRunId,
   });

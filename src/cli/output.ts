@@ -208,7 +208,11 @@ export function renderRunDetail(run: WorkflowRun): string {
     run.runner
       ? `runner:     pid=${run.runner.pid} started=${run.runner.startedAt} log=${run.runner.logPath}`
       : run.legacyRunnerTmux
-        ? `runner:     legacy tmux runner (gone; resumable)`
+        ? `runner:     legacy tmux runner (gone${
+            run.status === 'running' || run.status === 'orphaned' || run.status === 'failed'
+              ? '; resumable'
+              : ''
+          })`
         : null,
     `steps:      ${run.steps.length}`,
     run.attempts?.length ? `attempts:   ${run.attempts.length}` : null,
