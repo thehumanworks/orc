@@ -78,7 +78,7 @@ export interface FakeScript {
    * outlives its actor). Default: exit immediately on EOF.
    */
   ignoreStdinEofMs?: number;
-  /** Provider session id for a FRESH start (default `fake-<uuid>`, codex-like server-assigned). */
+  /** Provider session id for a FRESH start (default `fake-<uuid>`, a server-assigned-style id). */
   providerSessionId?: string;
   rules?: FakeRule[];
   /** Behaviour when no rule matches. Default `{ action: 'reply' }`. */
@@ -236,7 +236,7 @@ export const fakeRuntimeFactory: ProviderRuntimeFactory = {
       },
     );
     launch.onSpawn?.({ pid: proc.pid, startTime: processStartTime(proc.pid) });
-    // Simulated start handshake (claude/codex take seconds between spawn and ready).
+    // Simulated start handshake (claude takes seconds between spawn and ready).
     if (script.startDelayMs) await Bun.sleep(script.startDelayMs);
     return new FakeRuntime(proc, launch.rawLogPath);
   },

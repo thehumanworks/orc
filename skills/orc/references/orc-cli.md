@@ -29,12 +29,16 @@ Conventions:
 | `orc attach <sel>` | — | 0 when the session stops/suspends or Ctrl-C; 1 no runtime state | `{id, command, journalPath}` (no follow) |
 | `orc kill <sel>` | `--worktree`, `--purge` | 0 / 1 | `{ok, id, purged}` |
 | `orc resume <sel>` | — | 0 / 1 | same as `state --json` |
-| `orc takeover <sel>` | — | 0 / 1 | `{id, cwd, command}` |
+| `orc takeover <sel>` | — | 0 / 1 | `{id, cwd, command, note?}` |
 | `orc prune` | `--worktree`, `--suspended` | 0 / 1 | `{ok, pruned: [ids]}` |
+| `orc login chatgpt` | `--import-pi`, `--no-browser` | 0 / 1 | — (Sign in with ChatGPT for codex; stored in `~/.orc/auth/chatgpt.json`) |
+| `orc login status` | — | 0 | `{active: orc\|pi\|env\|none, orc, pi, openaiApiKey}` (no secrets) |
+| `orc logout chatgpt` | — | 0 | — (orc's credential only; pi's login is untouched) |
 
 ### spawn options
 
-- `--provider, -p claude|codex|pi` (required); `--model, -m <name>`
+- `--provider, -p claude|codex|pi` (required); `--model, -m <name>` (codex without it: the first
+  model the account lists — `spawn` prints/records it)
 - `--agent <name>` — named agent definition (exclusive with `--system-prompt`)
 - `--alias <name>` — workspace-scoped handle; never changes agent behaviour
 - `--system-prompt <txt>`, `--system-prompt-mode append|replace` (default append)
@@ -93,7 +97,9 @@ last state and exits 1. After 3 consecutive failed starts a session is no longer
 - `attach`: follows the journal as text until the session stops/suspends or Ctrl-C. Read-only
   (`--read-only` is accepted and ignored).
 - `takeover`: stops the actor (sticky), waits for the provider to exit, prints
-  `cd <cwd> && <provider resume command>` and `# hand it back with: orc resume <id>`.
+  `cd <cwd> && <provider resume command>` and `# hand it back with: orc resume <id>`. codex:
+  `pi --session <~/.orc/sessions/<sid>/codex-session.jsonl>` plus a note that pi needs its own
+  OpenAI login.
 - `kill`: sticky stop; drops queued messages; keeps the record and journal (`read` still works).
   `--purge` removes the record and session dir; `--worktree` removes the worktree (not the branch).
 - `prune`: removes `dead` records and their session dirs. Keeps `running`; keeps `suspended` unless
@@ -132,16 +138,18 @@ last state and exits 1. After 3 consecutive failed starts a session is no longer
 - **claude**: native `--agent` — `./.claude/agents/<name>.md` then `~/.claude/agents/<name>.md`
 - **codex**: `./.codex/agents/*.toml` by `name` → `$CODEX_HOME/agents/*.toml` →
   `./.codex/prompts/<name>.md` → `$CODEX_HOME/prompts/<name>.md` → the claude locations; the body
-  becomes `developerInstructions` (a TOML `model` applies when `--model` is omitted)
+  is appended to the harness's system prompt (a TOML `model` applies when `--model` is omitted)
 - **pi**: the claude locations; the body becomes the appended system prompt
 
 ## Providers
 
-All sessions run in yolo mode: claude `--permission-mode bypassPermissions`; codex
-`approvalPolicy: never` + `sandbox: danger-full-access`; pi `-a`. System prompts go through an
+All sessions run in yolo mode: claude `--permission-mode bypassPermissions`; pi `-a`; codex is
+orc's built-in harness (pi-ai + pi-agent-core → OpenAI Responses API) with no approvals and the
+tools `read`/`write`/`edit`/`bash`/`ls`. codex credentials, first match wins: `orc login chatgpt`,
+pi's ChatGPT login (`~/.pi/agent/auth.json`), `OPENAI_API_KEY`. System prompts go through an
 orc-owned file, never argv or the worktree. Slash commands: claude `/compact` and `/goal <condition>`
-work through `orc send` (verified, claude 2.1.300); pickers and `/login` don't; codex/pi
-unverified.
+work through `orc send` (verified, claude 2.1.300); pickers and `/login` don't; pi unverified;
+codex has none (sent as text).
 
 ## Daemon & remote hosts
 

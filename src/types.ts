@@ -120,8 +120,8 @@ export interface SessionRecord extends ExecutionLineage {
   /** `actor` for every session launched on the tmux-free runtime. */
   runtime?: 'actor';
   /**
-   * Provider-side session id (claude/pi: equals sessionId; codex: the server-assigned
-   * thread id), learned from the kernel once the provider is ready.
+   * Provider-side session id (claude/pi/codex harness: equals sessionId), learned from the
+   * kernel once the provider is ready.
    */
   providerSessionId?: string;
   provider: Provider;

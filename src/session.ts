@@ -327,8 +327,8 @@ export class Session {
 
   /**
    * Wait until the provider reported ready (`provider.ready` after the latest actor
-   * start) and return what that entry says (provider session id — codex: its thread id —
-   * and transcript path). Throws — with the journal error and the actor.log tail — when
+   * start) and return what that entry says (provider session id, transcript path and the
+   * model the provider reported). Throws — with the journal error and the actor.log tail — when
    * the actor stops or dies first, or on timeout.
    */
   async awaitReady(timeoutMs = DEFAULT_READY_TIMEOUT_MS): Promise<ProviderReadyInfo> {

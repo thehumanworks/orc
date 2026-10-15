@@ -51,11 +51,12 @@ export interface SpawnSpec {
   /** Provider-specific per-session dir (pi --session-dir). */
   sessionDir?: string;
   /**
-   * Provider-side session id once known (codex: server-assigned thread id; claude/pi:
-   * equals sessionId). Persisted so resume works from any client.
+   * Provider-side session id once known (claude/pi/codex harness: equals sessionId; a
+   * session from the removed codex app-server runtime holds its codex thread id). Persisted
+   * so resume works from any client.
    */
   providerSessionId?: string;
-  /** Provider-side transcript path once known (codex: thread.path). */
+  /** Provider-side transcript path once known (codex: the harness's codex-session.jsonl). */
   transcriptPath?: string;
   /** For `fake` only: the scripted behaviour (see src/runtime/providers/fake.ts). */
   fakeScript?: unknown;
@@ -254,7 +255,7 @@ export interface ActorStateFile {
   providerSessionId?: string;
   /** Highest journal seq the actor has written. */
   lastSeq: number;
-  /** Number of turns that reached turn.completed (resume needs >= 1 for codex). */
+  /** Number of turns that reached turn.completed. */
   completedTurns: number;
   stopReason?: string;
   /**

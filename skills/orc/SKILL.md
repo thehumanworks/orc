@@ -31,8 +31,10 @@ diversity-sensitive. If the coordination overhead would exceed the task's value 
 one-line change, a quick lookup — just do it directly (or hand it to a single subagent). Match the
 machinery to the task.
 
-`orc` runs real coding-agent CLIs (`claude`, `codex`, `pi`) as **durable, detached sessions**: one
-actor process per session drives the CLI over its structured protocol and journals everything. A
+`orc` runs real coding agents (`claude`, `codex`, `pi`) as **durable, detached sessions**: one
+actor process per session drives the provider over a structured protocol and journals everything
+(`codex` is orc's built-in harness on the OpenAI Responses API; it needs `orc login chatgpt`, pi's
+ChatGPT login, or `OPENAI_API_KEY` — check with `orc login status`). A
 subagent's work is never opaque — you (or the user) can read its transcript or follow its journal
 at any time — and sessions outlive this one. Exact flags, exit codes and JSON shapes:
 **`references/orc-cli.md`**. The essentials:
@@ -166,8 +168,8 @@ whole point of orc over headless one-shots:
   then the turn completes (`orc wait` returns). Good for "keep fixing failures until the suite is
   green". Still verify the condition yourself.
 - Slash commands reach the provider as the message text. Only claude's `/compact` and `/goal` are
-  verified; interactive pickers and `/login` don't work, and codex/pi slash commands are unverified
-  (assume they arrive as plain text).
+  verified; interactive pickers and `/login` don't work, pi slash commands are unverified, and the
+  codex harness has none (assume they arrive as plain text).
 - A stuck subagent (no progress across several reads, repeated failed turns, or `waiting`) is a steer
   signal: nudge it, give it the missing context, or kill it and respawn with a sharper prompt. Don't
   let it spin.

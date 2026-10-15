@@ -1,6 +1,7 @@
 /**
  * On-disk layout of one session's runtime state (see the header of ./types.ts).
- * The session dir may also hold unrelated orc sidecars (e.g. codex instructions.md).
+ * The session dir may also hold orc sidecars (system-prompt.md; the codex harness's
+ * codex-session.jsonl and provider.stderr.log).
  */
 import path from 'node:path';
 import { sessionStateDir } from '../paths.ts';

@@ -1,8 +1,9 @@
 # orc — Architecture
 
-orc runs coding-agent CLIs (`claude`, `codex`, `pi`) as durable sessions for other agents to drive.
-Each session is a small **actor process** that drives its provider CLI over the provider's
-**structured protocol** and records every fact in a **journal**. There is no terminal and no
+orc runs coding agents (`claude`, `codex`, `pi`) as durable sessions for other agents to drive.
+Each session is a small **actor process** that drives its provider over a **structured
+protocol** and records every fact in a **journal**. claude and pi are their own CLIs; codex is
+orc's built-in harness (pi-ai + pi-agent-core on the OpenAI Responses API). There is no terminal and no
 screen scraping. Agents hold the reins; humans observe (`read`, `attach`) or take over
 (`takeover` → `resume`).
 
@@ -14,9 +15,11 @@ historical (tmux-era) research log.
 ## Stack
 
 - Bun (TypeScript, ESM), `engines.bun >= 1.3`. Ships from source or as one binary
-  (`bun build --compile`). No runtime dependencies: `Bun.spawn` pipes, `node:fs`, `util.parseArgs`.
-- The only external executables are the provider CLIs (plus `git` for worktrees and `tailscale`
-  for the daemon).
+  (`bun build --compile`). The kernel uses `Bun.spawn` pipes, `node:fs`, `util.parseArgs`. The only
+  runtime dependencies, for the codex harness, are `@earendil-works/pi-ai` and
+  `@earendil-works/pi-agent-core`, pinned to exactly 1.2.0.
+- The only external executables are the claude and pi CLIs (plus `git` for worktrees and
+  `tailscale` for the daemon). codex needs none: the harness is this binary re-executed.
 - macOS and Linux. Process identity is pid + start time (Linux `/proc/<pid>/stat`, macOS
   `ps -o lstart=`), so a reused pid is never mistaken for a live process.
 
@@ -32,7 +35,10 @@ historical (tmux-era) research log.
  orc __actor <sid>   (one per session: lease, inbox loop, journal writer)
    │  stdin/stdout pipes, own process group
    ▼
- claude -p --input-format stream-json … | codex app-server | pi --mode rpc
+ claude -p --input-format stream-json … | orc __codex-harness <sid> | pi --mode rpc
+                                           │ HTTPS (Responses API)
+                                           ▼
+                                  api.openai.com/v1/responses
 ```
 
 - Clients never talk to the actor directly. They write `spawn.json`/`state.json` under the
@@ -102,7 +108,7 @@ waits for `ready`.
 
 ## Provider runtimes (`src/runtime/providers/`)
 
-`ProviderRuntimeFactory.start(launch)` spawns the CLI (detached, pipes) and returns a
+`ProviderRuntimeFactory.start(launch)` spawns the provider process (detached, pipes) and returns a
 `ProviderRuntime`: `send(messageId, text)`, `interrupt()`, `close({graceMs})`, and one async stream
 of normalized events (`ready`, `turn.started`, `assistant.text`, `turn.completed|failed|interrupted`,
 `interrupt.acked`, `permission.requested`, `exited`). Outcomes come from protocol events, never exit
@@ -110,16 +116,21 @@ codes. Each runtime appends its raw protocol lines to `provider.jsonl`.
 
 | | claude | codex | pi |
 | --- | --- | --- | --- |
-| process | `claude -p --input-format stream-json --output-format stream-json --verbose --replay-user-messages --permission-mode bypassPermissions --setting-sources user,project,local` | `codex app-server`; `thread/start` with `approvalPolicy: never`, `sandbox: danger-full-access` | `pi --mode rpc -a` |
-| fresh / resume | `--session-id <sid>` / `--resume <sid>` | `thread/start` / `thread/resume` (needs ≥ 1 completed turn) | same flags both ways: `--session-id` + `--session-dir` |
-| system prompt | `--append-system-prompt-file` / `--system-prompt-file` | `developerInstructions` / `baseInstructions` | `--append-system-prompt` / `--system-prompt` `<file>` |
-| ready | `initialize` control response | thread start/resume response | `get_state` response |
-| ack | `command_lifecycle started` (fallback: replayed user echo) | `turn/start` response | `prompt` response |
-| outcome | `result` (`terminal_reason` / `is_error`) | `turn/completed` status | `agent_settled` |
-| interrupt | `control_request interrupt` | `turn/interrupt` | `abort` |
-| verified | 2.1.300 | 0.162.1 | 1.2.0 |
+| process | `claude -p --input-format stream-json --output-format stream-json --verbose --replay-user-messages --permission-mode bypassPermissions --setting-sources user,project,local` | `orc __codex-harness <sid>` (the running orc build); JSONL `init` line carries the spec | `pi --mode rpc -a` |
+| fresh / resume | `--session-id <sid>` / `--resume <sid>` | new / replayed `~/.orc/sessions/<sid>/codex-session.jsonl` (pi session format v3) | same flags both ways: `--session-id` + `--session-dir` |
+| system prompt | `--append-system-prompt-file` / `--system-prompt-file` | harness prompt + file / the file alone | `--append-system-prompt` / `--system-prompt` `<file>` |
+| ready | `initialize` control response | `ready` (credential resolved, model chosen, session loaded) | `get_state` response |
+| ack | `command_lifecycle started` (fallback: replayed user echo) | `turn.started` (prompt accepted) | `prompt` response |
+| outcome | `result` (`terminal_reason` / `is_error`) | pi-agent-core `agent_end`: last assistant `stopReason` | `agent_settled` |
+| interrupt | `control_request interrupt` | `abort` → AbortSignal on the request and tools | `abort` |
+| verified | 2.1.300 | pi-ai / pi-agent-core 1.2.0 (offline; live run pending) | 1.2.0 |
 
-Wire types are vendored and version-pinned (`*-protocol.ts`); contract tests pin each mapping.
+Wire types are vendored and version-pinned (`*-protocol.ts`, `src/codex/protocol.ts`); contract
+tests pin each mapping. The codex harness (`src/codex/`): credentials (`auth.ts`: orc store →
+pi's `auth.json` → `OPENAI_API_KEY`; refreshes written back to their source), model choice
+(`models.ts`: `--model` → session model → first model the account lists), tools (`tools.ts`:
+read/write/edit/bash/ls), the pi-format session file (`session-file.ts`), `orc login`
+(`login.ts`), and an offline `--self-test` for compiled binaries.
 claude strips inherited `CLAUDE_CODE_*` variables except auth/backend settings
 (`ORC_CLAUDE_KEEP_ENV` adds more). Permission requests in yolo mode are journaled, then denied.
 
@@ -146,8 +157,9 @@ claude strips inherited `CLAUDE_CODE_*` variables except auth/backend settings
   the kernel. Pre-actor records normalise to `dead` + `legacy: 'tmux'` (readable, never controlled).
 - **Workspaces and aliases**: workspace = explicit key, else git toplevel, else realpath(cwd);
   `@alias` resolves among active (running/suspended) records of a workspace.
-- **Transcripts** (`provider-cli.ts`): claude `~/.claude/projects/*/<id>.jsonl`; codex `thread.path`;
-  pi `get_state.sessionFile` or `<sessionDir>/*_<id>.jsonl`. `orc read` falls back to the journal
+- **Transcripts** (`provider-cli.ts`): claude `~/.claude/projects/*/<id>.jsonl`; codex
+  `~/.orc/sessions/<sid>/codex-session.jsonl` (parsed with the pi parser); pi
+  `get_state.sessionFile` or `<sessionDir>/*_<id>.jsonl`. `orc read` falls back to the journal
   when none exists yet.
 
 ## CLI and daemon

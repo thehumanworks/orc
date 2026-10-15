@@ -1,9 +1,10 @@
 # orc
 
-`orc` runs coding-agent CLIs (`claude`, `codex`, `pi`) as durable, detached sessions that other
+`orc` runs coding agents (`claude`, `codex`, `pi`) as durable, detached sessions that other
 agents (and humans) drive. Its core primitive, `agent()`, starts one **actor process per session**
-that drives the provider CLI over its **structured protocol** (no terminal, no screen scraping),
-optionally in a fresh git worktree, in yolo mode by default.
+that drives the provider over a **structured protocol** (no terminal, no screen scraping),
+optionally in a fresh git worktree, in yolo mode by default. `claude` and `pi` are their own CLIs;
+`codex` is orc's **built-in harness** on the OpenAI Responses API (no codex CLI needed).
 
 - **Durable.** Each session has a mailbox (`inbox/`) and an append-only journal. Prompts survive an
   actor crash or a reboot; the next `orc send` (or `orc resume`) wakes the session.
@@ -20,7 +21,7 @@ Design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (the current system) and
 | --- | --- |
 | [Bun](https://bun.sh) | ≥ 1.3 (`engines.bun`); developed on 1.4.2 |
 | OS | macOS or Linux (POSIX process groups; macOS also needs `ps`). No Windows. |
-| provider CLI on `PATH` | at least one of `claude`, `codex`, `pi`, authenticated. Verified: claude 2.1.300, codex-cli 0.162.1, pi 1.2.0 (other versions are not refused). |
+| a provider | at least one of: `claude` or `pi` on `PATH`, authenticated (verified: claude 2.1.300, pi 1.2.0; other versions are not refused); for `codex`, an OpenAI credential — `orc login chatgpt`, pi's ChatGPT login, or `OPENAI_API_KEY` (see [codex](#codex-built-in-harness)) |
 | `git` | only for `--worktree` |
 | `tailscale` | only for `orc daemon` / `--host` |
 
@@ -95,6 +96,9 @@ orc prune  [--worktree] [--suspended]               Drop dead records (+ session
 orc workflow <run|list|status|attach|logs|resume|retry|cancel|cleanup> ...   (alias: wf)
 orc daemon [--port 8787] [--bind <ip>] [--insecure] Serve the HTTP API over tailscale
 orc remote <add|list|rm> <host> [--port P]          Manage trusted peers
+orc login  chatgpt [--import-pi] [--no-browser]     Sign in with ChatGPT (codex)
+orc login  status [--json]                          Which OpenAI credential codex uses
+orc logout chatgpt                                  Remove orc's ChatGPT credential
 orc --host <h> <command>                            Run a command against a peer's daemon
 ```
 
@@ -106,7 +110,7 @@ orc --host <h> <command>                            Run a command against a peer
 | flag | meaning |
 | --- | --- |
 | `--provider, -p` | `claude` \| `codex` \| `pi` (required) |
-| `--model, -m` | model name |
+| `--model, -m` | model name (codex without it: the first model your account lists, recorded on the session) |
 | `--agent <name>` | named agent definition (exclusive with `--system-prompt`) |
 | `--alias <name>` | workspace-scoped handle (`@name`); does not change agent behaviour |
 | `--system-prompt <txt>`, `--system-prompt-mode` | system prompt; `append` (default) \| `replace` |
@@ -131,7 +135,7 @@ dir, and removes a `--worktree` it created.
 | `attach` | 0 when the session stops/suspends or on Ctrl-C; 1 if it has no runtime state | `{id, command, journalPath}` (does not follow) |
 | `kill` | 0 / 1 | `{ok, id, purged}` |
 | `resume` | 0 / 1 | same shape as `state --json` |
-| `takeover` | 0 / 1 | `{id, cwd, command}` |
+| `takeover` | 0 / 1 | `{id, cwd, command, note?}` |
 | `prune` | 0 / 1 | `{ok, pruned: [ids]}` |
 | `workflow run` | 0 run `done`; 1 otherwise; 143 runner got SIGTERM | final `WorkflowRun`; `--detach`: `{runId, logPath}` |
 
@@ -189,23 +193,24 @@ await s.kill({ removeWorktree: true });
 
 | | claude | codex | pi |
 | --- | --- | --- | --- |
-| protocol | `claude -p` stream-json over stdio | `codex app-server` (JSON-RPC 2.0, stdio) | `pi --mode rpc` |
-| yolo | `--permission-mode bypassPermissions` | thread `approvalPolicy: never`, `sandbox: danger-full-access` | `-a` |
-| system prompt | `--append-system-prompt-file` / `--system-prompt-file` | `developerInstructions` (append) / `baseInstructions` (replace), over stdio | `--append-system-prompt` / `--system-prompt` `<file>` |
+| protocol | `claude -p` stream-json over stdio | orc's harness (`orc __codex-harness`, JSONL over stdio) → OpenAI Responses API | `pi --mode rpc` |
+| yolo | `--permission-mode bypassPermissions` | always (no approvals; tools run unattended) | `-a` |
+| system prompt | `--append-system-prompt-file` / `--system-prompt-file` | harness prompt + file (append) / the file alone (replace) | `--append-system-prompt` / `--system-prompt` `<file>` |
 | `--agent` | native `--agent <name>` | resolved body → system prompt | resolved body → system prompt |
-| transcript (`orc read`) | `~/.claude/projects/*/<id>.jsonl` | the thread's rollout file | `~/.orc/transcripts/pi/<sid>/` |
-| `orc takeover` prints | `claude --resume <id> …` | `codex resume <thread-id>` | `pi … --session-id … --session-dir …` |
-| binary | `ORC_CLAUDE_BIN` or `PATH` | `ORC_CODEX_BIN` or `PATH` | `PATH` |
+| transcript (`orc read`) | `~/.claude/projects/*/<id>.jsonl` | `~/.orc/sessions/<sid>/codex-session.jsonl` (pi session format) | `~/.orc/transcripts/pi/<sid>/` |
+| `orc takeover` prints | `claude --resume <id> …` | `pi --session <codex-session.jsonl>` | `pi … --session-id … --session-dir …` |
+| binary | `ORC_CLAUDE_BIN` or `PATH` | none (built into orc) | `PATH` |
 
 - System prompts live in an orc-owned file (`~/.orc/sessions/<sid>/system-prompt.md`), never on
   argv and never in the worktree. orc never writes `AGENTS.md` or provider config.
 - claude runs with `--setting-sources user,project,local` (never `--bare`), so skills, agents and
-  hooks load. Permission requests that still arrive (claude `can_use_tool`, codex approvals, pi
-  dialogs) are journaled and denied.
+  hooks load. Permission requests that still arrive (claude `can_use_tool`, pi dialogs) are
+  journaled and denied; the codex harness never asks.
 - Slash commands, verified live with claude 2.1.300 through `orc send`: `/compact` compacts the
   session (the turn completes with an empty result; earlier context survives as a summary), and
   `/goal <condition>` sets a goal the turn keeps working toward until it holds. Interactive
-  pickers and `/login` don't work. codex and pi slash commands are unverified.
+  pickers and `/login` don't work. pi slash commands are unverified; the codex harness has none
+  (a `/…` message is sent to the model as text).
 
 `--agent <name>` resolution, each provider's own store first:
 
@@ -217,6 +222,31 @@ await s.kill({ removeWorktree: true });
 
 A codex TOML agent's `developer_instructions` become the system prompt, and its `model` applies
 when `--model` is omitted. An unresolvable name is an error that lists the locations searched.
+
+### codex (built-in harness)
+
+`--provider codex` runs orc's own coding agent: the actor starts `orc __codex-harness <sid>`
+(the same binary), which embeds [pi-ai](https://www.npmjs.com/package/@earendil-works/pi-ai) and
+pi-agent-core 1.2.0 and calls `https://api.openai.com/v1/responses` directly.
+
+- **Credentials**, first match wins: `orc login chatgpt` (Sign in with ChatGPT, stored 0600 in
+  `~/.orc/auth/chatgpt.json`), then pi's ChatGPT login (`~/.pi/agent/auth.json` or
+  `$PI_CODING_AGENT_DIR`), then `OPENAI_API_KEY`. `orc login status` shows which one is active. A
+  refreshed token is written back to the store it came from (pi's file under pi's own lock).
+  `orc login chatgpt --import-pi` copies pi's login instead of signing in; the copies then
+  refresh independently.
+- **Login** prints (and opens) the ChatGPT authorize URL and waits for the browser on
+  `http://127.0.0.1:1455/auth/callback`; from a remote shell, paste the final redirect URL.
+  Sign in with ChatGPT is an OpenAI program with eligibility rules for apps; if your account
+  cannot use it, set `OPENAI_API_KEY`.
+- **Model**: `--model`, else (on resume) the session's model, else the first model your account
+  lists (`GET /v1/models`, cached 10 min). If the list is unavailable, spawn fails and asks for
+  `--model`.
+- **Tools**: `read`, `write`, `edit`, `bash`, `ls` (pi's names and schemas), in the session cwd,
+  unsandboxed. `bash` commands live in the harness's process group, so `orc kill` stops them.
+- **Session file**: pi's session JSONL v3 at `~/.orc/sessions/<sid>/codex-session.jsonl`; resume
+  replays it. `orc takeover` prints `cd <cwd> && pi --session <file>` (pi ≥ 1.2.0 with its own
+  OpenAI login); `orc resume` continues whatever pi appended.
 
 ## Workflows
 
@@ -349,7 +379,13 @@ delete a session's dir.
 | env | effect |
 | --- | --- |
 | `ORC_HOME` | state root (default `~/.orc`) |
-| `ORC_CLAUDE_BIN`, `ORC_CODEX_BIN` | provider executables |
+| `ORC_CLAUDE_BIN` | claude executable |
+| `ORC_AUTH_DIR` | codex login dir (default `$ORC_HOME/auth`) |
+| `OPENAI_API_KEY` | codex fallback credential (API-key Responses API) |
+| `PI_CODING_AGENT_DIR` | where codex looks for pi's login (pi's own variable) |
+| `ORC_CODEX_THINKING` | codex reasoning level: `off`/`minimal`/`low`/`medium` (default)/`high`/`xhigh`/`max` |
+| `ORC_CODEX_MAX_RETRIES` | codex retries for 408/409/429/5xx (default 2) |
+| `ORC_CODEX_BOOT_TIMEOUT_MS` | codex harness ready timeout (default 60000) |
 | `ORC_CLAUDE_READY_TIMEOUT_MS` | claude initialize timeout (default 60000) |
 | `ORC_ACTOR_READY_TIMEOUT_MS` | the actor's provider-ready timeout (default 120000) |
 | `ORC_WORKFLOW_ROOTS` | daemon workflow import allowlist (`path.delimiter`-separated) |
@@ -359,8 +395,9 @@ delete a session's dir.
 ## Development & verification
 
 ```sh
-bun test                                   # unit + fake-provider suites
+bun test                                   # unit + fake-provider suites (codex: a local fake OpenAI server)
 bun run typecheck                          # tsc --noEmit (src, test, scripts)
+bun run check:compile                      # compile orc; run the codex harness's offline self-test
 bun run verify:live --claude-model haiku   # live end-to-end on an authenticated host
 ```
 
@@ -397,10 +434,18 @@ worktree of this repo; `bun scripts/dogfood/run.ts watch <id>` supervises it unt
    - new commands `resume` and `takeover`; `resume`, `takeover`, `prune`, `daemon` and `remote`
      are host-local under `--host`
 5. Yolo flags: claude `--permission-mode bypassPermissions` (was `--dangerously-skip-permissions`);
-   codex over `app-server` with `approvalPolicy: never`; pi `--mode rpc -a`.
+   pi `--mode rpc -a`; codex is now orc's built-in harness (see below).
 6. Daemon `api` is 2; in a mixed fleet check `GET /health` → `api`.
 7. SDK: removed `Session.tmuxName`, `Session.capture()`, `classifyState`, `reduceWait`,
    `AgentOptions.driver`, `pruneSessions({driver})`, `runnerTmuxName`, `PaneInfo` and the
    `messages.ts` delivery-record helpers. `Session.attach()` follows the journal, `SessionStatus`
    adds `suspended`, `SendResult` is `{phase, messageId, replayed}`, and `StepDoneCtx.capture` is
    journal text rather than a pane.
+
+### Upgrading from the codex app-server runtime
+
+codex no longer runs the `codex` CLI (`codex app-server`); it runs orc's built-in harness, and the
+codex CLI is not needed. Sessions created by the app-server runtime show as `dead`, have no
+transcript in `orc read` (their rollouts stay in `~/.codex/sessions`), and cannot be resumed;
+`orc prune` removes them. `ORC_CODEX_BIN` is ignored. Sign in once with `orc login chatgpt` (or
+reuse pi's login, or set `OPENAI_API_KEY`). `--agent` still reads codex TOML agents.

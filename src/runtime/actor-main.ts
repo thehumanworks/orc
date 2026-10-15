@@ -422,7 +422,7 @@ class Actor {
         this.ready = true;
         clearTimeout(this.readyTimer);
         // spawn.json FIRST: whoever observes provider.ready must also find the provider
-        // session id (codex thread id) and transcript path on disk.
+        // session id and transcript path on disk.
         if (
           this.spec.providerSessionId !== ev.providerSessionId ||
           (ev.transcriptPath !== undefined && this.spec.transcriptPath !== ev.transcriptPath)

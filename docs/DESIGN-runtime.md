@@ -3,6 +3,8 @@
 Status: **implemented (2026-10-15)**; proposed and judge-reviewed 2026-10-14. Supersedes the tmux
 driver decision in `RESEARCH.md` §F.16c and the old `Driver` section of `ARCHITECTURE.md`.
 §1–6 are the decision record as reviewed; §7 lists where the build differs and what it added.
+**codex changed since (S9, §7.3):** the `codex app-server` runtime in §4.1 was replaced by orc's
+built-in codex harness; read the codex column of §4.1 as history.
 
 ## 1. Goal and constraints
 
@@ -226,6 +228,7 @@ re-run on any authenticated macOS or Linux host.
 | 11 | Takeover = stop, then native resume (§4.5) | As designed: sticky stop → wait (≤ 15 s) for the provider group to exit → `cd <cwd> && <native resume>`; handback `orc resume` | `session.ts` `takeover` / `resume`, `provider-cli.ts` |
 | 12 | S7 gate: `grep -ri tmux` clean outside history docs | Remaining mentions are intentional: legacy-record / legacy-run normalisation and errors, tests that shadow `tmux` on PATH, the `verify:live` tmux shim, upgrade notes, and history (`RESEARCH.md`, this design) | — |
 | 13 | `spawn.json` holds an "argv template" (§4.3) | It holds the inputs (provider, cwd, env additions, model, agent, system prompt file, provider session id, transcript path); each runtime builds argv per launch | `runtime/spec.ts`, `runtime/types.ts` `SpawnSpec` |
+| 14 | codex = `codex app-server` over JSON-RPC (§4.1, S3) | Replaced in S9 by orc's built-in harness (§7.3); the app-server runtime, its vendored wire types and the rollout parser are deleted | `src/codex/`, `runtime/providers/codex.ts` |
 
 ### 7.2 Added during the build
 
@@ -254,3 +257,25 @@ re-run on any authenticated macOS or Linux host.
 - **Privacy.** Beyond §4.3's 0700/0600 session dirs, every file orc writes under `ORC_HOME`
   (registry, peers, run records, instruction drops, locks, artifacts) is owner-only, with explicit
   chmod; older state is tightened on its next write (`src/private-fs.ts`).
+
+### 7.3 S9: the codex harness replaces `codex app-server` (2026-10-15)
+
+Owner decision: embed pi's libraries instead of driving the codex CLI.
+
+| | codex (S9) |
+|---|---|
+| Process | `orc __codex-harness <sid>`: the running orc build re-executed (compiled binary or `bun src/cli/index.ts`), detached, own process group; the actor's runtime (`runtime/providers/codex.ts`) speaks a JSONL protocol with it (`src/codex/protocol.ts`): `init {spec, resume, sessionFile}` → `ready`, `prompt` → `turn.started` … outcome, `abort` → `interrupt.acked`, stdin EOF → graceful exit |
+| Engine | `@earendil-works/pi-ai` 1.2.0 (`openaiProvider()`, `openai-responses` API, Sign in with ChatGPT OAuth) + `@earendil-works/pi-agent-core` 1.2.0 (`Agent` loop), pinned exactly; requests go to `https://api.openai.com/v1/responses` (never pi-ai's `openai-codex` / chatgpt.com backend) |
+| Credentials | `$ORC_HOME/auth/chatgpt.json` (`orc login chatgpt`; 0600, atomic, orc lock beside it; `ORC_AUTH_DIR` overrides the dir) → pi's `auth.json` (`$PI_CODING_AGENT_DIR` or `~/.pi/agent`) → `OPENAI_API_KEY` → error. A refresh is written back to its source; pi's file under pi's proper-lockfile convention (`mkdir <auth.json>.lock`, mtime kept fresh, 30 s stale, in-place write) |
+| Model | `--model` → the session's model on resume → the first model `GET /v1/models` lists for the credential (SIWC shape `{models:[{slug,visibility}]}` in server order; API-key shape filtered to pi-ai's chat catalog, newest first), cached 10 min; no listing and no `--model` → start fails asking for `--model`. The choice is in `ready.info` and recorded on the session record |
+| Tools | `read`, `write`, `edit`, `bash`, `ls` with pi's names and schemas (orc's implementation); bash runs in the harness's process group, an abort/timeout kills the command tree |
+| Yolo / prompts | no approvals exist; system prompt = harness prompt + file (append) or the file (replace); codex TOML agents still resolve into it |
+| Persistence | pi session JSONL v3 at `~/.orc/sessions/<sid>/codex-session.jsonl` (every finalised message appended); resume replays the active branch; `orc read` uses the pi parser |
+| Takeover | `cd <cwd> && pi --session <file>` (verified: pi 1.2.0 opens a harness file with its messages, model and thinking level, from any cwd); pi needs its own OpenAI login |
+| Legacy | sessions from the app-server runtime (provider session id = codex thread id) are `dead`, have no transcript, and refuse resume |
+| Verification | offline: a fake Responses/models/token server drives the real harness through the runtime and the kernel; `bun run check:compile` runs the compiled binary's `--self-test`. Live: `scripts/verify-runtime/codex.ts` (needs the owner's login) |
+
+Not verified live yet (no OpenAI account in the build environment): a real SIWC token against
+`/v1/responses` and `/v1/models` (and whether orc's `dynamic_agent_client` registration is
+accepted — SIWC is an OpenAI partner program), refresh-token rotation against the real token
+endpoint, and the compiled binary's end-to-end login.
