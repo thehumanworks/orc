@@ -11,6 +11,7 @@ import { effectiveAgentModel, resolveAgentDef } from './agentdefs.ts';
 import { createWorktree, gitToplevel, isInsideGitRepo, removeWorktree } from './worktree.ts';
 import { removeRecord, reserveRecord, upsertRecord, validateAlias } from './registry.ts';
 import { piSessionDir } from './paths.ts';
+import { ensurePrivateDir } from './private-fs.ts';
 import { Session } from './session.ts';
 import { withLock } from './lock.ts';
 import type { AgentOptions, Provider, SessionRecord, SystemPromptMode } from './types.ts';
@@ -183,7 +184,7 @@ export async function agent(opts: AgentOptions): Promise<Session> {
     }
 
     if (provider === 'pi') {
-      await fs.mkdir(sessionDir, { recursive: true });
+      ensurePrivateDir(sessionDir);
     }
 
     let systemPromptPath: string | undefined;

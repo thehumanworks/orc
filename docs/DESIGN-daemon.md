@@ -42,13 +42,17 @@ per node. So:
 GET  /sessions?workspace=&all=&dead=     → list (each record gains a live `state` from F1)
 POST /sessions   {provider,model,agent,alias,systemPrompt,prompt,worktree,cwd,workspace}  → spawn
 GET  /sessions/:id                       → record + state()
-GET  /sessions/:id/read?raw=&full=&last=&index=  → selected parsed turns (or raw pane) [reuses readParsed]
-POST /sessions/:id/send   {prompt}       → send
+GET  /sessions/:id/read?raw=&full=&last=&index=  → {kind:'parsed',turns} | {kind:'raw'|'fallback',journal}
+POST /sessions/:id/send   {prompt,messageId|idempotencyKey,wake} → {ok,id,phase,messageId,replayed}
 POST /sessions/:id/wait   {for,timeoutMs}→ waitFor (long-poll)               [reuses F1]
 POST /sessions/:id/kill   {worktree,purge}
 GET  /workflows/runs , POST /workflows/run {file|def,maxConcurrency} , GET /workflows/runs/:id
-GET  /health , GET /whoami               → daemon identity + version (trust handshake)
+GET  /workflows/runs/:id/logs , POST /workflows/runs/:id/{resume,retry,cancel,cleanup}
+GET  /health , GET /whoami               → daemon identity + version + `api` (trust handshake)
 ```
+
+`GET /health` reports `api: 2` since the actor runtime: raw reads and `logs?raw` return the
+session `journal` (v1 daemons returned a tmux `pane`; the client still understands both).
 
 ## Backgrounding ties to F2
 A detached workflow (F2b) running on a host's daemon is exactly what a remote peer queries via
@@ -59,7 +63,7 @@ and owns the run records. So F2b's `--detach` and F3's daemon should share the r
 ## Reads/waits over HTTP
 `wait` can be long. Start with **server-side long-poll** (the handler runs `waitFor` and responds when
 settled or at a timeout the client retries) — simplest, reuses F1 unchanged. SSE/websocket streaming of
-live pane/turns can come later; not needed for v1.
+the live journal can come later; not needed for v1.
 
 ## Verification (when built — real, two endpoints, no mocks)
 Run a daemon bound to `127.0.0.1` (loopback stand-in for the tailscale IP in CI/local test), spawn a
@@ -70,6 +74,7 @@ request from a non-allowlisted identity is refused. (On the user's real tailnet,
 ## Decisions and remaining constraints
 1. `orc --host` proxies the supported read and mutation commands; spawn/kill/workflow control are
    intentionally part of the remote surface.
-2. Worktrees are host-local paths — remote `read --raw`/`attach` only make sense ON that host;
-   `attach` should print the host + `tailscale ssh <host>` hint rather than a bare local tmux command.
+2. Worktrees are host-local paths — remote `attach` only makes sense ON that host, so
+   `orc --host <h> attach <id>` prints `tailscale ssh <h> orc attach <id>` (implemented; likewise
+   `workflow attach`). `resume`, `takeover`, `prune`, `daemon` and `remote` are host-local.
 3. Discovery uses a fixed port plus MagicDNS hostnames in `peers.json`.

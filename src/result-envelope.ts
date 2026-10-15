@@ -209,9 +209,9 @@ export async function writeResultEnvelope(
 ): Promise<void> {
   const v = validateResultEnvelope(envelope);
   if (!v.ok) throw new Error(`refusing to write invalid envelope: ${v.error}`);
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.mkdir(path.dirname(filePath), { recursive: true, mode: 0o700 });
   const tmp = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  await Bun.write(tmp, JSON.stringify(v.envelope, null, 2));
+  await fs.writeFile(tmp, JSON.stringify(v.envelope, null, 2), { mode: 0o600 });
   await fs.rename(tmp, filePath);
 }
 
