@@ -57,6 +57,8 @@ export class TurnLedger {
   lastActorStopped?: { seq: number; at: string; reason: string; error?: string };
   providerSessionId?: string;
   transcriptPath?: string;
+  /** Seq of the most recent provider.ready (0 = never). */
+  lastProviderReadySeq = 0;
   /** Every provider.spawned, in order; `exited` once a later provider.exited closed it. */
   readonly spawnedProviders: Array<ProcessIdentity & { seq: number; exited: boolean }> = [];
 
@@ -143,6 +145,7 @@ export class TurnLedger {
         break;
       }
       case 'provider.ready':
+        this.lastProviderReadySeq = e.seq;
         this.providerSessionId = e.providerSessionId;
         if (e.transcriptPath) this.transcriptPath = e.transcriptPath;
         break;
@@ -193,6 +196,12 @@ export interface JournalSummary {
   lastActorStopped?: { seq: number; at: string; reason: string; error?: string };
   providerSessionId?: string;
   transcriptPath?: string;
+  /**
+   * The current actor incarnation's provider reported ready (a provider.ready after the
+   * last actor.started). The journal is the source of truth: state.json's phase can lag it
+   * by up to one state write.
+   */
+  providerReady?: boolean;
 }
 
 export function summarizeLedger(l: TurnLedger): JournalSummary {
@@ -210,6 +219,7 @@ export function summarizeLedger(l: TurnLedger): JournalSummary {
   if (l.lastActorStopped) s.lastActorStopped = l.lastActorStopped;
   if (l.providerSessionId) s.providerSessionId = l.providerSessionId;
   if (l.transcriptPath) s.transcriptPath = l.transcriptPath;
+  if (l.lastProviderReadySeq > 0 && l.lastProviderReadySeq > (l.lastActorStarted?.seq ?? 0)) s.providerReady = true;
   return s;
 }
 
@@ -328,7 +338,7 @@ export function deriveState(view: SessionView): DerivedState {
     out.suspended = true;
     return out;
   }
-  if (view.actor.phase === 'starting') out.state = 'starting';
+  if (view.actor.phase === 'starting' && !s.providerReady) out.state = 'starting';
   else if (s.pendingPermission) out.state = 'waiting';
   else if (s.openTurn || view.pending.messages > 0) out.state = 'running';
   else if (s.lastTurn?.outcome === 'failed') out.state = 'failed';

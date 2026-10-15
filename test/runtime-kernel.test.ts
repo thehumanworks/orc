@@ -361,6 +361,27 @@ describe('deriveState', () => {
     ['suspended', { phase: 'suspended' as const, live: false }, { state: 'failed', suspended: true }],
     ['actor died mid-stop', { phase: 'stopping' as const, live: false }, { state: 'failed', stopped: true, suspended: false }],
     ['provider initialising', { phase: 'starting' as const, journal: [started] }, { state: 'starting' }],
+    [
+      // state.json can lag the journal by one write: provider.ready for THIS actor wins.
+      'provider ready, state.json still starting',
+      {
+        phase: 'starting' as const,
+        journal: [started, E({ type: 'provider.ready', providerSessionId: 'p', providerPid: 2 })],
+      },
+      { state: 'done' },
+    ],
+    [
+      // A provider.ready from a previous actor incarnation does not count.
+      'stale provider.ready before a restart',
+      {
+        phase: 'starting' as const,
+        journal: [
+          E({ type: 'provider.ready', providerSessionId: 'p', providerPid: 2 }),
+          E({ type: 'actor.started', pid: 3, mode: 'resume' }),
+        ],
+      },
+      { state: 'starting' },
+    ],
     ['idle', { journal: [started] }, { state: 'done', stopped: false, suspended: false }],
     ['queued inbox message', { journal: [started], pendingMessages: 1 }, { state: 'running' }],
   ])('%s', (_label, opts, want) => {
