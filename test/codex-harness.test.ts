@@ -351,14 +351,45 @@ describe('OAuth refresh writes back to the store the credential came from', () =
   test('the holder keeps the lock fresh (mtime refreshed while held)', async () => {
     seedPi({ openai: oauthCred() });
     const authFile = path.join(piDir, 'auth.json');
-    const release = await acquirePiAuthLock(authFile);
+    const lock = await acquirePiAuthLock(authFile);
     const lockDir = `${authFile}.lock`;
-    const old = new Date(Date.now() - 20_000);
-    fs.utimesSync(lockDir, old, old);
+    const first = fs.statSync(lockDir).mtimeMs;
     await Bun.sleep(2_300);
-    expect(Date.now() - fs.statSync(lockDir).mtimeMs).toBeLessThan(3_000);
-    release();
+    expect(fs.statSync(lockDir).mtimeMs).toBeGreaterThan(first);
+    expect(() => lock.assertHeld()).not.toThrow();
+    lock.release();
     expect(fs.existsSync(lockDir)).toBe(false);
+  });
+
+  test('a lock reclaimed by pi after a stall is detected: no write, and pi\'s lock is left alone', async () => {
+    const before = { openai: oauthCred({ access: 'tok-pi-orig' }) };
+    seedPi(before);
+    const authFile = path.join(piDir, 'auth.json');
+    const lockDir = `${authFile}.lock`;
+    const reclaim = () => {
+      // pi judged ours stale, removed it and took its own (a different mtime).
+      fs.rmdirSync(lockDir);
+      fs.mkdirSync(lockDir);
+      const t = new Date(Date.now() - 3_000);
+      fs.utimesSync(lockDir, t, t);
+    };
+    const lock = await acquirePiAuthLock(authFile);
+    reclaim();
+    expect(() => lock.assertHeld()).toThrow('reclaimed');
+    lock.release();
+    expect(fs.existsSync(lockDir)).toBe(true); // pi's lock survives our release
+    fs.rmdirSync(lockDir);
+
+    const store = new PiAuthFileStore(authFile);
+    await expect(
+      store.modify('openai', async (cur) => {
+        reclaim(); // the refresh stalled long enough for pi to take the lock
+        return { ...(cur as object), access: 'must-not-be-written' } as Credential;
+      }),
+    ).rejects.toThrow('left unchanged');
+    expect(JSON.parse(fs.readFileSync(authFile, 'utf8'))).toEqual(JSON.parse(JSON.stringify(before)));
+    expect(fs.existsSync(lockDir)).toBe(true);
+    fs.rmdirSync(lockDir);
   });
 
   test('orc never creates or logs out of pi\'s file', async () => {

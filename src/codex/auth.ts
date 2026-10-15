@@ -252,11 +252,22 @@ export const PI_LOCK_UPDATE_MS = 2_000;
 export const PI_LOCK_WAIT_MS = 30_000;
 
 /**
+ * A held pi auth lock. `assertHeld()` throws when the lock was compromised: removed, or
+ * reclaimed by another process (its mtime is no longer the one we last set — proper-lockfile's
+ * check). `release()` never removes a lock that is no longer ours.
+ */
+export interface PiAuthLock {
+  assertHeld(): void;
+  release(): void;
+}
+
+/**
  * Acquire pi's `auth.json` lock: proper-lockfile 4.1.2 semantics with pi's options
  * (`realpath:false`, `stale:30000`, retried with capped exponential backoff for up to
- * 30 s). Returns the release function.
+ * 30 s), including its compromise detection: each refresh first checks that the lock's
+ * mtime is still the one we set.
  */
-export async function acquirePiAuthLock(authPath: string, signal?: AbortSignal): Promise<() => void> {
+export async function acquirePiAuthLock(authPath: string, signal?: AbortSignal): Promise<PiAuthLock> {
   const lockPath = `${path.resolve(authPath)}.lock`;
   const deadline = Date.now() + PI_LOCK_WAIT_MS;
   let retry = 0;
@@ -293,27 +304,53 @@ export async function acquirePiAuthLock(authPath: string, signal?: AbortSignal):
     retry++;
     await sleep(Math.min(Math.round(base * (1 + Math.random())), remaining));
   }
+  let lastMtimeMs: number | null = null;
+  let compromised: string | null = null;
+  let released = false;
+  const mtimeNow = (): number | null => {
+    try {
+      return fs.statSync(lockPath).mtimeMs;
+    } catch {
+      return null;
+    }
+  };
   const touch = () => {
+    if (compromised || released) return;
+    if (lastMtimeMs !== null && mtimeNow() !== lastMtimeMs) {
+      compromised = 'pi auth lock was reclaimed or removed by another process';
+      clearInterval(timer);
+      return;
+    }
     const now = new Date();
     try {
       fs.utimesSync(lockPath, now, now);
+      lastMtimeMs = mtimeNow();
     } catch {
-      // removed under us: detected before the write (assertHeld)
+      compromised = 'pi auth lock disappeared';
+      clearInterval(timer);
     }
   };
-  touch();
   const timer = setInterval(touch, PI_LOCK_UPDATE_MS);
   timer.unref?.();
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    clearInterval(timer);
-    try {
-      fs.rmdirSync(lockPath);
-    } catch {
-      // already gone
-    }
+  touch();
+  return {
+    assertHeld() {
+      if (!compromised && (lastMtimeMs === null || mtimeNow() !== lastMtimeMs)) {
+        compromised = 'pi auth lock was reclaimed or removed by another process';
+      }
+      if (compromised) throw new Error(compromised);
+    },
+    release() {
+      if (released) return;
+      released = true;
+      clearInterval(timer);
+      if (compromised || mtimeNow() !== lastMtimeMs) return; // not ours any more: leave it
+      try {
+        fs.rmdirSync(lockPath);
+      } catch {
+        // already gone
+      }
+    },
   };
 }
 
@@ -368,22 +405,24 @@ export class PiAuthFileStore implements CredentialStore {
   ): Promise<Credential | undefined> {
     if (providerId !== OPENAI_PROVIDER_ID) throw new Error(`pi auth store: refusing to modify '${providerId}'`);
     if (!fs.existsSync(this.path)) throw new Error(`pi auth store: ${this.path} does not exist`);
-    const release = await acquirePiAuthLock(this.path, options?.signal);
+    const lock = await acquirePiAuthLock(this.path, options?.signal);
     try {
       const data = parseAuthJson(fs.readFileSync(this.path, 'utf8'), this.path);
       const raw = data[providerId];
       const current = isOAuthCredential(raw) ? structuredClone(raw) : undefined;
       const next = await fn(current);
       if (next === undefined) return current;
-      if (!fs.existsSync(`${path.resolve(this.path)}.lock`)) {
-        throw new Error(`pi auth lock was lost while refreshing; ${this.path} left unchanged`);
+      try {
+        lock.assertHeld();
+      } catch (e) {
+        throw new Error(`${(e as Error).message} while refreshing; ${this.path} left unchanged`);
       }
       // pi's write: in place, full document, other providers preserved, 0600 on creation.
       const merged = { ...data, [providerId]: next };
       fs.writeFileSync(this.path, JSON.stringify(merged, null, 2), { encoding: 'utf-8', mode: 0o600 });
       return next;
     } finally {
-      release();
+      lock.release();
     }
   }
 
