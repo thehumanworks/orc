@@ -204,12 +204,21 @@ async function waitForActorStart(
     }
     return undefined;
   };
+  // A failed start is journaled just before the actor's final state write (startFailures,
+  // lease release): return only once that is visible, so callers act on settled state.
+  const settled = async (o: { sessionError?: string }) => {
+    if (o.sessionError) {
+      const until = Date.now() + 5_000;
+      while (Date.now() < until && isLiveProcess(actor) && leaseLive(readActorState(sessionId))) await Bun.sleep(20);
+    }
+    return o;
+  };
   while (true) {
     const outcome = scan();
-    if (outcome) return outcome;
+    if (outcome) return settled(outcome);
     if (!isLiveProcess(actor)) {
       const last = scan();
-      if (last) return last;
+      if (last) return settled(last);
       if (started) return { sessionError: `actor ${actor.pid} exited during start${logTail(sessionId)}` };
       await markStartFailed(sessionId, actor);
       throw new Error(`actor ${actor.pid} for session ${sessionId} exited before starting${logTail(sessionId)}`);
