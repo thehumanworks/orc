@@ -7,7 +7,7 @@
 
 ## Context
 You are an autonomous coding agent in an **isolated git worktree** of `orc` — a tool that drives
-coding-agent CLIs (claude/codex/pi) as detached sessions, with an SDK + an `orc` CLI. First:
+coding agents (claude/codex/pi) as detached sessions, with an SDK + an `orc` CLI. First:
 `bun install` (no node_modules in the worktree), then read `README.md`, `docs/DESIGN-workflows.md`
 (the design you are implementing), `src/index.ts`, `src/session.ts` (note `state()`, `waitFor()`,
 `readParsed()`), `src/agent.ts`, `src/state.ts` (`AgentState`), and `scripts/dogfood/run.ts` (a
