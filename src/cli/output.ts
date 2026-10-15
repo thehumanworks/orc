@@ -285,7 +285,7 @@ spawn options:
   --alias <name>         workspace-scoped session alias; later use @name or @workspace:name
   --system-prompt <txt>  system prompt text
   --system-prompt-mode   append (default) | replace
-  --prompt <txt | ->     initial prompt sent once the provider is ready (- reads stdin)
+  --prompt <txt|-|@f>    initial prompt sent once the provider is ready (- stdin, @f file)
   --cwd <dir>            base working directory (default: cwd)
   --workspace <w>       logical workspace key
   --worktree            create a fresh git worktree as cwd
@@ -323,14 +323,14 @@ workflow subcommands:
                                       (<provider>)'). --raw shows each step session's journal
                                       tail; --json emits {step,turns}[] (or {step,provider,journal}[]
                                       with --raw).
-  orc workflow resume <runId> [file] [--detach] [--json]
+  orc workflow resume <runId> <file> [--detach] [--json]
                                       Resume an incomplete run (skips successful attempts; adopts
                                       in-flight steps whose instruction reached a still-resumable
-                                      session). Requires the original workflow file when the plan
-                                      used function \`done\` predicates (non-portable; prefer \`verify\`).
-  orc workflow retry <runId> [--step id] [file] [--detach] [--json]
+                                      session). <file> is the original workflow file (required
+                                      locally; over --host it defaults to the run's recorded file).
+  orc workflow retry <runId> [--step id] <file> [--detach] [--json]
                                       New attempts for failed/incomplete steps (or --step and
-                                      subsequent). Preserves attempt history.
+                                      subsequent). Preserves attempt history. <file> as for resume.
   orc workflow cancel <runId> [--cascade] [--json]
                                       Idempotent cancel; --cascade kills only sessions proven owned
                                       by this run/root (never unrelated sessions).
@@ -382,8 +382,9 @@ read defaults to the latest parsed conversation turn. --full emits the full pars
 transcript, --index N emits zero-based parsed turn N, and --raw emits the session journal
 (JSONL; --json: {id,journal}). If no transcript exists yet it falls back to the journal
 rendered as text (--json: {id,fallback:true,journal}).
-state --json emits {id,state,status,suspended,stopped}. wait --json emits
-{id,state,elapsedMs,timedOut}; exit 0 iff a requested state was reached.
+state --json emits {id,state,status,stopped,suspended,live,pendingMessages,openTurn?,
+lastTurn?,stopReason?}. wait --json emits {id,state,elapsedMs,timedOut}; exit 0 iff a
+requested state was reached.
 send --json emits {ok,id,phase,messageId,replayed}.
 takeover prints \`cd <cwd> && <provider resume command>\` (--json: {id,cwd,command});
 \`orc resume <id>\` hands the session back. attach --json: {id,command,journalPath}.

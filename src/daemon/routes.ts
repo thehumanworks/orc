@@ -110,7 +110,7 @@ export interface SpawnRequest {
   workspace?: string;
   worktree?: boolean | { branch?: string };
   branch?: string;
-  /** `orc spawn --no-wait`: skip the boot wait AND the initial-prompt send. */
+  /** `orc spawn --no-wait`: skip the readiness wait; an initial prompt is still queued. */
   noWait?: boolean;
 }
 
