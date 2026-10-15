@@ -563,6 +563,7 @@ describe('codex runtime + harness child (fake Responses API)', () => {
         piAi: PI_AI_VERSION,
         tools: ['read', 'bash', 'edit', 'write', 'ls'],
         endpoint: 'https://api.openai.com/v1/responses',
+        testEndpoint: fake.origin, // the journal records the redirect
       });
       expect(fake.modelRequests().at(-1)!.headers.authorization).toBe('Bearer tok-orc-1');
 
@@ -708,6 +709,11 @@ describe('codex runtime + harness child (fake Responses API)', () => {
       expect(f2.type).toBe('turn.failed');
       expect(f2.error).toContain('500');
       expect(fake.responses().length - before).toBe(3); // 1 + DEFAULT_MAX_RETRIES
+
+      await rt.send('m2b', 'FAKE:OVERFLOW');
+      const fo = (await c.outcome('m2b')) as Extract<ProviderEvent, { type: 'turn.failed' }>;
+      expect(fo.type).toBe('turn.failed');
+      expect(fo.error).toContain("the conversation exceeds the model's context window; start a new session");
 
       await rt.send('m3', 'FAKE:USAGE_LIMIT');
       const f3 = (await c.outcome('m3')) as Extract<ProviderEvent, { type: 'turn.failed' }>;

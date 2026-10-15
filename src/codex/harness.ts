@@ -30,6 +30,7 @@ import pkg from '../../package.json';
 import {
   createModels,
   InMemoryCredentialStore,
+  isContextOverflow,
   type AssistantMessage,
   type Model,
   type Api,
@@ -41,7 +42,7 @@ import type { SpawnSpec, TurnUsage } from '../runtime/types.ts';
 import { JsonlSplitter } from '../runtime/providers/pi-protocol.ts';
 import { parsePi } from '../transcript.ts';
 import { CodexAuthError, OPENAI_PROVIDER_ID, resolveCodexAuth, type CodexAuth } from './auth.ts';
-import { installTestEndpoint, OPENAI_API_BASE } from './endpoint.ts';
+import { installTestEndpoint, OPENAI_API_BASE, testEndpoint } from './endpoint.ts';
 import { buildModel, listLiveModels, parseModelList, resolveModelId } from './models.ts';
 import { encodeLine, parseHarnessCommand, type HarnessCommand, type HarnessEvent } from './protocol.ts';
 import { loadSession, SessionFileWriter, type LoadedSession } from './session-file.ts';
@@ -162,6 +163,7 @@ export class CodexHarness {
   private turn: OpenTurn | null = null;
   private chain: Promise<void> = Promise.resolve();
   private modelKnown = true;
+  private contextWindow: number | undefined;
   private auth!: CodexAuth;
   private shuttingDown = false;
 
@@ -203,6 +205,7 @@ export class CodexHarness {
     });
     const built = buildModel(models, pick.id);
     this.modelKnown = built.known;
+    this.contextWindow = built.model.contextWindow;
     const thinkingLevel = (loaded?.thinkingLevel as ThinkingLevel | undefined) ?? thinkingLevelFromEnv(env);
     const tools = createCodingTools({ cwd: spec.cwd, env });
     const systemPrompt = loaded ? undefined : composeSystemPrompt(spec);
@@ -259,6 +262,8 @@ export class CodexHarness {
         messageCount: this.agent.state.messages.length,
         tools: [...CODING_TOOL_NAMES],
         endpoint: `${OPENAI_API_BASE}/responses`,
+        // Never misreport where tokens went: the offline test seam redirects every request.
+        ...(testEndpoint(env) ? { testEndpoint: testEndpoint(env) } : {}),
       },
     });
   }
@@ -361,7 +366,16 @@ export class CodexHarness {
     const messageId = turn.messageId;
     if (stop === 'aborted' || (turn.interruptRequested && stop === 'error')) return { type: 'turn.interrupted', messageId };
     if (!last || stop === 'error' || stop === 'pending' || stop === 'deferred') {
-      return { type: 'turn.failed', messageId, error: this.errorWithHint(last?.errorMessage ?? `run ended with stopReason ${String(stop)}`) };
+      const message = last?.errorMessage ?? `run ended with stopReason ${String(stop)}`;
+      if (last && isContextOverflow(last, this.contextWindow)) {
+        // No compaction yet: the only way forward is a fresh session.
+        return {
+          type: 'turn.failed',
+          messageId,
+          error: `${message} — the conversation exceeds the model's context window; start a new session`,
+        };
+      }
+      return { type: 'turn.failed', messageId, error: this.errorWithHint(message) };
     }
     const usage: Required<TurnUsage> = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
     let cost = 0;

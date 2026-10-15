@@ -122,7 +122,10 @@ describe('codex harness through the actor kernel', () => {
       const spec = codexSpec();
       await createSession(spec);
       const ready = await waitForEntry(spec.sessionId, (e) => e.type === 'provider.ready', 'provider.ready', 20_000);
-      expect(ready).toMatchObject({ providerSessionId: spec.sessionId, info: { model: 'gpt-fake-1', authSource: 'orc' } });
+      expect(ready).toMatchObject({
+        providerSessionId: spec.sessionId,
+        info: { model: 'gpt-fake-1', authSource: 'orc', testEndpoint: fake.origin },
+      });
       const r = await send(spec.sessionId, { messageId: 'k1', text: 'hello kernel' });
       expect(r.verdict).toBe('acknowledged');
       const o = await outcome(spec.sessionId, 'k1');

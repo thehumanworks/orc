@@ -28,7 +28,7 @@ import {
   piAuthPath,
   resolveCodexAuth,
 } from './auth.ts';
-import { installTestEndpoint } from './endpoint.ts';
+import { installTestEndpoint, testEndpoint } from './endpoint.ts';
 import { listLiveModels } from './models.ts';
 
 /** Give up on an unfinished browser login after this long. */
@@ -112,6 +112,8 @@ export async function loginChatGPT(opts: LoginOptions = {}): Promise<number> {
   const env = opts.env ?? process.env;
   registerBunOAuthFlows();
   installTestEndpoint(env);
+  const redirected = testEndpoint(env);
+  if (redirected) err(`note: ORC_CODEX_TEST_ENDPOINT is set: OpenAI requests go to ${redirected}`);
   const orc = new OrcChatGPTStore();
 
   if (opts.importPi) {

@@ -9,6 +9,7 @@
  * Responses scripting — markers in the LAST user message:
  *   FAKE:SLOW          stream starts, then stays open (deltas every 200 ms) until aborted
  *   FAKE:HTTP400       HTTP 400 invalid_request_error (not retried)
+ *   FAKE:OVERFLOW      HTTP 400 context_length_exceeded
  *   FAKE:HTTP500       HTTP 500 (retried by the harness, then fails)
  *   FAKE:RECALL        reply lists every user text in the request input, joined by " | "
  *   FAKE:SCRIPT <json> steps: [{"tools":[{"name","args"}]} | {"text":"…"}]; the step is
@@ -140,6 +141,19 @@ export function startFakeOpenAI(): FakeOpenAI {
         if (last.includes('FAKE:HTTP400')) {
           return Response.json(
             { error: { message: 'fake bad request: unsupported parameter', type: 'invalid_request_error', code: 'unsupported_parameter' } },
+            { status: 400 },
+          );
+        }
+        if (last.includes('FAKE:OVERFLOW')) {
+          return Response.json(
+            {
+              error: {
+                message: 'Your input exceeds the context window of this model. Please adjust your input and try again.',
+                type: 'invalid_request_error',
+                param: 'input',
+                code: 'context_length_exceeded',
+              },
+            },
             { status: 400 },
           );
         }
