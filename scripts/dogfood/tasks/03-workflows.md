@@ -1,8 +1,9 @@
 # Task: orc workflows — core runner (feature 2a)
 
 > **Completed** (the feature shipped). Kept as an example task spec for `scripts/dogfood/run.ts`.
-> Written for the pre-actor runtime: tmux-specific steps were removed; other details (e.g. the
-> large-paste bug) are historical. Current behaviour: `README.md`, `docs/ARCHITECTURE.md`.
+> Written for the pre-actor runtime: tmux- and codex-CLI-specific steps were removed (codex is now
+> orc's built-in harness); other details (e.g. the large-paste bug) are historical. Current
+> behaviour: `README.md`, `docs/ARCHITECTURE.md`.
 
 ## Context
 You are an autonomous coding agent in an **isolated git worktree** of `orc` — a tool that drives
@@ -121,8 +122,7 @@ Throwaway `ORC_HOME="$(mktemp -d)/orc"`. Run the real example workflow end-to-en
    `ok:false` (because `commitsAhead===0`), NOT chained past. This proves the runner catches a real
    yielded-but-didn't-succeed step, not just an artificial false predicate. Also verify a non-worktree
    yield-only step is flagged `unverified:true`.
-4. Clean up: kill any sessions you spawned, remove throwaway ORC_HOME, restore `~/.codex/config.toml`
-   (remove temp trust entries; keep pre-existing).
+4. Clean up: kill any sessions you spawned, remove throwaway ORC_HOME.
 
 ## When done
 1. `bun run typecheck` and `bun test` green.

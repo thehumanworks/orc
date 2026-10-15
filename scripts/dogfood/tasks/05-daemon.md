@@ -1,8 +1,9 @@
 # Task: orc daemon — HTTP API + tailscale federation (feature 3)
 
 > **Completed** (the feature shipped). Kept as an example task spec for `scripts/dogfood/run.ts`.
-> Written for the pre-actor runtime: tmux-specific steps were removed; other details (e.g. the
-> large-paste bug) are historical. Current behaviour: `README.md`, `docs/ARCHITECTURE.md`.
+> Written for the pre-actor runtime: tmux- and codex-CLI-specific steps were removed (codex is now
+> orc's built-in harness); other details (e.g. the large-paste bug) are historical. Current
+> behaviour: `README.md`, `docs/ARCHITECTURE.md`.
 
 > Spawn this ONLY after F2b (`--detach`/`logs`) is merged — the daemon exposes the workflow surface.
 
@@ -80,7 +81,7 @@ Bind to `127.0.0.1` (loopback stands in for the tailscale IP locally). Throwaway
 4. Auth (fail-closed): no identity AND no credentials → `401`; WRONG secret/bearer → `401`; correct
    `x-orc-secret` → ok (all scopes); scoped bearer with insufficient scope → `403`; `/health` open.
    (On loopback, `tailscale whois` cannot resolve `127.0.0.1`, so this exercises secret/bearer + deny.)
-5. Clean up: stop the daemon, kill sessions, remove throwaway ORC_HOME, restore `~/.codex/config.toml`.
+5. Clean up: stop the daemon, kill sessions, remove throwaway ORC_HOME.
 
 ### Verification ceiling — REPORT HONESTLY (do not rubber-stamp)
 Loopback testing covers the plumbing, secret/bearer auth, 401/403 paths, and bind-refusal — but
