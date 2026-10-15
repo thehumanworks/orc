@@ -140,6 +140,11 @@ export function runDir(runId: string): string {
   return runInstructionsDir(runId);
 }
 
+/** Detached workflow runner stdout/stderr log: ~/.orc/runs/<runId>/runner.log (append-only). */
+export function runnerLogPath(runId: string): string {
+  return path.join(runDir(runId), 'runner.log');
+}
+
 /** Per-attempt working dir: ~/.orc/runs/<runId>/attempts/<attemptId>/. */
 export function runAttemptDir(runId: string, attemptId: string): string {
   assertValidRunId(runId);

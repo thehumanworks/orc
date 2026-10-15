@@ -2,9 +2,8 @@ import { describe, test, expect, beforeEach, afterAll } from 'bun:test';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { assertValidRunId, runPath, runInstructionsDir } from '../src/paths.ts';
+import { assertValidRunId, runPath, runInstructionsDir, runnerLogPath, runsDir } from '../src/paths.ts';
 import { writeRun, readRun } from '../src/runs.ts';
-import { runnerTmuxName } from '../src/workflow.ts';
 import type { WorkflowRun } from '../src/workflow.ts';
 
 const tmpHomes: string[] = [];
@@ -37,9 +36,9 @@ describe('assertValidRunId', () => {
     expect(runPath('deadbeef')).toMatch(/deadbeef\.json$/);
   });
 
-  test('runnerTmuxName validates and sanitizes', () => {
-    expect(runnerTmuxName('deadbeef')).toBe('orc-wf-deadbeef');
-    expect(() => runnerTmuxName('../x')).toThrow(/invalid runId/);
+  test('runnerLogPath validates and lives in the per-run dir', () => {
+    expect(runnerLogPath('deadbeef')).toBe(path.join(runsDir(), 'deadbeef', 'runner.log'));
+    expect(() => runnerLogPath('../x')).toThrow(/invalid runId/);
   });
 });
 
