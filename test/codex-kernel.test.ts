@@ -390,36 +390,60 @@ describe('orc login chatgpt (offline: fake auth + token endpoints)', () => {
     T,
   );
 
+  /** Start `orc login chatgpt --no-browser`, wait for the authorize URL, paste `line(state)`. */
+  async function pasteLogin(home: string, line: (state: string) => string) {
+    const env = { ...cliEnv(), ORC_HOME: path.join(home, 'orc') };
+    const p = Bun.spawn([process.execPath, cliEntryPath(), 'login', 'chatgpt', '--no-browser'], {
+      cwd: root,
+      env,
+      stdin: 'pipe',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    let out = '';
+    const dec = new TextDecoder();
+    const reader = (async () => {
+      for await (const c of p.stdout) out += dec.decode(c);
+    })();
+    const errText = new Response(p.stderr).text();
+    await waitFor(() => /https:\/\/auth\.openai\.com\/\S+/.test(out) || undefined, 'authorize URL', 15_000);
+    const url = new URL(/https:\/\/auth\.openai\.com\/\S+/.exec(out)![0]);
+    p.stdin.write(`${line(url.searchParams.get('state')!)}\n`);
+    await p.stdin.flush();
+    const code = await p.exited;
+    await reader;
+    return { code, out, err: await errText };
+  }
+
   test(
-    'a pasted redirect URL completes the login (remote browser); a wrong one is rejected',
+    'a pasted redirect URL completes the login (remote browser); a wrong URL or state is rejected',
     async () => {
       if (!(await callbackPortFree())) {
         console.warn('[codex-kernel] port 1455 busy: pasted-redirect login test skipped');
         return;
       }
       const home = fs.mkdtempSync(path.join(root, 'login-paste-'));
-      const env = { ...cliEnv(), ORC_HOME: path.join(home, 'orc') };
-      const p = Bun.spawn([process.execPath, cliEntryPath(), 'login', 'chatgpt', '--no-browser'], {
-        cwd: root,
-        env,
-        stdin: 'pipe',
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-      let out = '';
-      const reader = (async () => {
-        const dec = new TextDecoder();
-        for await (const c of p.stdout) out += dec.decode(c);
-      })();
-      await waitFor(() => /https:\/\/auth\.openai\.com\/\S+/.test(out) || undefined, 'authorize URL', 15_000);
-      const url = new URL(/https:\/\/auth\.openai\.com\/\S+/.exec(out)![0]);
-      const state = url.searchParams.get('state')!;
-      p.stdin.write(`http://127.0.0.1:1455/auth/callback?code=pasted-code&state=${encodeURIComponent(state)}&client_id=app_pasted\n`);
-      await p.stdin.flush();
-      const code = await p.exited;
-      await reader;
-      expect(code).toBe(0);
-      const cred = JSON.parse(fs.readFileSync(path.join(home, 'orc', 'auth', 'chatgpt.json'), 'utf8')).openai;
+      const credFile = path.join(home, 'orc', 'auth', 'chatgpt.json');
+      const tokensBefore = fake.tokenRequests().length;
+
+      const wrongUrl = await pasteLogin(home, () => 'https://example.com/auth/callback?code=x&state=y&client_id=z');
+      expect(wrongUrl.code).toBe(1);
+      expect(wrongUrl.err).toContain('must start with http://127.0.0.1:1455/auth/callback');
+      expect(await callbackPortFree()).toBe(true);
+
+      const wrongState = await pasteLogin(home, () => 'http://127.0.0.1:1455/auth/callback?code=x&state=not-the-state&client_id=z');
+      expect(wrongState.code).toBe(1);
+      expect(wrongState.err).toContain('OAuth state mismatch');
+      expect(fs.existsSync(credFile)).toBe(false);
+      expect(fake.tokenRequests().length).toBe(tokensBefore); // no code exchange happened
+      expect(await callbackPortFree()).toBe(true);
+
+      const ok = await pasteLogin(
+        home,
+        (state) => `http://127.0.0.1:1455/auth/callback?code=pasted-code&state=${encodeURIComponent(state)}&client_id=app_pasted`,
+      );
+      expect(ok.code).toBe(0);
+      const cred = JSON.parse(fs.readFileSync(credFile, 'utf8')).openai;
       expect(cred.clientId).toBe('app_pasted');
       expect(fs.statSync(path.join(home, 'orc', 'auth', 'device-id')).mode & 0o777).toBe(0o600);
       expect(fake.tokenRequests().at(-1)!.get('code')).toBe('pasted-code');
