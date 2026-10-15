@@ -269,7 +269,8 @@ export interface DerivedState {
 /**
  * Design §4.4 + brief decision 3:
  * - missing session            → failed
- * - phase stopped              → failed {stopped:true, suspended:false}
+ * - phase stopped (or stopping
+ *   with no live actor)        → failed {stopped:true, suspended:false}
  * - not live                   → failed {suspended:true}
  * - live, phase starting       → starting (provider not initialised yet)
  * - pending permission request → waiting
@@ -317,7 +318,9 @@ export function deriveState(view: SessionView): DerivedState {
     out.suspended = true;
     return out;
   }
-  if (view.actor.phase === 'stopped') {
+  // `stopping` with no live actor is a stop its actor died finishing: it is completed (to
+  // `stopped`) by the next lock holder, never woken — report it as stopped already.
+  if (view.actor.phase === 'stopped' || (view.actor.phase === 'stopping' && !view.live)) {
     out.stopped = true;
     return out;
   }

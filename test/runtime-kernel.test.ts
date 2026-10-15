@@ -359,6 +359,7 @@ describe('deriveState', () => {
     ['stopped (sticky)', { phase: 'stopped' as const, live: false }, { state: 'failed', stopped: true, suspended: false }],
     ['actor gone (crash)', { phase: 'running' as const, live: false }, { state: 'failed', stopped: false, suspended: true }],
     ['suspended', { phase: 'suspended' as const, live: false }, { state: 'failed', suspended: true }],
+    ['actor died mid-stop', { phase: 'stopping' as const, live: false }, { state: 'failed', stopped: true, suspended: false }],
     ['provider initialising', { phase: 'starting' as const, journal: [started] }, { state: 'starting' }],
     ['idle', { journal: [started] }, { state: 'done', stopped: false, suspended: false }],
     ['queued inbox message', { journal: [started], pendingMessages: 1 }, { state: 'running' }],

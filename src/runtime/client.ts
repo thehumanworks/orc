@@ -29,6 +29,7 @@ import {
   writeActorState,
 } from './actor-state.ts';
 import { TurnLedger, staleProviders, summarizeLedger, verdictFor } from './derive.ts';
+import { abandonedStopReason, finalizeStopLocked, isAbandonedStop } from './stop.ts';
 import type { DeliveryVerdict, SessionView } from './derive.ts';
 
 export { readJournal, followJournal, JournalCursor } from './journal.ts';
@@ -303,6 +304,12 @@ export async function ensureAwake(sessionId: string, opts: EnsureAwakeOptions = 
       return { status: 'live', actor: { pid: st.lease.pid, startTime: st.lease.startTime } };
     }
     if (st.phase === 'stopped') return { status: 'stopped' };
+    if (isAbandonedStop(st)) {
+      // The actor died mid-stop (phase `stopping`, lease dead): finish that stop — it is
+      // sticky — instead of waking the session.
+      await finalizeStopLocked(sessionId, st, abandonedStopReason(sessionId, st));
+      return { status: 'stopped' };
+    }
     const failures = st.startFailures ?? 0;
     if (failures >= MAX_CONSECUTIVE_START_FAILURES && !opts.force) {
       throw new SessionStartError(
@@ -578,11 +585,17 @@ export async function stop(
     if (!leaseLive(st) && (await awaitLeaseRenewal(sessionId))) st = readActorState(sessionId);
     if (leaseLive(st) && !asked) {
       asked = true;
-      enqueue(sessionId, { kind: 'stop', graceMs, ...(opts.reason ? { reason: opts.reason } : {}) });
+      const item = enqueue(sessionId, { kind: 'stop', graceMs, ...(opts.reason ? { reason: opts.reason } : {}) });
       const deadline = Date.now() + graceMs + (opts.timeoutMs ?? 10_000);
       while (Date.now() < deadline) {
         const cur = readActorState(sessionId);
-        if (cur?.phase === 'stopped') return { status: 'stopped' };
+        if (cur?.phase === 'stopped') {
+          // The actor unlinks the stop item right after its final state write.
+          const until = Date.now() + 3_000;
+          while (Date.now() < until && listPending(sessionId).some((i) => i.ulid === item.ulid)) await Bun.sleep(10);
+          removeInboxItem(sessionId, item.ulid);
+          return { status: 'stopped' };
+        }
         if (!leaseLive(cur)) break;
         await Bun.sleep(25);
       }
@@ -592,35 +605,10 @@ export async function stop(
       if (cur.phase === 'stopped') return 'stopped';
       // Someone woke it meanwhile: ask it to stop first (once).
       if (leaseLive(cur) && !asked) return 'retry';
-      if (cur.lease && isLiveProcess(cur.lease)) await terminateGroup(cur.lease, 1_000);
-      await terminateStaleProviders(sessionId, cur);
-      // No live actor and we hold the lock: we are the only journal writer.
-      const j = JournalWriter.forSession(sessionId);
-      try {
-        const ledger = TurnLedger.from(readJournal(sessionId));
-        for (const t of ledger.openTurns()) {
-          j.append({ type: 'turn.interrupted', messageId: t.messageId, reason: 'recovered' });
-          removeInboxItem(sessionId, t.ulid);
-        }
-        for (const it of listPending(sessionId)) {
-          if (it.kind !== 'message' || ledger.intentUlids.has(it.ulid)) continue;
-          j.append({ type: 'inbox.dropped', ulid: it.ulid, messageId: it.messageId, reason: 'stopped' });
-          removeInboxItem(sessionId, it.ulid);
-        }
-        j.append({ type: 'actor.stopped', reason: 'stop', ...(opts.reason ? { error: opts.reason } : {}) });
-        cur.lastSeq = Math.max(cur.lastSeq, j.lastSeq);
-      } finally {
-        j.close();
-      }
-      cur.phase = 'stopped';
-      cur.stopReason = opts.reason ?? 'stop';
-      delete cur.lease;
-      if (!cur.provider || !isLiveProcess(cur.provider)) delete cur.provider;
-      cur.updatedAt = new Date().toISOString();
-      writeActorState(cur, { fsync: true });
-      for (const it of listPending(sessionId)) {
-        if (it.kind !== 'message') removeInboxItem(sessionId, it.ulid);
-      }
+      // An actor that died mid-stop keeps the reason it persisted with `stopping`.
+      const reason =
+        cur.phase === 'stopping' ? abandonedStopReason(sessionId, cur, opts.reason) : (opts.reason ?? 'stop');
+      await finalizeStopLocked(sessionId, cur, reason);
       return 'stopped';
     });
     if (r === 'stopped') return { status: 'stopped' };
@@ -698,6 +686,10 @@ export async function reopen(
   return withActorLock(sessionId, async () => {
     requireSpec(sessionId);
     const st = readActorState(sessionId);
+    // A stop interrupted by an actor crash is finished first, then reopened like any stop.
+    if (st && !leaseLive(st) && isAbandonedStop(st)) {
+      await finalizeStopLocked(sessionId, st, abandonedStopReason(sessionId, st));
+    }
     if (!st || st.phase !== 'stopped' || leaseLive(st)) return { status: 'not-stopped' as const };
     const j = JournalWriter.forSession(sessionId);
     try {

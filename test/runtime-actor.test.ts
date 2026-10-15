@@ -11,6 +11,7 @@ import {
   SessionStartError,
   SessionStoppedError,
   createSession,
+  reopen,
   deliveryVerdict,
   deriveState,
   ensureAwake,
@@ -20,7 +21,7 @@ import {
   send,
   stop,
 } from '../src/runtime/client.ts';
-import { enqueue, listPending } from '../src/runtime/inbox.ts';
+import { enqueue, listPending, removeInboxItem } from '../src/runtime/inbox.ts';
 import {
   isLiveProcess,
   leaseLive,
@@ -93,6 +94,31 @@ async function orphanDuringHandshake(sid: string, nth = 1): Promise<ProcessIdent
   expect(isLiveProcess(orphan)).toBe(true);
   expect(fakeProviderPids(sid)).toEqual([orphan.pid]);
   return orphan;
+}
+
+const STOPPING_SCRIPT: FakeScript = {
+  ignoreStdinEofMs: 60_000,
+  rules: [{ match: 'HANG', action: 'hang', ignoreInterrupt: true }],
+};
+
+/**
+ * An actor SIGKILLed mid-stop: it accepted a stop item and persisted `stopping` + reason
+ * (the provider ignores the interrupt, so the actor sits in its bounded interrupt wait),
+ * then dies before writing `stopped`. `consumeStopItem` reproduces the worst case where
+ * the stop item is already gone too. Leaves the provider orphaned (it ignores EOF).
+ */
+async function crashWhileStopping(sid: string, reason: string, consumeStopItem: boolean): Promise<ProcessIdentity> {
+  expect((await send(sid, { messageId: 'h1', text: 'HANG' })).verdict).toBe('acknowledged');
+  const provider = readActorState(sid)!.provider!;
+  const pid = actorPid(sid);
+  const item = enqueue(sid, { kind: 'stop', reason, graceMs: 4_000 });
+  await waitFor(() => readActorState(sid)?.phase === 'stopping', 'stopping');
+  process.kill(pid, 'SIGKILL');
+  await waitFor(() => !leaseLive(readActorState(sid)), 'lease to die');
+  expect(readActorState(sid)).toMatchObject({ phase: 'stopping', stopReason: reason });
+  if (consumeStopItem) removeInboxItem(sid, item.ulid);
+  expect(isLiveProcess(provider)).toBe(true);
+  return provider;
 }
 
 /** SIGKILL only the actor (its provider lives in its own group) and wait until not live. */
@@ -545,6 +571,79 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
       expect((await ensureAwake(sid)).status).toBe('started');
       expect(fs.existsSync(stale)).toBe(false);
       expect(fs.existsSync(fresh)).toBe(true);
+    },
+    T,
+  );
+
+  test(
+    'actor dies mid-stop (stop item already gone): ensureAwake finishes the stop, never wakes; reason kept',
+    async () => {
+      const sid = await newSession(STOPPING_SCRIPT);
+      const provider = await crashWhileStopping(sid, 'takeover', true);
+      expect(deriveState(inspect(sid))).toMatchObject({ state: 'failed', stopped: true, suspended: false });
+      await expect(send(sid, { messageId: 'x1', text: 'x' })).rejects.toBeInstanceOf(SessionStoppedError);
+      expect(await ensureAwake(sid)).toEqual({ status: 'stopped' });
+      expect(readActorState(sid)).toMatchObject({ phase: 'stopped', stopReason: 'takeover' });
+      expect(readActorState(sid)?.lease).toBeUndefined();
+      expect(isLiveProcess(provider)).toBe(false);
+      expect(entries(sid, 'actor.started')).toHaveLength(1);
+      expect(entries(sid, 'turn.interrupted', 'h1')).toMatchObject([{ reason: 'recovered' }]);
+      expect(entries(sid, 'actor.stopped').at(-1)).toMatchObject({ reason: 'stop', error: 'takeover' });
+      expect(await stop(sid)).toEqual({ status: 'already-stopped' });
+      expect(listPending(sid)).toEqual([]);
+      expect(fakeProviderPids(sid)).toEqual([]);
+      expect(actorPids(sid)).toEqual([]);
+    },
+    T,
+  );
+
+  test(
+    'actor dies mid-stop (stop item still queued): a directly started actor finishes the stop instead of starting',
+    async () => {
+      const sid = await newSession(STOPPING_SCRIPT);
+      const provider = await crashWhileStopping(sid, 'kill', false);
+      const spec = readSpawnSpec(sid)!;
+      spawnDetached([...selfArgv(), '__actor', sid], { cwd: spec.cwd, env: process.env, logPath: sessionPaths(sid).actorLog });
+      await waitFor(() => readActorState(sid)?.phase === 'stopped', 'stopped by the booting actor');
+      expect(readActorState(sid)).toMatchObject({ stopReason: 'kill' });
+      expect(isLiveProcess(provider)).toBe(false);
+      expect(entries(sid, 'actor.started')).toHaveLength(1);
+      expect(entries(sid, 'provider.spawned')).toHaveLength(1);
+      await waitFor(() => actorPids(sid).length === 0, 'booting actor to exit');
+      expect(listPending(sid)).toEqual([]);
+    },
+    T,
+  );
+
+  test(
+    'actor dies mid-stop: stop() completes it keeping the original reason; resume (reopen) then works',
+    async () => {
+      const sid = await newSession(STOPPING_SCRIPT);
+      const provider = await crashWhileStopping(sid, 'takeover', true);
+      expect(await stop(sid, { reason: 'kill' })).toEqual({ status: 'stopped' });
+      expect(readActorState(sid)).toMatchObject({ phase: 'stopped', stopReason: 'takeover' });
+      expect(isLiveProcess(provider)).toBe(false);
+      // Explicit resume path (session.resume): reopen, then a forced wake.
+      expect(await reopen(sid, { reason: 'resume' })).toEqual({ status: 'reopened' });
+      expect((await ensureAwake(sid, { force: true })).status).toBe('started');
+      await send(sid, { messageId: 'after', text: 'back' });
+      await waitCompleted(sid, 'after');
+      expect(fakeProviderPids(sid)).toEqual([readActorState(sid)!.provider!.pid]);
+    },
+    T,
+  );
+
+  test(
+    'resume (reopen) of a session whose actor died mid-stop finishes the stop first',
+    async () => {
+      const sid = await newSession(STOPPING_SCRIPT);
+      const provider = await crashWhileStopping(sid, 'takeover', true);
+      expect(await reopen(sid, { reason: 'resume' })).toEqual({ status: 'reopened' });
+      expect(isLiveProcess(provider)).toBe(false);
+      const types = readJournal(sid).map((e) => e.type);
+      expect(types.lastIndexOf('actor.stopped')).toBeLessThan(types.lastIndexOf('actor.reopened'));
+      expect(readActorState(sid)?.phase).toBe('suspended');
+      expect((await ensureAwake(sid, { force: true })).status).toBe('started');
     },
     T,
   );

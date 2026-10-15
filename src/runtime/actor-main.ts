@@ -52,6 +52,7 @@ import {
   writeActorState,
 } from './actor-state.ts';
 import { TurnLedger, staleProviders } from './derive.ts';
+import { abandonedStopReason, finalizeStopLocked, isAbandonedStop } from './stop.ts';
 import { getRuntimeFactory } from './providers/index.ts';
 import { ulidTime } from './ulid.ts';
 
@@ -153,6 +154,8 @@ class Actor {
   private providerSessionId?: string;
   private startFailures = 0;
   private lastStartError?: string;
+  /** Set when a sticky stop begins, so `stopping` is never persisted without its reason. */
+  private stopReason?: string;
   private readonly handlers: Array<[string, (...args: unknown[]) => void]> = [];
 
   constructor(private readonly sid: string) {
@@ -212,6 +215,11 @@ class Actor {
         st.lease.pid === this.pid &&
         (st.lease.startTime === null || st.lease.startTime === this.startTime);
       if (!mine && leaseLive(st)) return 'busy';
+      if (isAbandonedStop(st)) {
+        // The previous actor died mid-stop: finish that stop (sticky), never start.
+        await finalizeStopLocked(this.sid, st, abandonedStopReason(this.sid, st));
+        return 'stopped';
+      }
       // Interrupts enqueued before this incarnation was launched cannot target its turns.
       const launchedAt = mine ? Date.parse(st.updatedAt) : NaN;
       this.interruptCutoffMs = Number.isFinite(launchedAt) ? Math.min(launchedAt, Date.now()) : Date.now();
@@ -246,6 +254,7 @@ class Actor {
       s.phase = this.phase;
       if (this.providerSessionId) s.providerSessionId = this.providerSessionId;
       if (this.providerId) s.provider = this.providerId;
+      if (this.stopReason !== undefined) s.stopReason = this.stopReason;
       if (this.startFailures > 0) {
         s.startFailures = this.startFailures;
         if (this.lastStartError) s.lastStartError = this.lastStartError;
@@ -282,12 +291,14 @@ class Actor {
   }
 
   /** updateState with policy: lease loss → shut down; other errors are logged. */
-  private async persist(mut: (s: ActorStateFile) => void = () => {}, opts: { fsync?: boolean } = {}): Promise<void> {
+  private async persist(mut: (s: ActorStateFile) => void = () => {}, opts: { fsync?: boolean } = {}): Promise<boolean> {
     try {
       await this.updateState(mut, opts);
+      return true;
     } catch (e) {
       if (e instanceof LeaseLostError) this.onLeaseLost();
       else this.log(`state write failed: ${errMsg(e)}`);
+      return false;
     }
   }
 
@@ -700,7 +711,10 @@ class Actor {
     const graceMs = o.graceMs ?? DEFAULT_STOP_GRACE_MS;
     try {
       if (owns && o.phase === 'stopped') {
+        // Persisted with its reason: if this actor dies before `stopped`, whoever next
+        // takes the lock finishes the stop (finalizeStopLocked) instead of waking it.
         this.phase = 'stopping';
+        this.stopReason = o.stopReason;
         await this.persist();
       }
       if (this.starting) await withTimeout(this.starting, graceMs + 10_000);
@@ -748,10 +762,8 @@ class Actor {
         this.log(`journal write failed during shutdown: ${errMsg(e)}`);
       }
     }
-    // Handled + journaled: consume the stop item before the final state write, so a
-    // caller that sees `stopped` also sees an empty control inbox.
-    if (o.stopUlid) removeInboxItem(this.sid, o.stopUlid);
     clearInterval(this.heartbeat);
+    let finalWritten = false;
     if (owns) {
       const providerGone = !this.providerId || !isLiveProcess(this.providerId);
       this.phase = o.phase;
@@ -760,9 +772,9 @@ class Actor {
         this.startFailures += 1;
         this.lastStartError = o.error ?? o.stopReason;
       }
-      await this.persist(
+      this.stopReason = o.stopReason;
+      finalWritten = await this.persist(
         (s) => {
-          s.stopReason = o.stopReason;
           delete s.lease;
           if (providerGone) delete s.provider;
           else if (this.providerId) s.provider = this.providerId;
@@ -770,6 +782,9 @@ class Actor {
         { fsync: true },
       );
     }
+    // Consume the stop item only once `stopped` is durable: until then it is the second
+    // safety net (a woken actor would process it again) next to `stopping` + stopReason.
+    if (o.stopUlid && finalWritten) removeInboxItem(this.sid, o.stopUlid);
     this.journal?.close();
     for (const [ev, fn] of this.handlers) process.off(ev, fn);
     this.log(`stopped (${o.phase})`);
