@@ -51,15 +51,15 @@ describe('runWorkflow with the default executor', () => {
       const events: WorkflowEvent[] = [];
       const def: WorkflowDef = {
         name: 'wf-events',
-        steps: [{ id: 'one', provider: 'claude', cwd: work, prompt: 'events please', allowUnverified: true }],
+        steps: [{ id: 'evt', provider: 'claude', cwd: work, prompt: 'events please', allowUnverified: true }],
       };
       const run = await runWorkflow(def, { runId: 'wfev1', onEvent: (e) => events.push(e) });
       expect(run.status).toBe('done');
       expect(phasesByStep(events)).toEqual({
-        one: ['queued', 'spawning', 'dispatched', 'running', 'verifying', 'succeeded'],
+        evt: ['queued', 'spawning', 'dispatched', 'running', 'verifying', 'succeeded'],
       });
       // The data attached by the same-phase re-record is still persisted.
-      const att = (await readRun('wfev1'))!.attempts!.find((a) => a.stepId === 'one')!;
+      const att = (await readRun('wfev1'))!.attempts!.find((a) => a.stepId === 'evt')!;
       expect(att.resultPath).toBeString();
       expect(att.phase).toBe('succeeded');
 
@@ -79,7 +79,7 @@ describe('runWorkflow with the default executor', () => {
         }),
       });
       expect(stub.status).toBe('done');
-      expect(phasesByStep(stubEvents)).toEqual({ one: ['queued', 'spawning', 'dispatched', 'verifying', 'succeeded'] });
+      expect(phasesByStep(stubEvents)).toEqual({ evt: ['queued', 'spawning', 'dispatched', 'verifying', 'succeeded'] });
     },
     T,
   );
