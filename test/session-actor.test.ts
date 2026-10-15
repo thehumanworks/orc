@@ -13,6 +13,7 @@ import { readRegistry } from '../src/registry.ts';
 import { readSpawnSpec } from '../src/runtime/spec.ts';
 import { readActorState, leaseLive } from '../src/runtime/actor-state.ts';
 import { sessionPaths } from '../src/runtime/layout.ts';
+import { deliveryVerdict } from '../src/runtime/client.ts';
 import type { Session } from '../src/session.ts';
 import { renderCapture } from '../src/journal-render.ts';
 import { actorPids, fakeProviderPids, killSessionProcesses, mkTmp, waitFor } from './runtime-helpers.ts';
@@ -239,10 +240,22 @@ describe('agent() + Session on the actor runtime', () => {
       await crashActor(a);
       // a is suspended: it does not hold a slot, so b may spawn.
       const b = await spawn({ rootRunId: 'root-d2', policy });
-      await expect(a.send('wake me')).rejects.toThrow(/maxConcurrentSessions=1/);
+      await expect(a.send('first attempt', { messageId: 'd2-first' })).rejects.toThrow(/maxConcurrentSessions=1/);
       expect(await a.status()).toBe('suspended');
+      // The rejected wake leaves nothing queued for a later wake to deliver.
+      expect((await a.stateDetail()).pendingMessages).toBe(0);
+      expect(a.journal().filter((e) => e.type === 'inbox.dropped')).toMatchObject([
+        { messageId: 'd2-first', reason: 'policy' },
+      ]);
+      expect(deliveryVerdict(a.sessionId, 'd2-first')).toBe('failed');
       await b.kill();
-      expect((await a.send('wake me')).phase).toBe('acknowledged');
+      expect((await a.send('second attempt', { messageId: 'd2-second' })).phase).toBe('acknowledged');
+      expect((await a.waitForResult({ timeoutMs: 10_000 })).state).toBe('done');
+      const delivered = a
+        .journal()
+        .filter((e) => e.type === 'turn.intent')
+        .map((e) => (e.type === 'turn.intent' ? e.text : ''));
+      expect(delivered).toEqual(['second attempt']);
       await a.kill();
     },
     T,
