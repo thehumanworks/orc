@@ -51,6 +51,7 @@ import {
   RunnerSpawnError,
 } from '../src/workflow-runner.ts';
 import { serveDaemon } from '../src/daemon/server.ts';
+import { sanitizeLockName } from '../src/lock.ts';
 import { renderRunDetail } from '../src/cli/output.ts';
 
 const CLI = path.resolve(import.meta.dir, '..', 'src', 'cli', 'index.ts');
@@ -846,12 +847,29 @@ describe('real detached runner processes', () => {
     20_000,
   );
 
+  /**
+   * SIGSTOP `pid` OUTSIDE its `run:<runId>` lock section. Frozen INSIDE it, the owner stays
+   * alive while holding the lock, so every reconcile blocks on it (up to the lock timeout)
+   * — a test artefact, not the scenario under test. If the lock file exists right after
+   * the stop: SIGCONT, give it 5 ms to leave the section, retry.
+   */
+  function freezeOutsideRunLock(pid: number, runId: string): void {
+    const lockFile = path.join(process.env.ORC_HOME!, 'locks', `${sanitizeLockName(`run:${runId}`)}.lock`);
+    for (let i = 0; i < 200; i++) {
+      process.kill(pid, 'SIGSTOP');
+      if (!fs.existsSync(lockFile)) return;
+      process.kill(pid, 'SIGCONT');
+      Bun.sleepSync(5);
+    }
+    throw new Error(`could not freeze ${pid} outside its run:${runId} lock section`);
+  }
+
   test(
     'SIGSTOP past the lease, superseded by a new runner, SIGCONT: the stale runner cannot overwrite it',
     async () => {
       const leaseMs = 400;
       const r1 = await startBlockingRunner('ss1', leaseMs);
-      process.kill(r1.pid, 'SIGSTOP');
+      freezeOutsideRunLock(r1.pid, 'ss1');
       try {
         await waitFor(
           async () => (await reconcileRun((await readRun('ss1'))!)).status === 'orphaned',
