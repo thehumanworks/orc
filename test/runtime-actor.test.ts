@@ -686,6 +686,34 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
   );
 
   test(
+    'host sleep: an alive actor with an expired lease is given a heartbeat to renew, not killed',
+    async () => {
+      const sid = await newSession({ rules: [{ match: 'HANG', action: 'hang' }] });
+      expect((await send(sid, { messageId: 'h1', text: 'HANG' })).verdict).toBe('acknowledged');
+      const before = readActorState(sid)!;
+      // As after a laptop sleep: the lease looks expired. Also rewind the phase, as if a
+      // state write had been lost — the next heartbeat must re-apply the intended phase.
+      await withActorLock(sid, async () => {
+        const st = readActorState(sid)!;
+        st.lease!.expiresAt = new Date(Date.now() - 1_000).toISOString();
+        st.phase = 'starting';
+        writeActorState(st);
+      });
+      expect(leaseLive(readActorState(sid))).toBe(false);
+      const r = await send(sid, { messageId: 'n2', text: 'next' }, { ackTimeoutMs: 300 });
+      expect(r).toMatchObject({ woke: false, verdict: 'queued' });
+      const after = readActorState(sid)!;
+      expect(after.lease?.pid).toBe(before.lease!.pid);
+      expect(after.provider?.pid).toBe(before.provider!.pid);
+      expect(after.phase).toBe('running');
+      expect(leaseLive(after)).toBe(true);
+      expect(deliveryVerdict(sid, 'h1')).toBe('acknowledged');
+      expect(entries(sid, 'actor.started')).toHaveLength(1);
+    },
+    T,
+  );
+
+  test(
     'lease lost → the actor kills its provider and exits without touching state.json',
     async () => {
       const sid = await newSession();

@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { assertValidMessageId } from '../paths.ts';
 import { selfArgv, spawnDetached } from './process.ts';
-import { LEASE_TTL_MS } from './types.ts';
+import { LEASE_HEARTBEAT_MS, LEASE_TTL_MS } from './types.ts';
 import type { ActorStateFile, ProcessIdentity, SpawnSpec } from './types.ts';
 import { ensureSessionDirs, sessionPaths } from './layout.ts';
 import { assertValidSessionId, readFileTail } from './fsutil.ts';
@@ -106,6 +106,27 @@ function spawnActorLocked(sessionId: string, state: ActorStateFile): ProcessIden
   delete next.stopReason;
   writeActorState(next, { fsync: true });
   return actor;
+}
+
+/**
+ * Host sleep (laptops): an actor whose process is alive but whose lease expired is most
+ * likely healthy and renews on its next heartbeat. Give it one heartbeat (+1 s) before
+ * anyone treats it as wedged and kills it. Returns true when the lease is live (again).
+ * Called WITHOUT the actor lock (the actor needs it to renew).
+ */
+async function awaitLeaseRenewal(sessionId: string): Promise<boolean> {
+  const st = readActorState(sessionId);
+  if (leaseLive(st)) return true;
+  const active = st?.phase === 'starting' || st?.phase === 'running' || st?.phase === 'stopping';
+  if (!st?.lease || !active || !isLiveProcess(st.lease)) return false;
+  const deadline = Date.now() + LEASE_HEARTBEAT_MS + 1_000;
+  while (Date.now() < deadline) {
+    await Bun.sleep(50);
+    const cur = readActorState(sessionId);
+    if (leaseLive(cur)) return true;
+    if (!cur?.lease || !isLiveProcess(cur.lease)) return false;
+  }
+  return false;
 }
 
 /**
@@ -206,6 +227,7 @@ export type EnsureAwakeResult =
  */
 export async function ensureAwake(sessionId: string, opts: EnsureAwakeOptions = {}): Promise<EnsureAwakeResult> {
   assertValidSessionId(sessionId);
+  await awaitLeaseRenewal(sessionId);
   const r = await withActorLock(sessionId, async (): Promise<EnsureAwakeResult> => {
     requireSpec(sessionId);
     const st = readActorState(sessionId) ?? initialActorState(sessionId, 'suspended');
@@ -448,8 +470,9 @@ export async function stop(
 
   let asked = false;
   for (let attempt = 0; attempt < 3; attempt++) {
-    const st = readActorState(sessionId);
+    let st = readActorState(sessionId);
     if (st?.phase === 'stopped') return { status: 'stopped' };
+    if (!leaseLive(st) && (await awaitLeaseRenewal(sessionId))) st = readActorState(sessionId);
     if (leaseLive(st) && !asked) {
       asked = true;
       enqueue(sessionId, { kind: 'stop', graceMs, ...(opts.reason ? { reason: opts.reason } : {}) });
