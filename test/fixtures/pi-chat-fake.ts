@@ -14,7 +14,7 @@
  * - Replies: "exactly one word…: X" → X; "same single word you replied with last time" →
  *   the last reply; "…first message…" → the first reply; "What codeword…" → the codeword
  *   from "Remember the codeword X" in history; otherwise "OK".
- * - stdin EOF → exit 0 (like pi).
+ * - stdin EOF → exit 0 (like pi). PI_FAKE_REPLY_DELAY_MS slows every reply (default 20 ms).
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -127,7 +127,7 @@ rl.on('line', (line) => {
       const r = reply(text, [...h, { role: 'user', content: text }]);
       append({ role: 'user', content: text });
       append({ role: 'assistant', content: r });
-      setTimeout(() => settle(r, 'stop'), 20);
+      setTimeout(() => settle(r, 'stop'), Number(process.env.PI_FAKE_REPLY_DELAY_MS ?? 20));
       return;
     }
     case 'abort':

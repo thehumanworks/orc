@@ -4,7 +4,7 @@
  *
  *   bun scripts/verify-runtime/all.ts [--providers claude,codex,pi] [--claude-model M]
  *       [--codex-model M] [--pi-model M] [--keep]
- *       [--claude-bin P] [--codex-bin P] [--pi-bin P] [--no-runtime-gates] [--no-workflow]
+ *       [--claude-bin P] [--codex-bin P] [--pi-bin P] [--no-runtime-gates] [--no-e2e] [--no-workflow]
  *       [--results <file>]   (default: <repo>/verify-results.json)
  *
  * 1. Preflight: OS/arch, bun, each provider's binary + version (a missing provider is SKIP,
@@ -43,15 +43,16 @@ interface Args {
   bin: Partial<Record<Provider, string>>;
   keep: boolean;
   runtimeGates: boolean;
+  e2e: boolean;
   workflow: boolean;
 }
 
 const USAGE = `usage: bun scripts/verify-runtime/all.ts [--providers claude,codex,pi] [--claude-model M]
        [--codex-model M] [--pi-model M] [--keep] [--claude-bin P] [--codex-bin P] [--pi-bin P]
-       [--no-runtime-gates] [--no-workflow] [--results <file>]`;
+       [--no-runtime-gates] [--no-e2e] [--no-workflow] [--results <file>]`;
 
 function parseArgs(argv: string[]): Args {
-  const a: Args = { providers: [...PROVIDERS], model: {}, bin: {}, keep: false, runtimeGates: true, workflow: true };
+  const a: Args = { providers: [...PROVIDERS], model: {}, bin: {}, keep: false, runtimeGates: true, e2e: true, workflow: true };
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i]!;
     const val = (): string => {
@@ -73,6 +74,7 @@ function parseArgs(argv: string[]): Args {
     else if (k === '--keep') a.keep = true;
     else if (k === '--no-runtime-gates') a.runtimeGates = false;
     else if (k === '--no-workflow') a.workflow = false;
+    else if (k === '--no-e2e') a.e2e = false;
     else if (k === '-h' || k === '--help') {
       console.log(USAGE);
       process.exit(0);
@@ -195,31 +197,84 @@ function killTree(pid: number | undefined): void {
   }
 }
 
-/** SIGKILL the actor + provider groups recorded in every state.json under `root`. */
-function killEverythingUnder(root: string): void {
-  const walk = (dir: string, depth: number): void => {
-    if (depth > 6) return;
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      const p = path.join(dir, e.name);
-      if (e.isDirectory()) walk(p, depth + 1);
-      else if (e.name === 'state.json') {
-        try {
-          const st = JSON.parse(fs.readFileSync(p, 'utf8')) as { lease?: ProcessIdentity; provider?: ProcessIdentity };
-          // Identity-checked (pid + start time): a recycled pid is never signalled.
-          for (const id of [st.lease, st.provider]) if (id && isSameProcessAlive(id)) killTree(id.pid);
-        } catch {
-          /* unreadable */
-        }
-      }
-    }
+/** Files under `dir` (depth-bounded) whose path matches `pred`. */
+function findFiles(dir: string, pred: (file: string) => boolean, depth = 0): string[] {
+  if (depth > 7) return [];
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) out.push(...findFiles(p, pred, depth + 1));
+    else if (pred(p)) out.push(p);
+  }
+  return out;
+}
+
+function readJson<T>(file: string): T | undefined {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8')) as T;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Child processes (orc CLI calls, runtime gates) currently running for this run. */
+const activeChildren = new Set<Bun.Subprocess>();
+
+/**
+ * Stop everything this run started under `root` (Ctrl-C path). Order matters: detached
+ * workflow runners first (they would otherwise spawn new step sessions), then our own
+ * child processes, then — twice, to catch an actor that registered late — every actor and
+ * provider recorded in a state.json. Every pid is identity-checked (pid + start time).
+ */
+function stopEverythingUnder(root: string): void {
+  const killId = (id: ProcessIdentity | undefined) => {
+    if (id && isSameProcessAlive(id)) killTree(id.pid);
   };
-  walk(root, 0);
+  for (const f of findFiles(root, (f) => path.basename(path.dirname(f)) === 'runs' && f.endsWith('.json'))) {
+    const run = readJson<{ runner?: ProcessIdentity }>(f);
+    if (run?.runner) killId({ pid: run.runner.pid, startTime: run.runner.startTime ?? null });
+  }
+  for (const child of activeChildren) {
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      /* gone */
+    }
+  }
+  for (let pass = 0; pass < 2; pass++) {
+    Bun.sleepSync(300);
+    for (const f of findFiles(root, (f) => path.basename(f) === 'state.json')) {
+      const st = readJson<{ lease?: ProcessIdentity; provider?: ProcessIdentity }>(f);
+      killId(st?.lease);
+      killId(st?.provider);
+    }
+  }
+}
+
+/** Every session id recorded in a registry.json under `root`. */
+function sessionIdsUnder(root: string): string[] {
+  const out: string[] = [];
+  for (const f of findFiles(root, (f) => path.basename(f) === 'registry.json')) {
+    for (const r of readJson<{ sessionId?: string }[]>(f) ?? []) if (r.sessionId) out.push(r.sessionId);
+  }
+  return out;
+}
+
+/** Remove the claude transcript dirs this run created (their slug embeds the temp root name). */
+function removeClaudeTranscripts(root: string, sids: Iterable<string>, env: Record<string, string>): void {
+  const marker = path.basename(root);
+  for (const sid of sids) {
+    const t = resolveClaudeTranscript(sid, env);
+    if (t && path.basename(path.dirname(t)).includes(marker)) {
+      fs.rmSync(path.dirname(t), { recursive: true, force: true });
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------------
@@ -289,12 +344,14 @@ async function orc(ctx: Ctx, args: string[], timeoutMs = 240_000): Promise<Run> 
     stdout: 'pipe',
     stderr: 'pipe',
   });
+  activeChildren.add(proc);
   const timer = setTimeout(() => proc.kill('SIGKILL'), timeoutMs);
   try {
     const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
     return { code: await proc.exited, out, err };
   } finally {
     clearTimeout(timer);
+    activeChildren.delete(proc);
   }
 }
 
@@ -622,10 +679,12 @@ async function runtimeGate(p: Provider, env: Record<string, string>, model: stri
     stdout: 'pipe',
     stderr: 'pipe',
   });
+  activeChildren.add(proc);
   const timer = setTimeout(() => proc.kill('SIGTERM'), 900_000);
   const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
   clearTimeout(timer);
   const exitCode = await proc.exited;
+  activeChildren.delete(proc);
   const text = sanitize(`${out}\n${err}`);
   for (const l of text.trim().split('\n')) console.log(`      | ${l}`);
   const lines = text.trim().split('\n').filter(Boolean);
@@ -661,9 +720,12 @@ async function main(): Promise<number> {
   for (const p of PROVIDERS) if (args.bin[p] && BIN_ENV[p]) env[BIN_ENV[p]!] = path.join(shimDir, p);
   // Ctrl-C: stop every actor/provider this run started (found via its temp ORC_HOMEs).
   const onInterrupt = () => {
-    console.error('\ninterrupted: stopping the sessions this run started…');
-    killEverythingUnder(root);
-    if (!args.keep) fs.rmSync(root, { recursive: true, force: true });
+    console.error('\ninterrupted: stopping the runners and sessions this run started…');
+    stopEverythingUnder(root);
+    if (!args.keep) {
+      removeClaudeTranscripts(root, new Set([...claudeSids, ...sessionIdsUnder(root)]), env);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
     process.exit(130);
   };
   process.once('SIGINT', onInterrupt);
@@ -718,8 +780,8 @@ async function main(): Promise<number> {
   // 3. CLI e2e
   console.log('\n[3/4] CLI end-to-end (isolated ORC_HOME, temp git repo)');
   for (const p of args.providers) {
-    if (!available.includes(p)) {
-      record(p, 'e2e', 'SKIP', 'provider unavailable');
+    if (!available.includes(p) || !args.e2e) {
+      record(p, 'e2e', 'SKIP', args.e2e ? 'provider unavailable' : '--no-e2e');
       continue;
     }
     const ctx: Ctx = { provider: p, home: path.join(root, p, 'orc-home'), repo: path.join(root, p, 'repo'), env };
@@ -753,12 +815,7 @@ async function main(): Promise<number> {
 
   // cleanup: temp root + claude transcripts this run created (only dirs named after our temp root)
   if (!args.keep) {
-    for (const sid of claudeSids) {
-      const t = resolveClaudeTranscript(sid, env);
-      if (t && path.basename(path.dirname(t)).includes('orc-verify-all-')) {
-        fs.rmSync(path.dirname(t), { recursive: true, force: true });
-      }
-    }
+    removeClaudeTranscripts(root, new Set([...claudeSids, ...sessionIdsUnder(root)]), env);
     fs.rmSync(root, { recursive: true, force: true });
   }
 
@@ -788,6 +845,7 @@ async function main(): Promise<number> {
       models: args.model,
       binOverrides: Object.keys(args.bin),
       runtimeGates: args.runtimeGates,
+      e2e: args.e2e,
       workflow: args.workflow,
       kept: args.keep,
     },
