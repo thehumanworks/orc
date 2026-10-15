@@ -21,7 +21,10 @@ Design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (the current system) and
 | --- | --- |
 | [Bun](https://bun.sh) | ≥ 1.3 (`engines.bun`); developed on 1.4.2 |
 | OS | macOS or Linux (POSIX process groups; macOS also needs `ps`). No Windows. |
-| a provider | at least one of: `claude` or `pi` on `PATH`, authenticated (verified: claude 2.1.300, pi 1.2.0; other versions are not refused); for `codex`, an OpenAI credential — `orc login chatgpt`, pi's ChatGPT login, or `OPENAI_API_KEY` (see [codex](#codex-built-in-harness)) |
+| at least one provider | see below; other CLI versions are not refused |
+| `claude` CLI | for `--provider claude`: on `PATH` (or `ORC_CLAUDE_BIN`), signed in. Verified: 2.1.300 |
+| `pi` CLI | only for `--provider pi`, and to continue a codex session after `orc takeover`. Verified: 1.2.0 |
+| OpenAI credential | for `--provider codex`: `orc login chatgpt`, pi's ChatGPT login, or `OPENAI_API_KEY` (see [codex](#codex-built-in-harness)). The `codex` CLI is **not** needed |
 | `git` | only for `--worktree` |
 | `tailscale` | only for `orc daemon` / `--host` |
 
@@ -55,7 +58,8 @@ orc kill "$ID"                 # stop it (record + journal kept; --purge removes
 | --- | --- | --- |
 | `running` | the session's actor holds a live lease | — |
 | `suspended` | actor gone without a stop (crash, reboot, provider exit) | the next `orc send` wakes it and resumes the provider session; `orc resume` does too |
-| `dead` | stopped by `orc kill` / `orc takeover`, a legacy tmux record, or no runtime state | sticky: never auto-wakes. `orc resume` hands a killed or taken-over session back |
+| `spawning` | reserved by `orc spawn` moments ago; the actor is being created (`state`: `starting`) | becomes `running`, or `dead` if the spawn died (after 10 min) |
+| `dead` | stopped by `orc kill` / `orc takeover`, a legacy tmux record, a codex app-server session, or no runtime state | sticky: never auto-wakes. `orc resume` hands a killed or taken-over session back |
 
 **State:** what is the agent doing? (`orc state`, `orc wait`; derived from the journal)
 
@@ -76,8 +80,11 @@ Rules that matter for scripts:
   `--no-wake`. After 3 consecutive failed starts, auto-wake stops (`send` only queues) until
   `orc resume`.
 - `orc kill` drops messages still queued for the session (their delivery becomes `failed`).
-- `orc prune` removes `dead` records and their session dirs. It keeps `running` sessions, keeps
-  `suspended` ones unless `--suspended`, and keeps a spawn in progress.
+- `orc prune` removes `dead` records and their session dirs. It keeps `running` and `spawning`
+  sessions; keeps `suspended` ones unless `--suspended` (which stops them first, under the
+  session's lock, so a concurrent `orc resume` either wins or finds nothing); and keeps sessions a
+  human took over unless `--taken-over` (their dir holds the system prompt the printed resume
+  command uses). `orc list` marks those `taken-over(hand back: orc resume <id>)`.
 
 ## CLI
 
@@ -92,7 +99,7 @@ orc attach <id|@alias>                              Follow the journal live (rea
 orc kill   <id|@alias> [--worktree] [--purge]       Stop (sticky); --purge removes record + journal
 orc resume <id|@alias>                              Hand a killed/taken-over/suspended session back to an actor
 orc takeover <id|@alias>                            Stop the actor; print the provider's own resume command
-orc prune  [--worktree] [--suspended]               Drop dead records (+ session dirs, optional worktrees)
+orc prune  [--worktree] [--suspended] [--taken-over]  Drop dead records (+ session dirs, optional worktrees)
 orc workflow <run|list|status|attach|logs|resume|retry|cancel|cleanup> ...   (alias: wf)
 orc daemon [--port 8787] [--bind <ip>] [--insecure] Serve the HTTP API over tailscale
 orc remote <add|list|rm> <host> [--port P]          Manage trusted peers
@@ -137,6 +144,9 @@ dir, and removes a `--worktree` it created.
 | `resume` | 0 / 1 | same shape as `state --json` |
 | `takeover` | 0 / 1 | `{id, cwd, command, note?}` |
 | `prune` | 0 / 1 | `{ok, pruned: [ids]}` |
+| `login chatgpt` | 0 signed in / imported; 1 failed | — (prints the default codex model) |
+| `login status` | 0; 1 when a credential file is unreadable | `{active: orc\|pi\|env\|none\|error, error?, orc: {path, credential}, pi: {path, credential}, openaiApiKey}` (no secrets) |
+| `logout chatgpt` | 0 | — (orc's credential only; pi's login is untouched) |
 | `workflow run` | 0 run `done`; 1 otherwise; 143 runner got SIGTERM | final `WorkflowRun`; `--detach`: `{runId, logPath}` |
 
 With `--json`, errors print `{"error": "..."}` on stdout and exit 1.
@@ -235,18 +245,30 @@ pi-agent-core 1.2.0 and calls `https://api.openai.com/v1/responses` directly.
   refreshed token is written back to the store it came from (pi's file under pi's own lock).
   `orc login chatgpt --import-pi` copies pi's login instead of signing in; the copies then
   refresh independently.
-- **Login** prints (and opens) the ChatGPT authorize URL and waits for the browser on
-  `http://127.0.0.1:1455/auth/callback`; from a remote shell, paste the final redirect URL.
-  Sign in with ChatGPT is an OpenAI program with eligibility rules for apps; if your account
-  cannot use it, set `OPENAI_API_KEY`.
-- **Model**: `--model`, else (on resume) the session's model, else the first model your account
-  lists (`GET /v1/models`, cached 10 min). If the list is unavailable, spawn fails and asks for
-  `--model`.
+- **Login** prints (and, unless `--no-browser`, opens) the ChatGPT authorize URL and waits for
+  the browser on `http://127.0.0.1:1455/auth/callback`; from a remote shell, paste the final
+  redirect URL. On success it prints the default codex model. `orc logout chatgpt` removes orc's
+  credential only (pi's login stays and is then used).
+- **Eligibility.** Sign in with ChatGPT is an OpenAI program: eligible ChatGPT Plus/Pro users can
+  opt in to plan usage, which OpenAI offers to open-source projects and personal projects that
+  run locally (paid or remotely hosted apps must request access first). See OpenAI's
+  [Sign in with ChatGPT](https://developers.openai.com/cookbook/articles/sign-in-with-chatgpt)
+  guide. Otherwise set `OPENAI_API_KEY`.
+- **Model**: `--model`, else (on resume) the session's model, else the live default: the first
+  model your ChatGPT account lists (server order), or with an API key the newest chat model in
+  pi-ai's catalog (`GET /v1/models`, cached 10 min). The choice is recorded on the session and
+  printed by `orc spawn`. If no model can be listed, spawn fails and asks for `--model`.
 - **Tools**: `read`, `write`, `edit`, `bash`, `ls` (pi's names and schemas), in the session cwd,
   unsandboxed. `bash` commands live in the harness's process group, so `orc kill` stops them.
 - **Session file**: pi's session JSONL v3 at `~/.orc/sessions/<sid>/codex-session.jsonl`; resume
   replays it. `orc takeover` prints `cd <cwd> && pi --session <file>` (pi ≥ 1.2.0 with its own
   OpenAI login); `orc resume` continues whatever pi appended.
+- **Known limitation: no context compaction yet.** When a conversation outgrows the model's
+  context window the turn fails ("the conversation exceeds the model's context window; start a
+  new session"). Start a fresh session and hand it a summary. (claude's `/compact` does not apply:
+  the harness has no slash commands.)
+- **Legacy sessions** from the removed `codex app-server` runtime are `dead`, have no transcript in
+  `orc read`, and cannot be resumed (see the upgrade notes).
 
 ## Workflows
 
@@ -279,7 +301,11 @@ orc workflow cleanup <runId> [--sessions] [--worktrees] [--json]
   last 200 journal entries of each step session; `--json` emits `{step, turns}[]`, or
   `{step, provider, journal}[]` with `--raw`.
 - **`resume` / `retry`** need the original workflow file locally (over `--host` the daemon falls
-  back to the run's recorded source file); the plan digest must match.
+  back to the run's recorded source file); the plan digest must match. A step whose session a
+  human took over is never relaunched around them: the attempt fails as `taken_over`; hand the
+  session back (`orc resume <id>`), then `orc workflow retry <runId> --step <id>`.
+- **Events**: each attempt transition is emitted once and only forward
+  (`queued → spawning → dispatched → running → verifying → succeeded|failed|…`).
 - **Policy.** Optional `ExecutionPolicy` (`maxDepth`, `maxSessions`, `maxConcurrentSessions` (live
   actors), `deadlineMs`, `canDelegate`) is enforced fail-closed. Token/cost budgets are not
   enforced. Lineage flows through `ORC_*` env vars; `orc list --run <id>` filters by run tree.
@@ -333,9 +359,13 @@ orc list --all-hosts               # fleet view with a host column
 
 - The daemon is a JSON/HTTP layer over the SDK on the same `~/.orc`: `/sessions`,
   `/sessions/:id/{read,send,wait,kill}`, `/workflows/run`, `/workflows/runs[/:id]`,
-  `/workflows/runs/:id/{logs,resume,retry,cancel,cleanup}`, `/health`, `/whoami`. Bad requests →
-  400 with `{"error"}`.
-- `GET /health` reports `api: 2` (raw reads return `journal`; v1 daemons returned `pane`).
+  `/workflows/runs/:id/{logs,resume,retry,cancel,cleanup}`, `/health`, `/whoami`.
+- Errors are `{"error"}` with: 400 invalid request; 401/403 auth (below); 403 also when the
+  execution policy forbids a spawn or wake; 404 unknown session or run; 409 a stopped session
+  (`orc resume` first), an idempotency-key conflict, a legacy session, or a run in the wrong state
+  (cancelled, live owner); 502 the provider failed to start; 500 anything else.
+- `GET /health` reports `api: 2` (raw reads return `journal`). `--host` still works against a v1
+  (pre-actor) daemon: its `submitted` send phase counts as success and `pane` reads render.
 - `--host` covers `list`, `spawn`, `send`, `read`, `wait`, `state`, `kill` and `workflow`. Remote
   `attach` prints `tailscale ssh <host> orc attach <id>`. `resume`, `takeover`, `prune`, `daemon`
   and `remote` are host-local.
@@ -363,9 +393,12 @@ All state lives under `~/.orc` (override: `ORC_HOME`):
 ```
 registry.json              session records
 peers.json                 trusted daemon peers
-locks/                     cross-process locks
+locks/                     cross-process locks (a lock whose owner process is gone is reclaimed
+                           at once; one with no recorded owner after 5 min)
+auth/                      codex login: chatgpt.json, device-id (ORC_AUTH_DIR overrides)
+cache/codex-models.json    codex model list per account (ids only, 10 min)
 sessions/<sid>/            spawn.json, state.json, journal.jsonl, inbox/, provider.jsonl,
-                           actor.log, system-prompt.md
+                           actor.log, system-prompt.md, codex-session.jsonl (codex)
 transcripts/pi/<sid>/      pi session files
 runs/<runId>.json          workflow run record (the plan includes step prompts)
 runs/<runId>/              runner.log, instruction drops, attempts/, artifacts/, inputs/
@@ -404,8 +437,34 @@ bun run verify:live --claude-model haiku   # live end-to-end on an authenticated
 `verify:live` runs `scripts/verify-runtime/all.ts`: per-provider runtime gates; CLI end-to-end
 (spawn, idempotent send, SIGKILL the actor → `suspended` → wake, takeover/resume, kill/prune); a
 detached workflow; and a check that `tmux` is never invoked. A missing provider is SKIP; any FAIL
-exits 1. Everything runs in a temp `ORC_HOME`; expect a few cents with haiku. Flags and the
-per-provider gates: [`scripts/verify-runtime/README.md`](scripts/verify-runtime/README.md).
+exits 1. Everything runs in a temp `ORC_HOME`; expect a few cents with haiku. Flags, every row and
+the per-provider gates: [`scripts/verify-runtime/README.md`](scripts/verify-runtime/README.md).
+
+### Live verification on a Mac
+
+You need Bun ≥ 1.3, git and a signed-in `claude`. `pi` (for the pi rows) and an OpenAI credential
+(for the codex rows) are optional: a provider you don't have is reported SKIP.
+
+```sh
+git clone -b feat/actor-runtime https://github.com/thehumanworks/orc.git && cd orc
+bun install
+bun test && bun run typecheck                  # optional: the offline suites first
+bun src/cli/index.ts login status              # which OpenAI credential codex would use
+bun src/cli/index.ts login chatgpt             # only if status shows none and you want codex rows
+                                               # (or reuse pi's ChatGPT login, or export OPENAI_API_KEY)
+bun scripts/verify-runtime/all.ts --claude-model haiku \
+    [--codex-model <model-id>] [--pi-model <provider>/<model-id>]
+```
+
+- Without `--codex-model`, codex uses your account's default model (`orc login chatgpt` prints
+  it); without `--pi-model`, pi uses its own default. Each run prints a note for such providers.
+- Read the table: one `preflight` row per provider (claude/pi: binary and `--version`; codex: which
+  credential), then `runtime gate`, the `e2e …` rows, the `workflow` rows (claude), and
+  `tmux never invoked`. Exit 0 means no FAIL.
+- Results are also written to `verify-results.json` in the repo root (no tokens, emails or env;
+  home paths shown as `~`); share that file. `--keep` keeps the temp root for debugging.
+- Ctrl-C is safe: it stops workflow runners, then the run's processes, then every actor and
+  provider it started, and removes the temp root.
 
 Dogfooding: `bun scripts/dogfood/run.ts spawn <task.md> [provider]` starts an implementer in a
 worktree of this repo; `bun scripts/dogfood/run.ts watch <id>` supervises it until it reports
@@ -413,6 +472,9 @@ worktree of this repo; `bun scripts/dogfood/run.ts watch <id>` supervises it unt
 `scripts/dogfood/tasks/`).
 
 ## Upgrading from the tmux runtime
+
+The full list of user-visible and breaking changes, with schema migrations, is in
+[`docs/CHANGES-actor-runtime.md`](docs/CHANGES-actor-runtime.md).
 
 1. **Kill live pre-actor sessions first**, with the old binary (`orc kill`) or
    `tmux kill-session -t <name>`. After the upgrade they show as `dead` with `legacy: "tmux"`:
@@ -426,7 +488,8 @@ worktree of this repo; `bun scripts/dogfood/run.ts watch <id>` supervises it unt
    - no live TUI: `orc attach` follows the journal; `orc takeover` + `orc resume` replace
      `tmux attach`
    - `wait` is not debounced; `send` can exit 3 (`unknown`) and has `--no-wake`
-   - `list` shows `suspended`; `prune` keeps it unless `--suspended`
+   - `list` shows `suspended` and `spawning`; `prune` keeps suspended sessions unless
+     `--suspended` and taken-over ones unless `--taken-over`
    - `spawn --no-wait` queues the initial prompt instead of skipping it
    - `--json`: `read --raw` → `{id, journal}` (was `pane`); `workflow logs --raw` → `journal`;
      `workflow run --detach` → `{runId, logPath}` (was `runnerTmux`); `attach` → `orc attach <id>`;
@@ -439,7 +502,7 @@ worktree of this repo; `bun scripts/dogfood/run.ts watch <id>` supervises it unt
 7. SDK: removed `Session.tmuxName`, `Session.capture()`, `classifyState`, `reduceWait`,
    `AgentOptions.driver`, `pruneSessions({driver})`, `runnerTmuxName`, `PaneInfo` and the
    `messages.ts` delivery-record helpers. `Session.attach()` follows the journal, `SessionStatus`
-   adds `suspended`, `SendResult` is `{phase, messageId, replayed}`, and `StepDoneCtx.capture` is
+   adds `suspended` and `spawning`, `SendResult` is `{phase, messageId, replayed}`, and `StepDoneCtx.capture` is
    journal text rather than a pane.
 
 ### Upgrading from the codex app-server runtime
@@ -448,4 +511,6 @@ codex no longer runs the `codex` CLI (`codex app-server`); it runs orc's built-i
 codex CLI is not needed. Sessions created by the app-server runtime show as `dead`, have no
 transcript in `orc read` (their rollouts stay in `~/.codex/sessions`), and cannot be resumed;
 `orc prune` removes them. `ORC_CODEX_BIN` is ignored. Sign in once with `orc login chatgpt` (or
-reuse pi's login, or set `OPENAI_API_KEY`). `--agent` still reads codex TOML agents.
+reuse pi's login, or set `OPENAI_API_KEY`); `orc login status` shows which is used. `--agent`
+still reads codex TOML agents. Takeover now prints a `pi --session …` command, so install pi
+(1.2.0) if you want to continue codex sessions by hand.
