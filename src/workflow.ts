@@ -1437,10 +1437,11 @@ async function runWorkflowOwned(
       }
       if (cancelled) stopHeartbeat();
     });
+  // Deliberately NOT unref'd: an owning runner stays alive while it owns the record; the
+  // interval is cleared on every exit path (stopHeartbeat / releaseLifecycle).
   life.heartbeat = setInterval(() => {
     void heartbeat();
   }, heartbeatMs);
-  (life.heartbeat as { unref?: () => void }).unref?.();
 
   // ── Abort (D5): stop launching, stop heartbeating, never write again, return promptly.
   let aborted = false;
