@@ -11,6 +11,8 @@ import { randomUUID } from 'node:crypto';
 import type { Stats } from 'node:fs';
 import { registryPath, orcHome } from './paths.ts';
 import { ensurePrivateDir, writePrivateFile, PRIVATE_FILE_MODE } from './private-fs.ts';
+import { lockOwnerGone, lockOwnerRecord } from './lock.ts';
+import { isPidAlive } from './runtime/process.ts';
 import type { SessionRecord } from './types.ts';
 import { kernelLiveness } from './session-status.ts';
 import type { LivenessProbe } from './session-status.ts';
@@ -28,6 +30,8 @@ interface RegistryLockOwner {
   pid?: number;
   token?: string;
   createdAt?: string;
+  /** Owner's process start time (lockOwnerRecord); absent in older lock files. */
+  startTime?: string | null;
 }
 
 export interface AliasSelector {
@@ -174,9 +178,7 @@ async function acquireRegistryLock(): Promise<() => Promise<void>> {
     try {
       const handle = await fs.open(lock, 'wx', PRIVATE_FILE_MODE);
       try {
-        await handle.writeFile(
-          JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }),
-        );
+        await handle.writeFile(lockOwnerRecord(token));
       } finally {
         await handle.close();
       }
@@ -202,7 +204,9 @@ async function acquireRegistryLock(): Promise<() => Promise<void>> {
         if ((statError as { code?: string }).code === 'ENOENT') continue;
         throw statError;
       }
-      if (Date.now() - st.mtimeMs > REGISTRY_LOCK_STALE_MS) {
+      // An owner that is provably gone (dead / zombie / pid reused) is reclaimed now, not
+      // after REGISTRY_LOCK_STALE_MS (see lock.ts).
+      if (Date.now() - st.mtimeMs > REGISTRY_LOCK_STALE_MS || lockOwnerGone(await readRegistryLockOwner(lock))) {
         if (await tryRemoveStaleRegistryLock(lock)) continue;
       }
 
@@ -219,11 +223,11 @@ async function tryRemoveStaleRegistryLock(lock: string): Promise<boolean> {
   try {
     const st = await fs.stat(lock).catch(() => null);
     if (!st) return true;
-    if (Date.now() - st.mtimeMs <= REGISTRY_LOCK_STALE_MS) return false;
-
     const owner = await readRegistryLockOwner(lock);
-    if (owner.pid && processIsAlive(owner.pid)) return false;
-
+    if (!lockOwnerGone(owner)) {
+      if (Date.now() - st.mtimeMs <= REGISTRY_LOCK_STALE_MS) return false;
+      if (owner.pid && isPidAlive(owner.pid)) return false;
+    }
     await fs.rm(lock, { force: true });
     return true;
   } finally {
@@ -239,9 +243,7 @@ async function acquireRegistryCleanupLock(lock: string): Promise<() => Promise<v
     try {
       const handle = await fs.open(lock, 'wx', PRIVATE_FILE_MODE);
       try {
-        await handle.writeFile(
-          JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }),
-        );
+        await handle.writeFile(lockOwnerRecord(token));
       } finally {
         await handle.close();
       }
@@ -259,6 +261,15 @@ async function acquireRegistryCleanupLock(lock: string): Promise<() => Promise<v
     } catch (e) {
       const code = (e as { code?: string }).code;
       if (code !== 'EEXIST') throw e;
+      // A cleaner that died inside its (microsecond) section: reclaim after a grace.
+      const st = await fs.stat(lock).catch(() => null);
+      if (st && Date.now() - st.mtimeMs > 2_000) {
+        const owner = await readRegistryLockOwner(lock);
+        if (lockOwnerGone(owner) && (await readRegistryLockOwner(lock)).token === owner.token) {
+          await fs.rm(lock, { force: true });
+          continue;
+        }
+      }
       if (Date.now() >= deadline) {
         throw new Error(`timed out waiting for registry lock cleanup lock: ${lock}`);
       }
@@ -272,15 +283,6 @@ async function readRegistryLockOwner(lock: string): Promise<RegistryLockOwner> {
     return JSON.parse(await Bun.file(lock).text()) as RegistryLockOwner;
   } catch {
     return {};
-  }
-}
-
-function processIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return (e as { code?: string }).code === 'EPERM';
   }
 }
 

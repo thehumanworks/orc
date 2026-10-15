@@ -2,25 +2,42 @@
  * Cross-process filesystem lock under ORC_HOME. Atomic create (open 'wx'), bounded
  * wait, and stale-lock recovery. Prefer this over an in-memory mutex whenever
  * concurrent CLI/daemon/process writers can race.
+ *
+ * Recovery: a lock whose recorded owner is provably gone — pid dead, an unreaped zombie,
+ * or the pid now names another process (start time changed) — is reclaimed on the next
+ * poll, not after `staleMs` (a runner SIGKILLed inside `run:<id>` no longer blocks that
+ * run for 5 minutes). `staleMs` still governs a lock whose owner was never written
+ * (creator died between create and write). Removal always happens under the
+ * `<lock>.cleanup` lock after re-reading the owner.
  */
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Stats } from 'node:fs';
 import { orcHome } from './paths.ts';
 import { ensurePrivateDir, PRIVATE_FILE_MODE } from './private-fs.ts';
+import { isPidAlive, isSameProcessAlive, processStartTime } from './runtime/process.ts';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_STALE_MS = 300_000;
 const DEFAULT_POLL_MS = 25;
 const CLEANUP_SUFFIX = '.cleanup';
+/**
+ * A `.cleanup` lock whose owner died is reclaimed only once it is this old: cleanup
+ * sections last microseconds, so a live cleaner is never preempted.
+ */
+const CLEANUP_DEAD_OWNER_GRACE_MS = 2_000;
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export interface LockOptions {
   /** Give up after this long waiting for the lock. Default 30s. */
   timeoutMs?: number;
-  /** Treat a lock file older than this as stale (then reclaim if owner pid is dead). Default 5m. */
+  /**
+   * A lock file older than this whose owner was never recorded (or whose pid is dead) is
+   * stale. Default 5m. A recorded owner that is provably gone is reclaimed immediately.
+   */
   staleMs?: number;
   /** Poll interval while waiting. Default 25ms. */
   pollMs?: number;
@@ -32,6 +49,36 @@ interface LockOwner {
   pid?: number;
   token?: string;
   createdAt?: string;
+  /** Owner's process start-time token (pid-reuse guard); absent in older lock files. */
+  startTime?: string | null;
+  /** Owner's hostname: pids from another host (shared ORC_HOME) are not comparable. */
+  host?: string;
+}
+
+let selfStartTime: string | null | undefined;
+
+/** The owner JSON written into every lock file (pid + start time + host + token). */
+export function lockOwnerRecord(token: string): string {
+  if (selfStartTime === undefined) selfStartTime = processStartTime(process.pid);
+  return JSON.stringify({
+    pid: process.pid,
+    token,
+    createdAt: new Date().toISOString(),
+    host: os.hostname(),
+    ...(selfStartTime ? { startTime: selfStartTime } : {}),
+  });
+}
+
+/**
+ * The lock's recorded owner provably no longer exists: its pid is dead, an unreaped
+ * zombie, or now names a different process (start time changed). An owner that is not
+ * recorded (empty/unparseable file), or was recorded on another host (shared ORC_HOME,
+ * different pid namespace), is NOT provably gone — `staleMs` governs those cases.
+ */
+export function lockOwnerGone(owner: { pid?: unknown; startTime?: unknown; host?: unknown }): boolean {
+  if (typeof owner.pid !== 'number' || !Number.isInteger(owner.pid) || owner.pid <= 0) return false;
+  if (typeof owner.host === 'string' && owner.host !== os.hostname()) return false;
+  return !isSameProcessAlive({ pid: owner.pid, startTime: typeof owner.startTime === 'string' ? owner.startTime : null });
 }
 
 /** Sanitize a lock name for use as a single path segment (no traversal). */
@@ -52,15 +99,6 @@ function locksBase(opts?: LockOptions): string {
   return opts?.locksDir ?? path.join(orcHome(), 'locks');
 }
 
-function processIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return (e as { code?: string }).code === 'EPERM';
-  }
-}
-
 async function readOwner(lockPath: string): Promise<LockOwner> {
   try {
     return JSON.parse(await Bun.file(lockPath).text()) as LockOwner;
@@ -76,9 +114,7 @@ async function acquireCleanupLock(lockPath: string, timeoutMs: number, pollMs: n
     try {
       const handle = await fs.open(lockPath, 'wx', PRIVATE_FILE_MODE);
       try {
-        await handle.writeFile(
-          JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }),
-        );
+        await handle.writeFile(lockOwnerRecord(token));
       } finally {
         await handle.close();
       }
@@ -96,6 +132,16 @@ async function acquireCleanupLock(lockPath: string, timeoutMs: number, pollMs: n
     } catch (e) {
       const code = (e as { code?: string }).code;
       if (code !== 'EEXIST') throw e;
+      // A cleaner that died inside its (microsecond) section would otherwise wedge every
+      // future recovery of this lock.
+      const st = await fs.stat(lockPath).catch(() => null);
+      if (st && Date.now() - st.mtimeMs > CLEANUP_DEAD_OWNER_GRACE_MS) {
+        const owner = await readOwner(lockPath);
+        if (lockOwnerGone(owner) && (await readOwner(lockPath)).token === owner.token) {
+          await fs.rm(lockPath, { force: true });
+          continue;
+        }
+      }
       if (Date.now() >= deadline) {
         throw new Error(`timed out waiting for lock cleanup: ${lockPath}`);
       }
@@ -114,11 +160,12 @@ async function tryRemoveStaleLock(
   try {
     const st = await fs.stat(lockPath).catch(() => null);
     if (!st) return true;
-    if (Date.now() - st.mtimeMs <= staleMs) return false;
-
+    // Re-read under the cleanup lock: a fresh acquirer may have replaced it meanwhile.
     const owner = await readOwner(lockPath);
-    if (owner.pid && processIsAlive(owner.pid)) return false;
-
+    if (!lockOwnerGone(owner)) {
+      if (Date.now() - st.mtimeMs <= staleMs) return false;
+      if (owner.pid && isPidAlive(owner.pid)) return false; // a live owner is never robbed
+    }
     await fs.rm(lockPath, { force: true });
     return true;
   } finally {
@@ -145,9 +192,7 @@ export async function acquireLock(name: string, opts: LockOptions = {}): Promise
     try {
       const handle = await fs.open(lockPath, 'wx', PRIVATE_FILE_MODE);
       try {
-        await handle.writeFile(
-          JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }),
-        );
+        await handle.writeFile(lockOwnerRecord(token));
       } finally {
         await handle.close();
       }
@@ -174,7 +219,7 @@ export async function acquireLock(name: string, opts: LockOptions = {}): Promise
         throw statError;
       }
 
-      if (Date.now() - st.mtimeMs > staleMs) {
+      if (Date.now() - st.mtimeMs > staleMs || lockOwnerGone(await readOwner(lockPath))) {
         if (await tryRemoveStaleLock(lockPath, staleMs, timeoutMs, pollMs)) continue;
       }
 

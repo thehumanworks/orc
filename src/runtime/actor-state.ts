@@ -9,10 +9,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { acquireLock, sanitizeLockName } from '../lock.ts';
+import { lockOwnerGone, sanitizeLockName, withLock } from '../lock.ts';
 import type { LockOptions } from '../lock.ts';
 import { locksDir } from '../paths.ts';
-import { isLiveProcess, isPidAlive } from './process.ts';
+import { isLiveProcess } from './process.ts';
 import { RUNTIME_SCHEMA_VERSION } from './types.ts';
 import type { ActorPhase, ActorStateFile } from './types.ts';
 import { sessionPaths } from './layout.ts';
@@ -35,23 +35,23 @@ export function actorLockName(sessionId: string): string {
 }
 
 /**
- * Remove `name`'s lock file iff its recorded owner pid is dead or a zombie. Uses lock.ts's
- * own `<lock>.cleanup` protocol (O_EXCL + owner-token recheck), so it never races lock.ts
- * stale recovery or a fresh acquirer. lock.ts alone waits `staleMs` before reclaiming a
- * dead owner's lock and never reclaims one held by an unreaped zombie.
+ * Remove `name`'s lock file now iff its recorded owner is provably gone (dead, zombie or
+ * pid reused — lockOwnerGone). Uses lock.ts's `<lock>.cleanup` protocol (O_EXCL +
+ * owner-token recheck), so it never races lock.ts recovery or a fresh acquirer. (lock.ts
+ * performs the same reclaim itself on its next poll; this is the synchronous form.)
  */
 export function reclaimDeadOwnerLock(name: string): boolean {
   const lockPath = path.join(locksDir(), `${sanitizeLockName(name)}.lock`);
-  const readOwner = (): { pid?: number; token?: string } | undefined => {
+  const readOwner = (): { pid?: number; token?: string; startTime?: string | null } | undefined => {
     try {
-      return JSON.parse(fs.readFileSync(lockPath, 'utf8')) as { pid?: number; token?: string };
+      return JSON.parse(fs.readFileSync(lockPath, 'utf8')) as { pid?: number; token?: string; startTime?: string | null };
     } catch {
       return undefined;
     }
   };
   const owner = readOwner();
   if (!owner?.pid || !owner.token) return false;
-  if (isPidAlive(owner.pid)) return false; // zombie-aware
+  if (!lockOwnerGone(owner)) return false; // dead / zombie / pid reused only
   const cleanup = `${lockPath}.cleanup`;
   let fd: number;
   try {
@@ -71,29 +71,13 @@ export function reclaimDeadOwnerLock(name: string): boolean {
 }
 
 /**
- * Run `fn` holding the named lock (lock.ts, ACTOR_LOCK_OPTIONS), reclaiming it promptly
- * when its owner died while holding it (e.g. an actor SIGKILLed mid state-write).
+ * Run `fn` holding the named lock (lock.ts, ACTOR_LOCK_OPTIONS). A lock left by an owner
+ * that died while holding it (e.g. an actor SIGKILLed mid state-write) is reclaimed by
+ * lock.ts on its next poll.
  */
-export async function withSessionLock<T>(name: string, fn: () => Promise<T>): Promise<T> {
-  const deadline = Date.now() + (ACTOR_LOCK_OPTIONS.timeoutMs ?? 15_000);
-  let release: () => Promise<void>;
-  while (true) {
-    try {
-      release = await acquireLock(name, {
-        ...ACTOR_LOCK_OPTIONS,
-        timeoutMs: Math.max(1, Math.min(250, deadline - Date.now())),
-      });
-      break;
-    } catch (e) {
-      if (!/timed out waiting for lock/.test((e as Error).message) || Date.now() >= deadline) throw e;
-      reclaimDeadOwnerLock(name);
-    }
-  }
-  try {
-    return await fn();
-  } finally {
-    await release();
-  }
+export function withSessionLock<T>(name: string, fn: () => Promise<T>): Promise<T> {
+  // lock.ts itself reclaims a lock whose owner is provably gone on its next poll.
+  return withLock(name, fn, ACTOR_LOCK_OPTIONS);
 }
 
 /** Run `fn` under the brief per-session actor lock (lease acquire/renew, wake, stop). */
