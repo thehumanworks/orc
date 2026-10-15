@@ -16,7 +16,7 @@ import { writeSpawnSpec } from '../src/runtime/spec.ts';
 import { ensureSessionDirs } from '../src/runtime/layout.ts';
 import { sessionStatusOf } from '../src/session-status.ts';
 import type { SpawnSpec } from '../src/runtime/types.ts';
-import { cliEntryPath } from '../src/runtime/process.ts';
+import { cliEntryPath, isLiveProcess } from '../src/runtime/process.ts';
 import { actorPids, entries, liveProcs, waitFor, waitForEntry } from './runtime-helpers.ts';
 import { startFakeOpenAI, type FakeOpenAI } from './fixtures/openai-fake.ts';
 
@@ -141,14 +141,22 @@ describe('codex harness through the actor kernel', () => {
       await send(spec.sessionId, { messageId: 'r1', text: 'remember the word OSPREY' });
       expect((await outcome(spec.sessionId, 'r1')).type).toBe('turn.completed');
 
-      const actor = readActorState(spec.sessionId)!.lease!.pid;
+      const lease = readActorState(spec.sessionId)!.lease!;
       const harnessBefore = harnessPids(spec.sessionId);
       expect(harnessBefore).toHaveLength(1);
-      process.kill(actor, 'SIGKILL');
+      process.kill(lease.pid, 'SIGKILL');
+      // The actor must be gone (not just signalled) or ensureAwake still sees a live lease.
+      await waitFor(
+        () => !isLiveProcess(lease) || undefined,
+        `the SIGKILLed actor ${lease.pid} to die (state: ${JSON.stringify(readActorState(spec.sessionId))})`,
+        15_000,
+      );
       await waitFor(() => !pidAlive(harnessBefore[0]!) || undefined, 'the orphaned harness to exit on stdin EOF', 15_000);
 
       const woke = await ensureAwake(spec.sessionId);
-      expect(woke.status).toBe('started');
+      if (woke.status !== 'started') {
+        throw new Error(`ensureAwake → ${woke.status}; actor state: ${JSON.stringify(readActorState(spec.sessionId))}`);
+      }
       await waitForEntry(
         spec.sessionId,
         (e) => e.type === 'actor.started' && e.mode === 'resume',
