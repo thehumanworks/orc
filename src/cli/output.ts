@@ -278,6 +278,9 @@ Usage:
   orc workflow <run|list|status|attach|logs|resume|retry|cancel|cleanup> ...  Workflows (alias: wf)
   orc daemon [--port 8787] [--bind <ip>] [--insecure] Serve the HTTP API over tailscale
   orc remote <add|list|rm> <host> [--port P]          Manage trusted peers (~/.orc/peers.json)
+  orc login  chatgpt [--import-pi] [--no-browser]     Sign in with ChatGPT for the codex provider
+  orc login  status [--json]                          Which OpenAI credential codex sessions use
+  orc logout chatgpt                                  Remove orc's ChatGPT credential
   orc help                                            This help
 
 spawn options:
@@ -370,12 +373,19 @@ daemon + remote (drive agents on other orc hosts over tailscale):
                         Remote attach prints \`tailscale ssh <host> orc attach <id>\`.
   orc list --all-hosts  Fleet view: aggregate local + every trusted peer, with a host column.
 
+codex provider (orc's built-in harness; no codex CLI needed):
+  Talks to the OpenAI Responses API directly. Credentials, first match wins: \`orc login
+  chatgpt\` (~/.orc/auth/chatgpt.json), pi's ChatGPT login (~/.pi/agent/auth.json, or
+  $PI_CODING_AGENT_DIR), then OPENAI_API_KEY. Without --model a session uses the first model
+  your account lists (printed by spawn). Tools: read, write, edit, bash, ls. \`orc takeover\`
+  prints \`pi --session <file>\` (the harness writes pi's session format).
+
 Global:
   --host <h>            Run the command against the daemon on host <h> (see above)
   --json                machine-readable output; non-zero exit + {error} on failure
 
-Sessions run as detached per-session actors that drive each provider CLI over its
-structured protocol (no terminal). Status: running (actor live) | suspended (actor gone
+Sessions run as detached per-session actors that drive each provider over a structured
+protocol (no terminal). Status: running (actor live) | suspended (actor gone
 without a stop — crash/reboot; the next send or \`orc resume\` wakes it) | spawning
 (being created right now) | dead (killed, taken over, or pre-actor legacy). \`orc list\` shows running + suspended; --dead/--all
 include dead. \`orc prune\` never removes suspended sessions unless --suspended, nor

@@ -76,8 +76,8 @@ export async function agent(opts: AgentOptions): Promise<Session> {
   // Base cwd → realpath.
   const baseCwd = await fs.realpath(opts.cwd ?? process.cwd());
 
-  // Generate our handle uuid: the kernel session id (claude/pi also use it as their
-  // --session-id; codex assigns its own thread id, recorded as providerSessionId).
+  // Generate our handle uuid: the kernel session id (claude/pi use it as their
+  // --session-id; the codex harness uses it as its session id).
   const sessionId = randomUUID();
   const shortId = sessionId.slice(0, 8);
 
@@ -229,13 +229,15 @@ export async function agent(opts: AgentOptions): Promise<Session> {
 
     let session = new Session(record);
     if (opts.waitForReady ?? true) {
-      // Record the provider-side session id (codex: its thread id) and transcript path
-      // straight from the provider.ready entry (no second read racing spawn.json).
+      // Record the provider-side session id and transcript path straight from the
+      // provider.ready entry (no second read racing spawn.json).
       const ready = await session.awaitReady(opts.readyTimeoutMs);
       record = {
         ...record,
         providerSessionId: ready.providerSessionId,
         ...(ready.transcriptPath ? { transcriptPath: ready.transcriptPath } : {}),
+        // codex without --model runs the account's live default model: record (and print) it.
+        ...(provider === 'codex' && !record.model && ready.model ? { model: ready.model } : {}),
       };
       await upsertRecord(record);
       session = new Session(record);

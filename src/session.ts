@@ -126,6 +126,8 @@ export async function clearStoppedMarker(rec: SessionRecord): Promise<SessionRec
 export interface ProviderReadyInfo {
   providerSessionId: string;
   transcriptPath?: string;
+  /** The model the provider reported in `provider.ready` info, when it is a string. */
+  model?: string;
 }
 
 /** A stopped session refused a send; carries the `orc resume` hint. */
@@ -339,6 +341,7 @@ export class Session {
     const readyInfo = (e: Extract<JournalEntry, { type: 'provider.ready' }>): ProviderReadyInfo => ({
       providerSessionId: e.providerSessionId,
       ...(e.transcriptPath ? { transcriptPath: e.transcriptPath } : {}),
+      ...(typeof e.info?.model === 'string' ? { model: e.info.model } : {}),
     });
     while (true) {
       for (const e of cursor.readNew()) {

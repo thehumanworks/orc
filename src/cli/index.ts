@@ -1439,6 +1439,43 @@ async function cmdDaemon(args: string[]): Promise<number> {
 }
 
 /** `orc remote add|list|rm <host>` — manage the trusted-peer file (~/.orc/peers.json). */
+/**
+ * `orc login chatgpt [--import-pi] [--no-browser]` | `orc login status [--json]` — the codex
+ * harness's OpenAI credentials (src/codex/login.ts; loaded lazily: it pulls in pi-ai).
+ */
+async function cmdLogin(args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, {
+    'import-pi': { type: 'boolean' },
+    'no-browser': { type: 'boolean' },
+    json: { type: 'boolean' },
+  });
+  const json = jsonFlag(values);
+  const what = positionals[0];
+  const login = await import('../codex/login.ts');
+  if (what === 'status') {
+    const s = await login.loginStatus();
+    if (json) printJson(s);
+    else process.stdout.write(`${login.renderLoginStatus(s)}\n`);
+    return 0;
+  }
+  if (what === 'chatgpt') {
+    return login.loginChatGPT({ importPi: values['import-pi'] === true, noBrowser: values['no-browser'] === true });
+  }
+  printError(`usage: orc login chatgpt [--import-pi] [--no-browser] | orc login status [--json]`, json);
+  return 1;
+}
+
+/** `orc logout chatgpt` — remove orc's ChatGPT credential (pi's login is never touched). */
+async function cmdLogout(args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, { json: { type: 'boolean' } });
+  const json = jsonFlag(values);
+  if (positionals[0] !== 'chatgpt') {
+    printError('usage: orc logout chatgpt', json);
+    return 1;
+  }
+  return (await import('../codex/login.ts')).logoutChatGPT();
+}
+
 async function cmdRemoteAdmin(args: string[]): Promise<number> {
   const sub = args[0];
   const rest = args.slice(1);
@@ -2211,6 +2248,10 @@ export function resolveCommand(raw: string | undefined): string {
       return 'daemon';
     case 'remote':
       return 'remote';
+    case 'login':
+      return 'login';
+    case 'logout':
+      return 'logout';
     case 'help':
     case '--help':
     case '-h':
@@ -2269,6 +2310,10 @@ async function main(): Promise<number> {
       return cmdDaemon(rest);
     case 'remote':
       return cmdRemoteAdmin(rest);
+    case 'login':
+      return cmdLogin(rest);
+    case 'logout':
+      return cmdLogout(rest);
     case 'help':
       process.stdout.write(HELP_TEXT);
       return 0;
