@@ -426,14 +426,8 @@ class Actor {
         }
         this.ready = true;
         clearTimeout(this.readyTimer);
-        this.append({
-          type: 'provider.ready',
-          providerSessionId: ev.providerSessionId,
-          providerPid: this.rt?.pid ?? 0,
-          ...(ev.transcriptPath ? { transcriptPath: ev.transcriptPath } : {}),
-          ...(ev.capabilities ? { capabilities: ev.capabilities } : {}),
-          ...(ev.info ? { info: ev.info } : {}),
-        });
+        // spawn.json FIRST: whoever observes provider.ready must also find the provider
+        // session id (codex thread id) and transcript path on disk.
         if (
           this.spec.providerSessionId !== ev.providerSessionId ||
           (ev.transcriptPath !== undefined && this.spec.transcriptPath !== ev.transcriptPath)
@@ -443,8 +437,20 @@ class Actor {
             providerSessionId: ev.providerSessionId,
             ...(ev.transcriptPath ? { transcriptPath: ev.transcriptPath } : {}),
           };
-          writeSpawnSpec(this.spec);
+          try {
+            writeSpawnSpec(this.spec);
+          } catch (e) {
+            this.log(`could not persist providerSessionId to spawn.json: ${errMsg(e)}`);
+          }
         }
+        this.append({
+          type: 'provider.ready',
+          providerSessionId: ev.providerSessionId,
+          providerPid: this.rt?.pid ?? 0,
+          ...(ev.transcriptPath ? { transcriptPath: ev.transcriptPath } : {}),
+          ...(ev.capabilities ? { capabilities: ev.capabilities } : {}),
+          ...(ev.info ? { info: ev.info } : {}),
+        });
         this.providerSessionId = ev.providerSessionId;
         this.startFailures = 0;
         this.lastStartError = undefined;

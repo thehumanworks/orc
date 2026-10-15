@@ -72,6 +72,8 @@ describe('agent() + Session on the actor runtime', () => {
       // The provider-side id (server-assigned for the fake, like codex) is on the record.
       expect(rec.providerSessionId).toBe(spec.providerSessionId!);
       expect(rec.providerSessionId).toMatch(/^fake-/);
+      const readyEntry = s.journal().find((e) => e.type === 'provider.ready');
+      expect(readyEntry?.type === 'provider.ready' && readyEntry.providerSessionId).toBe(rec.providerSessionId!);
       expect(spec.provider).toBe('fake');
       expect(spec.env.ORC_PARENT_SESSION_ID).toBe(s.id);
       expect(spec.env.ORC_DEPTH).toBe('1');

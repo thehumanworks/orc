@@ -176,6 +176,38 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
   );
 
   test(
+    'spawn.json carries the provider session id before provider.ready is journaled',
+    async () => {
+      for (let i = 0; i < 3; i++) {
+        const spec = fakeSpec(mkTmp('orc-actor-cwd-'));
+        sids.push(spec.sessionId);
+        const created = createSession(spec, { startTimeoutMs: 10_000 });
+        const file = sessionPaths(spec.sessionId).journal;
+        // Tight poll (yield only): read spawn.json the instant provider.ready is visible.
+        let psid: string | undefined;
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline) {
+          await new Promise((r) => setImmediate(r));
+          let text = '';
+          try {
+            text = fs.readFileSync(file, 'utf8');
+          } catch {
+            continue;
+          }
+          if (text.includes('"type":"provider.ready"')) {
+            psid = readSpawnSpec(spec.sessionId)?.providerSessionId;
+            break;
+          }
+        }
+        await created;
+        const ready = entries(spec.sessionId, 'provider.ready')[0]!;
+        expect(psid).toBe(ready.providerSessionId);
+      }
+    },
+    T,
+  );
+
+  test(
     'the actor survives its launcher',
     async () => {
       const spec = fakeSpec(mkTmp('orc-actor-cwd-'));

@@ -104,6 +104,12 @@ export interface AttachOptions {
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /** A stopped session refused a send; carries the `orc resume` hint. */
+/** What `provider.ready` reported (Session.awaitReady). */
+export interface ProviderReadyInfo {
+  providerSessionId: string;
+  transcriptPath?: string;
+}
+
 export class SessionNotControllableError extends Error {
   constructor(
     message: string,
@@ -299,23 +305,28 @@ export class Session {
 
   /**
    * Wait until the provider reported ready (`provider.ready` after the latest actor
-   * start). Throws — with the journal error and the actor.log tail — when the actor
-   * stops or dies first, or on timeout.
+   * start) and return what that entry says (provider session id — codex: its thread id —
+   * and transcript path). Throws — with the journal error and the actor.log tail — when
+   * the actor stops or dies first, or on timeout.
    */
-  async awaitReady(timeoutMs = DEFAULT_READY_TIMEOUT_MS): Promise<void> {
+  async awaitReady(timeoutMs = DEFAULT_READY_TIMEOUT_MS): Promise<ProviderReadyInfo> {
     this.assertControllable('start');
     const sid = this.sessionId;
     const deadline = Date.now() + timeoutMs;
     const cursor = JournalCursor.forSession(sid);
-    let readySeq = 0;
+    let ready: Extract<JournalEntry, { type: 'provider.ready' }> | undefined;
     let stopped: Extract<JournalEntry, { type: 'actor.stopped' }> | undefined;
+    const readyInfo = (e: Extract<JournalEntry, { type: 'provider.ready' }>): ProviderReadyInfo => ({
+      providerSessionId: e.providerSessionId,
+      ...(e.transcriptPath ? { transcriptPath: e.transcriptPath } : {}),
+    });
     while (true) {
       for (const e of cursor.readNew()) {
         if (e.type === 'actor.started') {
-          readySeq = 0;
+          ready = undefined;
           stopped = undefined;
         } else if (e.type === 'provider.ready') {
-          readySeq = e.seq;
+          ready = e;
           stopped = undefined;
         } else if (e.type === 'actor.stopped') {
           stopped = e;
@@ -328,11 +339,12 @@ export class Session {
           })${actorLogTail(sid)}`,
         );
       }
-      if (readySeq > 0) return;
+      if (ready) return readyInfo(ready);
       if (!leaseLive(readActorState(sid))) {
         // Give the journal one more read: the actor may have journaled on its way out.
         await sleep(20);
-        if (cursor.readNew().some((e) => e.type === 'provider.ready')) return;
+        const late = cursor.readNew().find((e) => e.type === 'provider.ready');
+        if (late?.type === 'provider.ready') return readyInfo(late);
         throw new Error(`session ${this.id}: actor exited before its provider was ready${actorLogTail(sid)}`);
       }
       if (Date.now() >= deadline) {
