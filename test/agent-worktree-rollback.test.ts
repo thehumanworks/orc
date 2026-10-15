@@ -29,6 +29,13 @@ async function mkRepo(): Promise<string> {
   return fs.realpath(repo);
 }
 
+async function orcBranches(repo: string): Promise<string[]> {
+  const p = Bun.spawn(['git', 'branch', '--list', 'orc/*', '--format=%(refname:short)'], { cwd: repo, stdout: 'pipe' });
+  const out = await new Response(p.stdout).text();
+  await p.exited;
+  return out.split('\n').filter(Boolean);
+}
+
 async function listWorktreePaths(repo: string): Promise<string[]> {
   const p = Bun.spawn(['git', 'worktree', 'list', '--porcelain'], { cwd: repo, stdout: 'pipe' });
   const out = await new Response(p.stdout).text();
@@ -82,6 +89,8 @@ describe('agent() rollback when the provider fails to start (D16)', () => {
       ).rejects.toThrow(START_FAILURE);
 
       expect(await listWorktreePaths(repo)).toEqual(before);
+      // The branch the spawn created is deleted too (run from the repo, not the removed dir).
+      expect(await orcBranches(repo)).toEqual([]);
       expect(await readRegistry()).toEqual([]);
       expect(await sessionDirs(home)).toEqual([]);
     });

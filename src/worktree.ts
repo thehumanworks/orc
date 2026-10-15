@@ -125,11 +125,31 @@ export async function hasWorkingTreeChanges(cwd: string): Promise<boolean> {
   return r.code === 0 && r.stdout.trim().length > 0;
 }
 
+/** The repository's shared git dir (absolute), from any of its worktrees; null when none. */
+async function gitCommonDir(cwd: string): Promise<string | null> {
+  try {
+    await fs.access(cwd);
+  } catch {
+    return null;
+  }
+  const r = await git(['rev-parse', '--git-common-dir'], cwd);
+  const out = r.stdout.trim();
+  return r.code === 0 && out.length > 0 ? path.resolve(cwd, out) : null;
+}
+
+/**
+ * Remove the git worktree at `wtPath`. The branch is KEPT unless `opts.branch` is given —
+ * only agent()'s spawn-failure rollback deletes the branch it just created; `orc kill
+ * --worktree` / `orc prune --worktree` keep it (it may hold the agent's commits).
+ */
 export async function removeWorktree(
   repoCwd: string,
   wtPath: string,
   opts?: { branch?: string },
 ): Promise<void> {
+  // Resolve the repository BEFORE the worktree disappears: the branch is deleted through the
+  // shared git dir, never from inside the removed directory.
+  const commonDir = (await gitCommonDir(wtPath)) ?? (await gitCommonDir(repoCwd));
   const toplevel = (await gitToplevel(wtPath)) ?? (await gitToplevel(repoCwd)) ?? repoCwd;
   const r = await git(['worktree', 'remove', '--force', wtPath], toplevel);
   if (r.code !== 0 && !/is not a working tree|No such file/i.test(r.stderr)) {
@@ -137,7 +157,8 @@ export async function removeWorktree(
   }
   const branch = opts?.branch?.trim();
   if (branch) {
-    const dr = await git(['branch', '-D', branch], toplevel);
+    if (!commonDir) throw new Error(`git branch -D ${branch}: no repository found for ${wtPath}`);
+    const dr = await git(['--git-dir', commonDir, 'branch', '-D', branch], path.dirname(commonDir));
     if (
       dr.code !== 0 &&
       !/not found|not a valid object name|checked out/i.test(dr.stderr + dr.stdout)

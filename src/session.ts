@@ -569,9 +569,8 @@ export class Session {
       await removeSystemPromptFile(this.record).catch(() => {});
     }
     if (opts?.removeWorktree && this.record.worktreePath) {
-      await removeWorktree(this.record.cwd, this.record.worktreePath, {
-        branch: this.record.branch,
-      }).catch(() => {});
+      // The branch is kept (it may hold the agent's commits); only the checkout goes.
+      await removeWorktree(this.record.cwd, this.record.worktreePath).catch(() => {});
     }
     if (opts?.purge) {
       await removeSessionDir(this.sessionId);

@@ -358,7 +358,8 @@ export async function pruneSessions(opts?: {
     if (!gone) continue;
     removed.push(gone);
     if (opts?.removeWorktree && gone.worktreePath) {
-      await removeWorktree(gone.cwd, gone.worktreePath, { branch: gone.branch }).catch(() => {});
+      // The branch is kept (it may hold the agent's commits); only the checkout goes.
+      await removeWorktree(gone.cwd, gone.worktreePath).catch(() => {});
     }
   }
   return removed.map((r) => r.id);
