@@ -164,6 +164,17 @@ describe('mapSendRequest — prompt + optional idempotency key', () => {
     ).toEqual({ prompt: 'p', messageId: 'primary' });
   });
 
+  test('wake:false maps through (--no-wake); a non-boolean wake is rejected', () => {
+    expect(mapSendRequest({ prompt: 'p', wake: false })).toEqual({ prompt: 'p', wake: false });
+    expect(mapSendRequest({ prompt: 'p', wake: true })).toEqual({ prompt: 'p' });
+    expect(mapSendRequest({ prompt: 'p', messageId: 'k', wake: false })).toEqual({
+      prompt: 'p',
+      messageId: 'k',
+      wake: false,
+    });
+    expect(() => mapSendRequest({ prompt: 'p', wake: 'no' })).toThrow(/wake must be a boolean/);
+  });
+
   test('rejects missing/empty prompt', () => {
     expect(() => mapSendRequest({})).toThrow(/non-empty `prompt`/);
     expect(() => mapSendRequest({ prompt: '' })).toThrow(/non-empty `prompt`/);
