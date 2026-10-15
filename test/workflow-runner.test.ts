@@ -206,6 +206,24 @@ describe('schema v5: runner + legacy tmux-runner normalization', () => {
     expect(both.legacyRunnerTmux).toBeUndefined();
   });
 
+  test('readRun never sees a torn record while a writer atomically rewrites it', async () => {
+    await writeRun(baseRun({ id: 'tr1' }));
+    let done = false;
+    const writer = (async () => {
+      for (let i = 0; i < 200; i++) await writeRun(baseRun({ id: 'tr1', name: i % 2 ? 'n' : 'n'.repeat(4_000) }));
+      done = true;
+    })();
+    let reads = 0;
+    let nulls = 0;
+    while (!done) {
+      reads++;
+      if ((await readRun('tr1')) === null) nulls++;
+    }
+    await writer;
+    expect(reads).toBeGreaterThan(50);
+    expect(nulls).toBe(0);
+  }, 20_000);
+
   test('lease startTime round-trips (pid-reuse guard)', () => {
     const lease = makeLease();
     expect(lease.pid).toBe(process.pid);

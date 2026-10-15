@@ -759,10 +759,17 @@ export async function withRunLock<T>(runId: string, fn: () => Promise<T>): Promi
 
 async function readRunUnlocked(runId: string): Promise<WorkflowRun | null> {
   assertValidRunId(runId);
-  const f = Bun.file(runPath(runId));
-  if (!(await f.exists())) return null;
+  // One open + read-to-EOF: always a single complete inode, even while a writer
+  // atomically renames a new version into place (Bun.file exists()+json() could pair a
+  // stale size with the new inode and parse a torn read as "no run").
+  let text: string;
   try {
-    return normalizeRun(await f.json());
+    text = await fs.readFile(runPath(runId), 'utf8');
+  } catch {
+    return null;
+  }
+  try {
+    return normalizeRun(JSON.parse(text));
   } catch {
     return null;
   }
