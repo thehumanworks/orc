@@ -422,17 +422,23 @@ describe('prune drops dead records (BUG 3)', () => {
       workspace: '/tmp/ws-kill-test',
       createdAt: new Date().toISOString(),
     };
+    // Its old codex persona file lives in the session dir; prune removes it.
+    const legacyDir = path.join(process.env.ORC_HOME!, 'sessions', legacy.sessionId);
+    nodeFs.mkdirSync(legacyDir, { recursive: true });
+    legacy.instructionsPath = path.join(legacyDir, 'instructions.md');
+    nodeFs.writeFileSync(legacy.instructionsPath, 'persona\n');
     nodeFs.writeFileSync(registryPath(), JSON.stringify([legacy]));
     const [r] = await readRegistry();
     expect(r!.legacy).toBe('tmux');
     expect(r!.status).toBe('dead');
     expect(r!.legacyTmuxName).toBe('orc-codex-legacy10');
-    expect(r!.systemPromptPath).toBe('/tmp/x/instructions.md');
+    expect(r!.systemPromptPath).toBe(legacy.instructionsPath);
     expect(r!.providerSessionId).toBe('cdx-thread');
     expect('tmuxName' in r!).toBe(false);
     // Hidden from the default list, pruned by default (kernel liveness).
     expect((await listSessions({ workspace: '/tmp/ws-kill-test' })).map((s) => s.id)).toEqual([]);
     expect(await pruneSessions()).toEqual(['legacy10']);
+    expect(nodeFs.existsSync(legacyDir)).toBe(false);
   });
 });
 

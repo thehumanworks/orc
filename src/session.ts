@@ -539,7 +539,7 @@ export class Session {
       }).catch(() => {});
     }
     if (opts?.purge) {
-      if (!this.legacy) await removeSessionDir(this.sessionId);
+      await removeSessionDir(this.sessionId);
       await removeRecord(this.id);
       await releaseSessionPolicy(this.record.rootRunId).catch(() => {});
       return;

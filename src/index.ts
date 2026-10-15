@@ -324,7 +324,8 @@ export async function pruneSessions(opts?: {
     };
   });
   for (const r of removed) {
-    if (!r.legacy) await removeSessionDir(r.sessionId);
+    // A legacy record's dir holds at most its old codex persona file: remove it too.
+    await removeSessionDir(r.sessionId);
     if (opts?.removeWorktree && r.worktreePath) {
       await removeWorktree(r.cwd, r.worktreePath, { branch: r.branch }).catch(() => {});
     }
