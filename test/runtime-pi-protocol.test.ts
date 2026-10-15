@@ -26,9 +26,9 @@ interface Replay {
 }
 
 /**
- * Replay a recorded session through a fresh mapper: `out` prompt/abort lines drive
- * beginTurn/requestInterrupt, `in` lines are fed verbatim (the recorded abort response id
- * is rewritten to the id the mapper generated), `meta close-stdin` → process exit.
+ * Replay a recorded session through a fresh mapper: `send` prompt/abort lines drive
+ * beginTurn/requestInterrupt, `recv` lines are fed verbatim (the recorded abort response id
+ * is rewritten to the id the mapper generated), `info close-stdin` → process exit.
  */
 function replay(name: string): Replay {
   const m = new PiTurnMapper();
@@ -38,12 +38,12 @@ function replay(name: string): Replay {
   const lines = fs.readFileSync(path.join(FIXTURES, `${name}.jsonl`), 'utf8').split('\n').filter(Boolean);
   for (const l of lines) {
     const { dir, line } = JSON.parse(l) as { dir: string; line: string };
-    if (dir === 'meta') {
+    if (dir === 'info') {
       if (line === 'close-stdin') events.push(...m.finishOnExit());
       continue;
     }
     const rec = JSON.parse(line) as PiRecord;
-    if (dir === 'out') {
+    if (dir === 'send') {
       if (rec.type === 'prompt') {
         const cmd = m.beginTurn(rec.id as string, rec.message as string);
         expect(cmd).toEqual({ id: rec.id, type: 'prompt', message: rec.message });
@@ -297,6 +297,53 @@ describe('pi mapper: synthetic edge cases', () => {
     ]);
   });
 
+  test('repeat interrupt re-sends abort only after the previous one went unanswered for reabortAfterMs', () => {
+    const m = new PiTurnMapper({ reabortAfterMs: 3_000 });
+    m.beginTurn('m1', 'x');
+    feed(m, [ack('m1')]);
+    expect(m.requestInterrupt(1_000).writes).toEqual([{ id: `${PI_INTERNAL_ID_PREFIX}abort:1`, type: 'abort' }]);
+    expect(m.requestInterrupt(2_000)).toEqual({ events: [], writes: [] });
+    expect(m.requestInterrupt(3_999)).toEqual({ events: [], writes: [] });
+    expect(m.requestInterrupt(4_000).writes).toEqual([{ id: `${PI_INTERNAL_ID_PREFIX}abort:2`, type: 'abort' }]);
+    expect(m.openTurnAbortIds()).toEqual([`${PI_INTERNAL_ID_PREFIX}abort:1`, `${PI_INTERNAL_ID_PREFIX}abort:2`]);
+    // The window restarts from the latest abort.
+    expect(m.requestInterrupt(6_000)).toEqual({ events: [], writes: [] });
+    // Each abort written is acked once; the turn ends once.
+    const { events } = feed(m, [
+      assistantEnd([], 'aborted'),
+      settled(true),
+      { id: `${PI_INTERNAL_ID_PREFIX}abort:2`, type: 'response', command: 'abort', success: true },
+      { id: `${PI_INTERNAL_ID_PREFIX}abort:1`, type: 'response', command: 'abort', success: true },
+    ]);
+    expect(events).toEqual([
+      { type: 'turn.interrupted', messageId: 'm1' },
+      { type: 'interrupt.acked' },
+      { type: 'interrupt.acked' },
+    ]);
+    expect(m.isAbortPending(`${PI_INTERNAL_ID_PREFIX}abort:1`)).toBe(false);
+  });
+
+  test('an answered abort with the turn still open allows an immediate re-abort', () => {
+    const m = new PiTurnMapper({ reabortAfterMs: 3_000 });
+    m.beginTurn('m1', 'x');
+    feed(m, [ack('m1')]);
+    m.requestInterrupt(1_000);
+    const r = feed(m, [{ id: `${PI_INTERNAL_ID_PREFIX}abort:1`, type: 'response', command: 'abort', success: true }]);
+    expect(r.events).toEqual([{ type: 'interrupt.acked' }]);
+    expect(m.openMessageId).toBe('m1');
+    expect(m.requestInterrupt(1_100).writes).toEqual([{ id: `${PI_INTERNAL_ID_PREFIX}abort:2`, type: 'abort' }]);
+  });
+
+  test('a deferred interrupt is not re-sent before the ack, however long it waits', () => {
+    const m = new PiTurnMapper({ reabortAfterMs: 10 });
+    m.beginTurn('m1', 'x');
+    m.requestInterrupt(0);
+    expect(m.requestInterrupt(10_000)).toEqual({ events: [], writes: [] });
+    expect(m.handleRecord(ack('m1'), 10_001).writes).toEqual([{ id: `${PI_INTERNAL_ID_PREFIX}abort:1`, type: 'abort' }]);
+    expect(m.requestInterrupt(10_005)).toEqual({ events: [], writes: [] });
+    expect(m.requestInterrupt(10_011).writes).toHaveLength(1);
+  });
+
   test('interrupt with no open turn is a no-op', () => {
     const m = new PiTurnMapper();
     expect(m.requestInterrupt()).toEqual({ events: [], writes: [] });
@@ -316,6 +363,12 @@ describe('pi mapper: synthetic edge cases', () => {
       events: [],
       writes: [],
     });
+    // With no open turn the event carries no messageId key at all.
+    const idle = new PiTurnMapper();
+    const lone = { type: 'extension_ui_request', id: 'ui-9', method: 'select', options: ['a'] };
+    const ev = feed(idle, [lone]).events[0] as Record<string, unknown>;
+    expect(ev).toEqual({ type: 'permission.requested', detail: lone });
+    expect('messageId' in ev).toBe(false);
     // Unknown methods might block: treated as dialogs.
     expect(feed(m, [{ type: 'extension_ui_request', id: 'ui-3', method: 'pickColor' }]).writes).toEqual([
       { type: 'extension_ui_response', id: 'ui-3', cancelled: true },

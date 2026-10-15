@@ -7,9 +7,9 @@
  * `<dirname(rawLogPath)>/provider.stderr.log`; it is never parsed.
  *
  * Raw log (launch.rawLogPath), one JSON object per line, tagged from orc's point of view:
- *   {"ts":"<iso>","dir":"out","line":"<verbatim line written to pi's stdin>"}
- *   {"ts":"<iso>","dir":"in","line":"<verbatim line read from pi's stdout>"}
- *   {"ts":"<iso>","dir":"meta","line":"<lifecycle note: spawn argv, stdin closed, exit>"}
+ *   {"ts":"<iso>","dir":"send","line":"<verbatim line written to pi's stdin>"}
+ *   {"ts":"<iso>","dir":"recv","line":"<verbatim line read from pi's stdout>"}
+ *   {"ts":"<iso>","dir":"info","line":"<lifecycle note: spawn argv, stdin closed, exit>"}
  *
  * Lifecycle:
  *   start  → spawn, `get_state` (≤ bootTimeoutMs), validate, emit `ready`
@@ -22,13 +22,19 @@
  *            the prompt (turn.started / turn.failed already emitted) or exited. Rejects when
  *            a turn is open or the runtime is closing.
  *   interrupt → `abort` for the open turn (deferred until the prompt ack, because an abort
- *            that beats pi's preflight is a silent no-op). Every interrupt of an open turn
- *            yields exactly one `interrupt.acked` unless pi exits first. No open turn → no-op.
+ *            that beats pi's preflight is a silent no-op). A repeat interrupt re-sends `abort`
+ *            only if the previous one is unanswered after reabortAfterMs (default 3 s). Each
+ *            abort written yields one `interrupt.acked` unless pi exits first. No open turn →
+ *            no-op.
  *   dialogs → an extension `extension_ui_request` dialog (select/confirm/input/editor) is
  *            emitted as `permission.requested` and cancelled at once, so the turn can end.
- *   close  → end stdin (pi's shutdown: it aborts an active run silently and exits 0), wait
- *            graceMs, then terminate the process group (SIGTERM → SIGKILL). An open turn is
- *            closed as `turn.interrupted`. `exited` is always the final event.
+ *   close  → with a turn open, first `abort` it and wait (within graceMs) for pi to settle and
+ *            answer, so pi persists the partial assistant message (ending stdin mid-run drops
+ *            the run silently, leaving an unanswered user message in the transcript). Then end
+ *            stdin (pi's shutdown, exit 0), wait out the rest of graceMs (at least
+ *            min(graceMs, 500 ms)), then terminate the process group (SIGTERM → SIGKILL). A
+ *            turn still open at exit is closed as `turn.interrupted`. Concurrent/repeated
+ *            close() calls share one shutdown. `exited` is always the final event.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -62,6 +68,8 @@ export interface PiRuntimeOptions {
   bin?: string;
   /** Max wait for the boot `get_state` response. Default 15 s. */
   bootTimeoutMs?: number;
+  /** Re-send an unanswered `abort` on a repeat interrupt after this long. Default 3 s. */
+  reabortAfterMs?: number;
 }
 
 /** Factory with explicit options (tests, verification gates). */
@@ -98,7 +106,7 @@ async function startPi(launch: ProviderLaunch, opts: PiRuntimeOptions): Promise<
   const binPath = resolvePiBin(opts.bin ?? 'pi', env);
   const argv = [binPath, ...buildPiArgs(spec, resume)];
 
-  const rt = PiRuntime.spawn(argv, launch);
+  const rt = PiRuntime.spawn(argv, launch, opts);
   try {
     const ready = await rt.boot({
       sessionId,
@@ -133,13 +141,16 @@ class PiRuntime implements ProviderRuntime {
   readonly pid: number;
 
   private readonly identity: ProcessIdentity;
-  private readonly mapper = new PiTurnMapper();
+  private readonly mapper: PiTurnMapper;
   private readonly queue = new EventQueue<ProviderEvent>();
   /** Events produced before `ready` (flushed after it); null once ready. */
   private held: ProviderEvent[] | null = [];
   private rawFd: number | null;
   private bootWaiter: ((rec: PiRecord | null) => void) | null = null;
   private ackWaiter: { messageId: string; resolve: () => void } | null = null;
+  /** Woken after every processed stdout line and on exit (close() waits on them). */
+  private stateWaiters: Array<() => void> = [];
+  private closing: Promise<void> | null = null;
   private stdinEnded = false;
   private hasExited = false;
   private stdoutStopped = false;
@@ -147,7 +158,7 @@ class PiRuntime implements ProviderRuntime {
   private readonly stdoutDone: Promise<void>;
   private readonly exitDone: Promise<void>;
 
-  static spawn(argv: string[], launch: ProviderLaunch): PiRuntime {
+  static spawn(argv: string[], launch: ProviderLaunch, opts: PiRuntimeOptions): PiRuntime {
     fs.mkdirSync(path.dirname(launch.rawLogPath), { recursive: true, mode: 0o700 });
     const stderrPath = piStderrLogPath(launch.rawLogPath);
     const rawFd = fs.openSync(launch.rawLogPath, 'a', 0o600);
@@ -155,7 +166,7 @@ class PiRuntime implements ProviderRuntime {
     try {
       stderrFd = fs.openSync(stderrPath, 'a', 0o600);
       const proc = spawnPiProcess(argv, launch.spec.cwd, launch.env, stderrFd);
-      return new PiRuntime(proc, rawFd, stderrPath, argv);
+      return new PiRuntime(proc, rawFd, stderrPath, argv, opts);
     } catch (e) {
       fs.closeSync(rawFd);
       throw e;
@@ -169,11 +180,13 @@ class PiRuntime implements ProviderRuntime {
     rawFd: number,
     private readonly stderrPath: string,
     argv: string[],
+    opts: PiRuntimeOptions,
   ) {
+    this.mapper = new PiTurnMapper({ reabortAfterMs: opts.reabortAfterMs });
     this.pid = proc.pid;
     this.identity = { pid: proc.pid, startTime: processStartTime(proc.pid) };
     this.rawFd = rawFd;
-    this.raw('meta', `spawn pid=${proc.pid} argv=${JSON.stringify(argv)}`);
+    this.raw('info', `spawn pid=${proc.pid} argv=${JSON.stringify(argv)}`);
     this.stdoutDone = this.readStdout();
     this.exitDone = this.watchExit();
   }
@@ -187,7 +200,7 @@ class PiRuntime implements ProviderRuntime {
   }
 
   async send(messageId: string, text: string): Promise<void> {
-    if (this.stdinEnded || this.hasExited) throw new Error('pi runtime: closed');
+    if (this.closing || this.stdinEnded || this.hasExited) throw new Error('pi runtime: closed');
     const open = this.mapper.openMessageId;
     if (open !== null) throw new Error(`pi runtime: turn ${open} is still open`);
     const cmd = this.mapper.beginTurn(messageId, text);
@@ -209,10 +222,29 @@ class PiRuntime implements ProviderRuntime {
     for (const w of r.writes) await this.write(w).catch(() => {});
   }
 
-  async close(opts?: { graceMs?: number }): Promise<void> {
-    const graceMs = Math.max(0, opts?.graceMs ?? PI_DEFAULT_CLOSE_GRACE_MS);
+  close(opts?: { graceMs?: number }): Promise<void> {
+    if (!this.closing) this.closing = this.shutdown(Math.max(0, opts?.graceMs ?? PI_DEFAULT_CLOSE_GRACE_MS));
+    return this.closing;
+  }
+
+  private async shutdown(graceMs: number): Promise<void> {
+    const deadline = Date.now() + graceMs;
+    if (!this.hasExited && !this.stdinEnded && this.mapper.openMessageId !== null) {
+      // Abort first so pi settles the run and persists the partial assistant message.
+      const r = this.mapper.requestInterrupt();
+      for (const ev of r.events) this.emit(ev);
+      for (const w of r.writes) await this.write(w).catch(() => {});
+      // Settled AND its abort(s) answered (pi answers an abort only after the run settles).
+      const ids = new Set<string>();
+      await this.waitState(() => {
+        if (this.hasExited) return true;
+        for (const id of this.mapper.openTurnAbortIds()) ids.add(id);
+        return this.mapper.openMessageId === null && [...ids].every((id) => !this.mapper.isAbortPending(id));
+      }, deadline - Date.now());
+    }
     this.endStdin();
-    if (!(await this.exitedWithin(graceMs))) {
+    const exitWindow = Math.max(deadline - Date.now(), Math.min(graceMs, 500));
+    if (!(await this.exitedWithin(exitWindow))) {
       await terminateProcessGroup(this.identity, Math.min(graceMs, 1_000)).catch(() => false);
     }
     await this.exitDone;
@@ -291,7 +323,7 @@ class PiRuntime implements ProviderRuntime {
   private async write(cmd: PiRecord): Promise<void> {
     if (this.hasExited || this.stdinEnded) throw new Error('pi runtime: stdin closed');
     const line = encodePiCommand(cmd);
-    this.raw('out', line);
+    this.raw('send', line);
     const sink = this.proc.stdin;
     sink.write(`${line}\n`);
     await sink.flush();
@@ -301,13 +333,36 @@ class PiRuntime implements ProviderRuntime {
     if (this.stdinEnded) return;
     this.stdinEnded = true;
     if (this.hasExited) return;
-    this.raw('meta', 'stdin closed');
+    this.raw('info', 'stdin closed');
     try {
       const r = this.proc.stdin.end();
       if (r instanceof Promise) r.catch(() => {});
     } catch {
       // already closed
     }
+  }
+
+  /** Wait until `pred()` holds (re-checked per stdout line and on exit) or `ms` elapses. */
+  private async waitState(pred: () => boolean, ms: number): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    while (!pred()) {
+      const left = deadline - Date.now();
+      if (left <= 0) return false;
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, left);
+        this.stateWaiters.push(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    }
+    return true;
+  }
+
+  private notifyState(): void {
+    const ws = this.stateWaiters;
+    this.stateWaiters = [];
+    for (const w of ws) w();
   }
 
   private async exitedWithin(ms: number): Promise<boolean> {
@@ -324,7 +379,15 @@ class PiRuntime implements ProviderRuntime {
 
   private onLine(line: string): void {
     if (this.stdoutStopped) return;
-    this.raw('in', line);
+    try {
+      this.handleLine(line);
+    } finally {
+      this.notifyState();
+    }
+  }
+
+  private handleLine(line: string): void {
+    this.raw('recv', line);
     const rec = parsePiLine(line);
     if (!rec) {
       if (line.trim().length > 0) this.mapper.nonJsonLines++;
@@ -361,7 +424,7 @@ class PiRuntime implements ProviderRuntime {
     for (const line of split.push(dec.decode())) this.onLine(line);
     const rest = split.flush();
     // An unterminated line at EOF is a protocol error: logged, never interpreted.
-    if (rest.length > 0 && !this.stdoutStopped) this.raw('in', rest);
+    if (rest.length > 0 && !this.stdoutStopped) this.raw('recv', rest);
   }
 
   private async watchExit(): Promise<void> {
@@ -385,7 +448,7 @@ class PiRuntime implements ProviderRuntime {
 
     const code = this.proc.exitCode;
     const signal = this.proc.signalCode ?? null;
-    this.raw('meta', `exit code=${code} signal=${signal}`);
+    this.raw('info', `exit code=${code} signal=${signal}`);
     for (const ev of this.mapper.finishOnExit()) this.emit(ev);
     this.bootWaiter?.(null);
     const waiter = this.ackWaiter;
@@ -393,6 +456,7 @@ class PiRuntime implements ProviderRuntime {
     waiter?.resolve();
     this.emit({ type: 'exited', code, signal });
     this.queue.end();
+    this.notifyState();
     if (this.rawFd !== null) {
       try {
         fs.closeSync(this.rawFd);
@@ -403,7 +467,7 @@ class PiRuntime implements ProviderRuntime {
     }
   }
 
-  private raw(dir: 'in' | 'out' | 'meta', line: string): void {
+  private raw(dir: 'send' | 'recv' | 'info', line: string): void {
     if (this.rawFd === null) return;
     try {
       fs.writeSync(this.rawFd, `${JSON.stringify({ ts: new Date().toISOString(), dir, line })}\n`);

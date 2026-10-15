@@ -32,7 +32,7 @@
  *                                                 requested, else turn.failed{finalError ??
  *                                                 errorMessage}
  *   agent_settled otherwise (incl. "length")    → turn.completed{result, usage, costUsd}
- *   response(abort, id=ours)                    → interrupt.acked
+ *   response(abort, id=ours)                    → interrupt.acked (one per abort written)
  *   extension_ui_request (dialog method)        → permission.requested + auto-cancel reply
  *   process exit with a turn open               → turn.interrupted (pi emits nothing)
  */
@@ -49,6 +49,12 @@ export const PI_INTERNAL_ID_PREFIX = '__orc:';
 
 /** Request id of the boot-time `get_state`. */
 export const PI_BOOT_ID = `${PI_INTERNAL_ID_PREFIX}boot`;
+
+/**
+ * A repeated interrupt() re-sends `abort` only when the previous one is still unanswered
+ * after this long (pi may drop an abort, e.g. one racing a run boundary).
+ */
+export const PI_REABORT_AFTER_MS = 3_000;
 
 /** Extension UI methods that do NOT wait for a response (pi docs `rpc-extension-ui.md`). */
 const FIRE_AND_FORGET_UI = new Set(['notify', 'setStatus', 'setWidget', 'setTitle', 'set_editor_text']);
@@ -160,6 +166,10 @@ interface OpenTurn {
   interruptRequested: boolean;
   /** interrupt() came before the ack: the abort is written once the run exists. */
   abortDeferred: boolean;
+  /** Aborts written for this turn and not yet answered. */
+  unansweredAborts: Set<string>;
+  /** When the latest abort for this turn was written (ms). */
+  lastAbortAt?: number;
   last?: AssistantSummary;
   usage: Required<TurnUsage>;
   sawUsage: boolean;
@@ -179,8 +189,23 @@ export class PiTurnMapper {
   private turn: OpenTurn | null = null;
   private abortSeq = 0;
   private readonly pendingAborts = new Set<string>();
+  private readonly reabortAfterMs: number;
   /** stdout lines that were not JSON objects (logged, otherwise ignored). */
   nonJsonLines = 0;
+
+  constructor(opts: { reabortAfterMs?: number } = {}) {
+    this.reabortAfterMs = opts.reabortAfterMs ?? PI_REABORT_AFTER_MS;
+  }
+
+  /** Ids of the aborts written for the open turn and not yet answered. */
+  openTurnAbortIds(): string[] {
+    return this.turn ? [...this.turn.unansweredAborts] : [];
+  }
+
+  /** True while an abort with this id is still unanswered. */
+  isAbortPending(id: string): boolean {
+    return this.pendingAborts.has(id);
+  }
 
   /** messageId of the open turn, or null. */
   get openMessageId(): string | null {
@@ -202,6 +227,7 @@ export class PiTurnMapper {
       acked: false,
       interruptRequested: false,
       abortDeferred: false,
+      unansweredAborts: new Set(),
       usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
       sawUsage: false,
       costUsd: 0,
@@ -212,17 +238,25 @@ export class PiTurnMapper {
 
   /**
    * Interrupt the open turn: returns the `abort` to write now, or nothing when deferred
-   * (prompt not yet acked) or already requested. No open turn → no-op (no events).
+   * (prompt not yet acked) or already in flight. A repeat request re-sends `abort` only
+   * once the previous one has gone unanswered for `reabortAfterMs` (pi may drop one).
+   * No open turn → no-op (no events). Each abort written yields one `interrupt.acked`.
    */
-  requestInterrupt(): PiMapResult {
+  requestInterrupt(now: number = Date.now()): PiMapResult {
     const t = this.turn;
-    if (!t || t.interruptRequested) return empty();
-    t.interruptRequested = true;
-    if (!t.acked) {
-      t.abortDeferred = true;
-      return empty();
+    if (!t) return empty();
+    if (!t.interruptRequested) {
+      t.interruptRequested = true;
+      if (!t.acked) {
+        t.abortDeferred = true;
+        return empty();
+      }
+      return { events: [], writes: [this.abortCommand(t, now)] };
     }
-    return { events: [], writes: [this.abortCommand()] };
+    if (t.abortDeferred) return empty();
+    const lastAt = t.lastAbortAt ?? Number.NEGATIVE_INFINITY;
+    if (t.unansweredAborts.size > 0 && now - lastAt < this.reabortAfterMs) return empty();
+    return { events: [], writes: [this.abortCommand(t, now)] };
   }
 
   /** Process exit: close an open turn ourselves (pi emits nothing after stdin close / crash). */
@@ -243,10 +277,10 @@ export class PiTurnMapper {
     return this.handleRecord(rec);
   }
 
-  handleRecord(rec: PiRecord): PiMapResult {
+  handleRecord(rec: PiRecord, now: number = Date.now()): PiMapResult {
     switch (rec.type) {
       case 'response':
-        return this.onResponse(rec);
+        return this.onResponse(rec, now);
       case 'message_end':
         return this.onMessageEnd(rec);
       case 'auto_retry_end':
@@ -266,16 +300,19 @@ export class PiTurnMapper {
     }
   }
 
-  private abortCommand(): PiRecord {
+  private abortCommand(t: OpenTurn, now: number): PiRecord {
     const id = `${PI_INTERNAL_ID_PREFIX}abort:${++this.abortSeq}`;
     this.pendingAborts.add(id);
+    t.unansweredAborts.add(id);
+    t.lastAbortAt = now;
     return { id, type: 'abort' };
   }
 
-  private onResponse(rec: PiRecord): PiMapResult {
+  private onResponse(rec: PiRecord, now: number): PiMapResult {
     const id = rec.id;
     if (typeof id === 'string' && this.pendingAborts.has(id)) {
       this.pendingAborts.delete(id);
+      this.turn?.unansweredAborts.delete(id);
       return { events: [{ type: 'interrupt.acked' }], writes: [] };
     }
     const t = this.turn;
@@ -289,7 +326,7 @@ export class PiTurnMapper {
         out.events.push({ type: 'turn.started', messageId: t.messageId });
         if (t.abortDeferred) {
           t.abortDeferred = false;
-          out.writes.push(this.abortCommand());
+          out.writes.push(this.abortCommand(t, now));
         }
         return out;
       }
@@ -380,10 +417,9 @@ export class PiTurnMapper {
     if (method !== undefined && FIRE_AND_FORGET_UI.has(method)) return empty();
     // A dialog (select/confirm/input/editor, or an unknown method that may block): journal
     // it and cancel at once so the turn can end — orc sessions have no interactive UI.
-    const out: PiMapResult = {
-      events: [{ type: 'permission.requested', messageId: this.turn?.messageId, detail: rec }],
-      writes: [],
-    };
+    const ev: Extract<ProviderEvent, { type: 'permission.requested' }> = { type: 'permission.requested', detail: rec };
+    if (this.turn) ev.messageId = this.turn.messageId;
+    const out: PiMapResult = { events: [ev], writes: [] };
     if (typeof rec.id === 'string') out.writes.push({ type: 'extension_ui_response', id: rec.id, cancelled: true });
     return out;
   }

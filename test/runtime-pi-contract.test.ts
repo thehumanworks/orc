@@ -4,7 +4,8 @@
  * never touches the real ~/.pi: HOME and PI_CODING_AGENT_DIR point at temp dirs and the
  * child env is built from scratch (no inherited provider keys / cloud creds / proxies).
  *
- * pi binary: $ORC_TEST_PI_BIN, else the S4 scratch install. Skipped (with a message) if absent.
+ * pi binary: $ORC_TEST_PI_BIN, else `pi` on PATH, else the S4 scratch install. When none
+ * exists the suite registers a visible skipped test instead of running.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
 import fs from 'node:fs';
@@ -14,19 +15,30 @@ import { PI_VERIFIED_VERSION } from '../src/runtime/providers/pi-protocol.ts';
 import { createPiRuntime, piStderrLogPath } from '../src/runtime/providers/pi.ts';
 import type { ProviderEvent, ProviderLaunch, ProviderRuntime, SpawnSpec } from '../src/runtime/types.ts';
 
-const DEFAULT_PI_BIN =
+const SCRATCH_PI_BIN =
   '/tmp/claude-0/-home-claude/b00ce3a9-453c-561e-a590-e55f008719e0/scratchpad/pi/node_modules/.bin/pi';
-const PI_BIN = process.env.ORC_TEST_PI_BIN || DEFAULT_PI_BIN;
-const HAVE_PI = (() => {
-  try {
-    fs.accessSync(PI_BIN, fs.constants.X_OK);
-    return true;
-  } catch {
-    return false;
+
+/** $ORC_TEST_PI_BIN, else `pi` on PATH, else the S4 scratch install; null when none is executable. */
+function resolveTestPiBin(): string | null {
+  const candidates = [process.env.ORC_TEST_PI_BIN, Bun.which('pi'), SCRATCH_PI_BIN];
+  for (const c of candidates) {
+    if (!c) continue;
+    try {
+      fs.accessSync(c, fs.constants.X_OK);
+      return c;
+    } catch {
+      // try the next one
+    }
   }
-})();
+  return null;
+}
+
+const RESOLVED_PI_BIN = resolveTestPiBin();
+const HAVE_PI = RESOLVED_PI_BIN !== null;
+const PI_BIN = RESOLVED_PI_BIN ?? 'pi';
 if (!HAVE_PI) {
-  console.warn(`[runtime-pi-contract] SKIPPED: pi binary not found at ${PI_BIN} (set ORC_TEST_PI_BIN)`);
+  // Visible in the test report (not just a log line): the contract — incl. the version pin — did not run.
+  test.skip('pi runtime contract: no pi binary found (set ORC_TEST_PI_BIN or put pi on PATH)', () => {});
 }
 const d = HAVE_PI ? describe : describe.skip;
 
@@ -386,7 +398,7 @@ d('pi runtime contract (real pi --mode rpc, mock model)', () => {
       // Run a whole turn BEFORE anyone iterates events(): nothing may be lost.
       await rt.send('m-1', 'hello one');
       await waitUntil(
-        () => rawLog(s).some((r) => r.dir === 'in' && r.line.includes('"agent_settled"')),
+        () => rawLog(s).some((r) => r.dir === 'recv' && r.line.includes('"agent_settled"')),
         15_000,
         'agent_settled in raw log',
       );
@@ -412,9 +424,9 @@ d('pi runtime contract (real pi --mode rpc, mock model)', () => {
 
       // Raw log: both directions, verbatim, tagged.
       const raw = rawLog(s);
-      expect(raw.some((r) => r.dir === 'out' && JSON.parse(r.line).id === 'm-2')).toBe(true);
-      expect(raw.some((r) => r.dir === 'in' && r.line.includes('"command":"prompt"'))).toBe(true);
-      expect(raw.every((r) => ['in', 'out', 'meta'].includes(r.dir) && typeof r.ts === 'string')).toBe(true);
+      expect(raw.some((r) => r.dir === 'send' && JSON.parse(r.line).id === 'm-2')).toBe(true);
+      expect(raw.some((r) => r.dir === 'recv' && r.line.includes('"command":"prompt"'))).toBe(true);
+      expect(raw.every((r) => ['send', 'recv', 'info'].includes(r.dir) && typeof r.ts === 'string')).toBe(true);
     },
     30_000,
   );
@@ -490,7 +502,7 @@ d('pi runtime contract (real pi --mode rpc, mock model)', () => {
   );
 
   test(
-    'close with an open turn → turn.interrupted, then exited (last); no process left in the group',
+    'close with an open turn → aborts first (partial reply persisted), then exited (last); no process left in the group',
     async () => {
       const s = newSession();
       const rt = await start(launchOf(s));
@@ -500,9 +512,29 @@ d('pi runtime contract (real pi --mode rpc, mock model)', () => {
       await streaming;
       await rt.close({ graceMs: 3_000 });
       await c.done;
-      expect(c.types().slice(-2)).toEqual(['turn.interrupted:m-open', 'exited']);
+      // close() aborts first: pi itself settles the run (and answers the abort) before stdin ends.
+      expect(c.types().slice(-3)).toEqual(['turn.interrupted:m-open', 'interrupt.acked', 'exited']);
       expect(c.events.at(-1)).toEqual({ type: 'exited', code: 0, signal: null });
       expect(groupAlive(rt.pid)).toBe(false);
+      const raw = rawLog(s);
+      const abortAt = raw.findIndex((r) => r.dir === 'send' && r.line.includes('"type":"abort"'));
+      const settledAt = raw.findIndex((r) => r.dir === 'recv' && r.line.includes('"agent_settled"'));
+      const stdinEndAt = raw.findIndex((r) => r.dir === 'info' && r.line === 'stdin closed');
+      expect(abortAt).toBeGreaterThan(-1);
+      expect(settledAt).toBeGreaterThan(abortAt);
+      expect(stdinEndAt).toBeGreaterThan(settledAt);
+      // pi persisted the partial assistant reply, not just an unanswered user message.
+      const ready = c.events[0];
+      if (ready?.type !== 'ready' || !ready.transcriptPath) throw new Error('no transcript path');
+      const persisted = fs
+        .readFileSync(ready.transcriptPath, 'utf8')
+        .split('\n')
+        .filter(Boolean)
+        .map((l) => JSON.parse(l) as { type?: string; message?: { role?: string; stopReason?: string; content?: unknown } });
+      const assistant = persisted.filter((e) => e.type === 'message' && e.message?.role === 'assistant');
+      expect(assistant.length).toBe(1);
+      expect(assistant[0]?.message?.stopReason).toBe('aborted');
+      expect(JSON.stringify(assistant[0]?.message?.content)).toContain('chunk0');
       await expect(rt.send('m-late', 'x')).rejects.toThrow(/closed/);
       await rt.close(); // idempotent
     },
@@ -587,7 +619,7 @@ d('pi runtime contract (real pi --mode rpc, mock model)', () => {
       });
       expect(await c.outcome('m-ask')).toMatchObject({ type: 'turn.completed', result: 'MOCK OK: ASKME then answer' });
       const raw = rawLog(s);
-      expect(raw.some((r) => r.dir === 'out' && r.line.includes('"extension_ui_response"') && r.line.includes('"cancelled":true'))).toBe(true);
+      expect(raw.some((r) => r.dir === 'send' && r.line.includes('"extension_ui_response"') && r.line.includes('"cancelled":true'))).toBe(true);
     },
     30_000,
   );
