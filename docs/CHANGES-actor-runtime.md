@@ -65,6 +65,9 @@ Current behaviour: [`../README.md`](../README.md), [`ARCHITECTURE.md`](ARCHITECT
   v1 daemons.
 - **Privacy**: everything under `~/.orc` is owner-only (0700 dirs, 0600 files).
 - **Locks** whose owner process is gone are reclaimed at once (was: after 5 minutes).
+- **Worktrees**: `kill --worktree` / `prune --worktree` remove the checkout and keep the branch; a
+  `--worktree` spawn that fails before the provider is ready removes its worktree **and** the
+  branch it created (the branch used to be left behind).
 
 ### Removed
 
