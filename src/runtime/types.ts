@@ -147,7 +147,14 @@ export interface ProviderRuntimeFactory {
 export type InboxItem =
   | { kind: 'message'; ulid: string; messageId: string; text: string; createdAt: string }
   | { kind: 'interrupt'; ulid: string; createdAt: string }
-  | { kind: 'stop'; ulid: string; reason?: string; createdAt: string };
+  | {
+      kind: 'stop';
+      ulid: string;
+      reason?: string;
+      /** Provider close grace (ms) the actor applies before killing the group. */
+      graceMs?: number;
+      createdAt: string;
+    };
 
 /** Valid inbox file name: a Crockford-base32 ULID + .json. Anything else is ignored. */
 export const INBOX_FILE_RE = /^[0-9A-HJKMNP-TV-Z]{26}\.json$/;
