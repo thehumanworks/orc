@@ -8,6 +8,7 @@
  *   otherwise            → reply `echo: <text>` and a success result
  * `--resume 00000000-…` → "No conversation found" (stderr + error result), exit 1.
  * FAKE_CLAUDE_RECORD=<file> → writes {argv, env (CLAUDE_CODE_* / ORC_* keys)} there.
+ * FAKE_CLAUDE_REPLY_DELAY_MS=<n> → a normal reply arrives after n ms (default: at once).
  */
 import fs from 'node:fs';
 
@@ -103,7 +104,9 @@ function onUser(o: { uuid: string; message: { content: Array<{ type: string; tex
   if (text.includes('SPAWN_CHILD')) {
     Bun.spawn(['sleep', '300'], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' }).unref();
   }
-  result(uuid, `echo: ${text}`);
+  const delay = Number(process.env.FAKE_CLAUDE_REPLY_DELAY_MS ?? 0);
+  if (delay > 0) setTimeout(() => result(uuid, `echo: ${text}`), delay);
+  else result(uuid, `echo: ${text}`);
 }
 
 let buf = '';

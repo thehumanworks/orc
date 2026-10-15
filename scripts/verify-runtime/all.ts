@@ -4,7 +4,7 @@
  *
  *   bun scripts/verify-runtime/all.ts [--providers claude,codex,pi] [--claude-model M]
  *       [--codex-model M] [--pi-model M] [--keep]
- *       [--claude-bin P] [--codex-bin P] [--pi-bin P] [--no-runtime-gates] [--no-workflow]
+ *       [--claude-bin P] [--codex-bin P] [--pi-bin P] [--no-runtime-gates] [--no-e2e] [--no-workflow]
  *       [--results <file>]   (default: <repo>/verify-results.json)
  *
  * 1. Preflight: OS/arch, bun, each provider's binary + version (a missing provider is SKIP,
@@ -43,15 +43,16 @@ interface Args {
   bin: Partial<Record<Provider, string>>;
   keep: boolean;
   runtimeGates: boolean;
+  e2e: boolean;
   workflow: boolean;
 }
 
 const USAGE = `usage: bun scripts/verify-runtime/all.ts [--providers claude,codex,pi] [--claude-model M]
        [--codex-model M] [--pi-model M] [--keep] [--claude-bin P] [--codex-bin P] [--pi-bin P]
-       [--no-runtime-gates] [--no-workflow] [--results <file>]`;
+       [--no-runtime-gates] [--no-e2e] [--no-workflow] [--results <file>]`;
 
 function parseArgs(argv: string[]): Args {
-  const a: Args = { providers: [...PROVIDERS], model: {}, bin: {}, keep: false, runtimeGates: true, workflow: true };
+  const a: Args = { providers: [...PROVIDERS], model: {}, bin: {}, keep: false, runtimeGates: true, e2e: true, workflow: true };
   for (let i = 0; i < argv.length; i++) {
     const k = argv[i]!;
     const val = (): string => {
@@ -73,6 +74,7 @@ function parseArgs(argv: string[]): Args {
     else if (k === '--keep') a.keep = true;
     else if (k === '--no-runtime-gates') a.runtimeGates = false;
     else if (k === '--no-workflow') a.workflow = false;
+    else if (k === '--no-e2e') a.e2e = false;
     else if (k === '-h' || k === '--help') {
       console.log(USAGE);
       process.exit(0);
@@ -195,31 +197,84 @@ function killTree(pid: number | undefined): void {
   }
 }
 
-/** SIGKILL the actor + provider groups recorded in every state.json under `root`. */
-function killEverythingUnder(root: string): void {
-  const walk = (dir: string, depth: number): void => {
-    if (depth > 6) return;
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-    for (const e of entries) {
-      const p = path.join(dir, e.name);
-      if (e.isDirectory()) walk(p, depth + 1);
-      else if (e.name === 'state.json') {
-        try {
-          const st = JSON.parse(fs.readFileSync(p, 'utf8')) as { lease?: ProcessIdentity; provider?: ProcessIdentity };
-          // Identity-checked (pid + start time): a recycled pid is never signalled.
-          for (const id of [st.lease, st.provider]) if (id && isSameProcessAlive(id)) killTree(id.pid);
-        } catch {
-          /* unreadable */
-        }
-      }
-    }
+/** Files under `dir` (depth-bounded) whose path matches `pred`. */
+function findFiles(dir: string, pred: (file: string) => boolean, depth = 0): string[] {
+  if (depth > 7) return [];
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const out: string[] = [];
+  for (const e of entries) {
+    const p = path.join(dir, e.name);
+    if (e.isDirectory()) out.push(...findFiles(p, pred, depth + 1));
+    else if (pred(p)) out.push(p);
+  }
+  return out;
+}
+
+function readJson<T>(file: string): T | undefined {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8')) as T;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Child processes (orc CLI calls, runtime gates) currently running for this run. */
+const activeChildren = new Set<Bun.Subprocess>();
+
+/**
+ * Stop everything this run started under `root` (Ctrl-C path). Order matters: detached
+ * workflow runners first (they would otherwise spawn new step sessions), then our own
+ * child processes, then — twice, to catch an actor that registered late — every actor and
+ * provider recorded in a state.json. Every pid is identity-checked (pid + start time).
+ */
+function stopEverythingUnder(root: string): void {
+  const killId = (id: ProcessIdentity | undefined) => {
+    if (id && isSameProcessAlive(id)) killTree(id.pid);
   };
-  walk(root, 0);
+  for (const f of findFiles(root, (f) => path.basename(path.dirname(f)) === 'runs' && f.endsWith('.json'))) {
+    const run = readJson<{ runner?: ProcessIdentity }>(f);
+    if (run?.runner) killId({ pid: run.runner.pid, startTime: run.runner.startTime ?? null });
+  }
+  for (const child of activeChildren) {
+    try {
+      child.kill('SIGTERM');
+    } catch {
+      /* gone */
+    }
+  }
+  for (let pass = 0; pass < 2; pass++) {
+    Bun.sleepSync(300);
+    for (const f of findFiles(root, (f) => path.basename(f) === 'state.json')) {
+      const st = readJson<{ lease?: ProcessIdentity; provider?: ProcessIdentity }>(f);
+      killId(st?.lease);
+      killId(st?.provider);
+    }
+  }
+}
+
+/** Every session id recorded in a registry.json under `root`. */
+function sessionIdsUnder(root: string): string[] {
+  const out: string[] = [];
+  for (const f of findFiles(root, (f) => path.basename(f) === 'registry.json')) {
+    for (const r of readJson<{ sessionId?: string }[]>(f) ?? []) if (r.sessionId) out.push(r.sessionId);
+  }
+  return out;
+}
+
+/** Remove the claude transcript dirs this run created (their slug embeds the temp root name). */
+function removeClaudeTranscripts(root: string, sids: Iterable<string>, env: Record<string, string>): void {
+  const marker = path.basename(root);
+  for (const sid of sids) {
+    const t = resolveClaudeTranscript(sid, env);
+    if (t && path.basename(path.dirname(t)).includes(marker)) {
+      fs.rmSync(path.dirname(t), { recursive: true, force: true });
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------------
@@ -289,12 +344,14 @@ async function orc(ctx: Ctx, args: string[], timeoutMs = 240_000): Promise<Run> 
     stdout: 'pipe',
     stderr: 'pipe',
   });
+  activeChildren.add(proc);
   const timer = setTimeout(() => proc.kill('SIGKILL'), timeoutMs);
   try {
     const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
     return { code: await proc.exited, out, err };
   } finally {
     clearTimeout(timer);
+    activeChildren.delete(proc);
   }
 }
 
@@ -331,18 +388,39 @@ async function waitDone(ctx: Ctx, id: string): Promise<string> {
   return `done in ${(w.elapsedMs / 1000).toFixed(1)}s`;
 }
 
-async function readContains(ctx: Ctx, id: string, word: string): Promise<string> {
-  const r = await orc(ctx, ['read', id, '--json']);
-  check(r.code === 0, `read exited ${r.code}: ${r.err}`);
-  check(r.out.toUpperCase().includes(word.toUpperCase()), `read does not contain ${word}: ${clip(r.out, 100)}`);
-  let parsed: unknown = null;
-  try {
-    parsed = JSON.parse(r.out);
-  } catch {
-    /* fine */
+/**
+ * The latest parsed turn (`orc read --json`) must hold an ASSISTANT reply containing
+ * `word`. The prompt itself contains the word, so only assistant text counts, and the
+ * journal fallback (`{fallback: true}` — no provider transcript on disk) is a failure.
+ * Retries briefly: a provider may flush its transcript just after the turn's result.
+ */
+async function replyContains(ctx: Ctx, id: string, word: string): Promise<string> {
+  let last = '';
+  const deadline = Date.now() + 10_000;
+  while (true) {
+    const r = await orc(ctx, ['read', id, '--json']);
+    check(r.code === 0, `read exited ${r.code}: ${r.err}`);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(r.out);
+    } catch {
+      throw new Error(`read --json is not JSON: ${clip(r.out, 100)}`);
+    }
+    if (Array.isArray(parsed)) {
+      const reply = parsed
+        .filter((t: { role?: string }) => t?.role === 'assistant')
+        .map((t: { text?: string }) => String(t?.text ?? ''))
+        .join('\n');
+      if (reply.toUpperCase().includes(word.toUpperCase())) return `assistant: "${clip(reply, 60)}"`;
+      last = reply ? `assistant reply lacks ${word}: "${clip(reply, 80)}"` : 'no assistant turn in the latest read';
+    } else {
+      last = (parsed as { fallback?: boolean })?.fallback
+        ? 'no provider transcript on disk (read fell back to the journal)'
+        : `unexpected read shape: ${clip(r.out, 80)}`;
+    }
+    if (Date.now() >= deadline) throw new Error(last);
+    await Bun.sleep(500);
   }
-  const fallback = !!parsed && typeof parsed === 'object' && !Array.isArray(parsed) && (parsed as { fallback?: boolean }).fallback;
-  return `contains ${word}${fallback ? ' (journal fallback: no transcript)' : ''}`;
 }
 
 function mkRepo(dir: string, env: Record<string, string>): void {
@@ -351,8 +429,11 @@ function mkRepo(dir: string, env: Record<string, string>): void {
     const r = Bun.spawnSync(['git', ...args], { cwd: dir, env, stdout: 'ignore', stderr: 'pipe' });
     if (r.exitCode !== 0) throw new Error(`git ${args[0]}: ${r.stderr.toString().trim()}`);
   };
-  git(['init', '-q']);
-  git(['-c', 'user.name=orc-verify', '-c', 'user.email=orc-verify@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'init']);
+  // Neutral settings: no hooks, no signing prompts (a signed-commit setup would block), no
+  // default-branch hint. The user's git config is read, never written.
+  const neutral = ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-c', 'init.defaultBranch=main'];
+  git([...neutral, 'init', '-q']);
+  git([...neutral, '-c', 'user.name=orc-verify', '-c', 'user.email=orc-verify@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'init']);
 }
 
 // ---------------------------------------------------------------------------------
@@ -390,7 +471,7 @@ async function cliE2E(p: Provider, ctx: Ctx, model: string | undefined): Promise
       notePids();
       return `${id} ${await waitDone(ctx, id)}`;
     });
-    await s.step('e2e read → reply word', () => readContains(ctx, id, 'MANGO'));
+    await s.step('e2e read → assistant reply word', () => replyContains(ctx, id, 'MANGO'));
     await s.step('e2e send --idempotency-key k2 (+ replay)', async () => {
       const prompt = 'Do not use any tools. Reply with exactly one word: KIWI';
       const a = await orcJson<{ phase: string; replayed: boolean }>(ctx, ['send', id, prompt, '--idempotency-key', 'k2']);
@@ -399,8 +480,7 @@ async function cliE2E(p: Provider, ctx: Ctx, model: string | undefined): Promise
       const b = await orcJson<{ phase: string; replayed: boolean }>(ctx, ['send', id, prompt, '--idempotency-key', 'k2']);
       check(b.replayed === true, 'replay not reported as replayed');
       await waitDone(ctx, id);
-      await readContains(ctx, id, 'KIWI');
-      return `phase ${a.phase}; replay → replayed:true; reply KIWI`;
+      return `phase ${a.phase}; replay → replayed:true; ${await replyContains(ctx, id, 'KIWI')}`;
     });
     let oldProvider: ProcessIdentity | undefined;
     await s.step('e2e SIGKILL actor → list shows suspended', async () => {
@@ -428,7 +508,7 @@ async function cliE2E(p: Provider, ctx: Ctx, model: string | undefined): Promise
       ]);
       check(r.phase === 'acknowledged' || r.phase === 'queued', `phase ${r.phase}`);
       await waitDone(ctx, id);
-      return `woke (${r.phase}); ${await readContains(ctx, id, CODEWORD)}`;
+      return `woke (${r.phase}); ${await replyContains(ctx, id, CODEWORD)}`;
     });
     await s.step('e2e exactly one provider process for the session', async () => {
       const st = notePids();
@@ -439,7 +519,10 @@ async function cliE2E(p: Provider, ctx: Ctx, model: string | undefined): Promise
       check(gone, `the pre-crash provider ${oldProvider?.pid} is still running`);
       const others = liveProcs().filter((x) => x.cmd.includes(sid) && !x.cmd.includes('__actor') && x.pid !== fresh.pid);
       check(others.length === 0, `other live processes for the session: ${others.map((o) => o.pid).join(',')}`);
-      return `pre-crash provider ${oldProvider?.pid ?? '?'} gone; one live provider ${fresh.pid}`;
+      // codex app-server's argv carries no session id, so the argv scan cannot see a stray
+      // codex; the pid + start-time checks on the recorded providers still hold.
+      const how = p === 'codex' ? ' (codex: pid + start-time identity only; no session id in its argv)' : '';
+      return `pre-crash provider ${oldProvider?.pid ?? '?'} gone; one live provider ${fresh.pid}${how}`;
     });
     await s.step('e2e takeover → resume command; send refused', async () => {
       const live = notePids().provider;
@@ -458,7 +541,7 @@ async function cliE2E(p: Provider, ctx: Ctx, model: string | undefined): Promise
       const r = await orcJson<{ phase: string }>(ctx, ['send', id, 'Do not use any tools. Reply with exactly one word: LEMON']);
       check(r.phase === 'acknowledged' || r.phase === 'queued', `phase ${r.phase}`);
       await waitDone(ctx, id);
-      return `running; ${await readContains(ctx, id, 'LEMON')}`;
+      return `running; ${await replyContains(ctx, id, 'LEMON')}`;
     });
     await s.step('e2e kill → prune', async () => {
       notePids();
@@ -622,10 +705,12 @@ async function runtimeGate(p: Provider, env: Record<string, string>, model: stri
     stdout: 'pipe',
     stderr: 'pipe',
   });
+  activeChildren.add(proc);
   const timer = setTimeout(() => proc.kill('SIGTERM'), 900_000);
   const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
   clearTimeout(timer);
   const exitCode = await proc.exited;
+  activeChildren.delete(proc);
   const text = sanitize(`${out}\n${err}`);
   for (const l of text.trim().split('\n')) console.log(`      | ${l}`);
   const lines = text.trim().split('\n').filter(Boolean);
@@ -661,9 +746,12 @@ async function main(): Promise<number> {
   for (const p of PROVIDERS) if (args.bin[p] && BIN_ENV[p]) env[BIN_ENV[p]!] = path.join(shimDir, p);
   // Ctrl-C: stop every actor/provider this run started (found via its temp ORC_HOMEs).
   const onInterrupt = () => {
-    console.error('\ninterrupted: stopping the sessions this run started…');
-    killEverythingUnder(root);
-    if (!args.keep) fs.rmSync(root, { recursive: true, force: true });
+    console.error('\ninterrupted: stopping the runners and sessions this run started…');
+    stopEverythingUnder(root);
+    if (!args.keep) {
+      removeClaudeTranscripts(root, new Set([...claudeSids, ...sessionIdsUnder(root)]), env);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
     process.exit(130);
   };
   process.once('SIGINT', onInterrupt);
@@ -677,7 +765,10 @@ async function main(): Promise<number> {
   // 1. preflight
   console.log('\n[1/4] preflight');
   const available: Provider[] = [];
-  const providerInfo: Record<string, { selected: boolean; bin?: string; version?: string; overridden?: boolean }> = {};
+  const providerInfo: Record<
+    string,
+    { selected: boolean; bin?: string; version?: string; overridden?: boolean; model?: string }
+  > = {};
   for (const p of PROVIDERS) {
     if (!args.providers.includes(p)) {
       providerInfo[p] = { selected: false };
@@ -690,8 +781,17 @@ async function main(): Promise<number> {
       continue;
     }
     const version = versionOf(bin, env);
-    providerInfo[p] = { selected: true, bin: sanitize(bin), version: sanitize(version), overridden: !!args.bin[p] };
+    providerInfo[p] = {
+      selected: true,
+      bin: sanitize(bin),
+      version: sanitize(version),
+      overridden: !!args.bin[p],
+      model: args.model[p] ?? '(provider default)',
+    };
     record(p, 'preflight', 'PASS', `${bin} — ${version}${args.bin[p] ? ' (override)' : ''}`);
+    if (!args.model[p]) {
+      console.log(`  note  ${p} will use your default model (pass --${p}-model <cheap model> to choose)`);
+    }
     available.push(p);
   }
 
@@ -718,8 +818,8 @@ async function main(): Promise<number> {
   // 3. CLI e2e
   console.log('\n[3/4] CLI end-to-end (isolated ORC_HOME, temp git repo)');
   for (const p of args.providers) {
-    if (!available.includes(p)) {
-      record(p, 'e2e', 'SKIP', 'provider unavailable');
+    if (!available.includes(p) || !args.e2e) {
+      record(p, 'e2e', 'SKIP', args.e2e ? 'provider unavailable' : '--no-e2e');
       continue;
     }
     const ctx: Ctx = { provider: p, home: path.join(root, p, 'orc-home'), repo: path.join(root, p, 'repo'), env };
@@ -753,12 +853,7 @@ async function main(): Promise<number> {
 
   // cleanup: temp root + claude transcripts this run created (only dirs named after our temp root)
   if (!args.keep) {
-    for (const sid of claudeSids) {
-      const t = resolveClaudeTranscript(sid, env);
-      if (t && path.basename(path.dirname(t)).includes('orc-verify-all-')) {
-        fs.rmSync(path.dirname(t), { recursive: true, force: true });
-      }
-    }
+    removeClaudeTranscripts(root, new Set([...claudeSids, ...sessionIdsUnder(root)]), env);
     fs.rmSync(root, { recursive: true, force: true });
   }
 
@@ -788,6 +883,7 @@ async function main(): Promise<number> {
       models: args.model,
       binOverrides: Object.keys(args.bin),
       runtimeGates: args.runtimeGates,
+      e2e: args.e2e,
       workflow: args.workflow,
       kept: args.keep,
     },
