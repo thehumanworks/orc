@@ -309,11 +309,11 @@ describe('session locks', () => {
 });
 
 describe('providers registry', () => {
-  test('only the fake runtime is registered in S1', async () => {
-    expect((await getRuntimeFactory('fake')).provider).toBe('fake');
-    for (const p of ['claude', 'codex', 'pi'] as const) {
-      await expect(getRuntimeFactory(p)).rejects.toThrow(`runtime for ${p} not available yet`);
+  test('every runtime provider resolves to its own factory', async () => {
+    for (const p of ['fake', 'claude', 'codex', 'pi'] as const) {
+      expect((await getRuntimeFactory(p)).provider).toBe(p);
     }
+    await expect(getRuntimeFactory('nope' as never)).rejects.toThrow(/unknown runtime provider/);
   });
 });
 

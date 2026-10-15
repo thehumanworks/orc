@@ -524,14 +524,22 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
   );
 
   test(
-    'errors: unavailable runtime → actor stops with error (suspended); bad create inputs',
+    'errors: provider fails to start → actor stops with error (suspended); bad create inputs',
     async () => {
       const spec = { ...fakeSpec(mkTmp('orc-actor-cwd-')), provider: 'claude' as const };
       sids.push(spec.sessionId);
-      await createSession(spec);
+      // The actor inherits this env: point the claude runtime at a binary that cannot exist.
+      const prevBin = process.env.ORC_CLAUDE_BIN;
+      process.env.ORC_CLAUDE_BIN = path.join(root, 'no-such-claude-binary');
+      try {
+        await createSession(spec);
+      } finally {
+        if (prevBin === undefined) delete process.env.ORC_CLAUDE_BIN;
+        else process.env.ORC_CLAUDE_BIN = prevBin;
+      }
       const stopped = await waitForEntry(spec.sessionId, (e) => e.type === 'actor.stopped', 'actor.stopped');
       expect(stopped).toMatchObject({ reason: 'error' });
-      expect((stopped as { error?: string }).error).toContain('runtime for claude not available yet');
+      expect(String((stopped as { error?: string }).error)).toMatch(/claude|no-such-claude-binary|ENOENT/i);
       await waitFor(() => readActorState(spec.sessionId)?.phase === 'suspended', 'suspended');
 
       await expect(createSession(spec)).rejects.toThrow(/already exists/);
