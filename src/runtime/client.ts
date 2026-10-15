@@ -493,3 +493,53 @@ export function deliveryVerdict(sessionId: string, messageId: string): DeliveryV
 export function sessionExists(sessionId: string): boolean {
   return readSpawnSpec(assertValidSessionId(sessionId)) !== undefined;
 }
+
+// ---------------------------------------------------------------------------------
+// S5 additions (cutover): reopen a stopped session; look up a message's recorded text.
+// ---------------------------------------------------------------------------------
+
+/**
+ * Clear a sticky stop so the session can be woken again (`orc resume` after kill or
+ * takeover). Under the actor lock: phase `stopped` → `suspended`, journaling
+ * `actor.reopened` (no actor is live while stopped, so the lock holder is the only
+ * journal writer). Any other phase is left alone (`not-stopped`). Never spawns.
+ */
+export async function reopen(
+  sessionId: string,
+  opts: { reason?: string } = {},
+): Promise<{ status: 'reopened' | 'not-stopped' }> {
+  assertValidSessionId(sessionId);
+  return withActorLock(sessionId, async () => {
+    requireSpec(sessionId);
+    const st = readActorState(sessionId);
+    if (!st || st.phase !== 'stopped' || leaseLive(st)) return { status: 'not-stopped' as const };
+    const j = JournalWriter.forSession(sessionId);
+    try {
+      j.append({ type: 'actor.reopened', ...(opts.reason ? { reason: opts.reason } : {}) });
+      st.lastSeq = Math.max(st.lastSeq, j.lastSeq);
+    } finally {
+      j.close();
+    }
+    st.phase = 'suspended';
+    delete st.stopReason;
+    delete st.lease;
+    st.updatedAt = new Date().toISOString();
+    writeActorState(st, { fsync: true });
+    return { status: 'reopened' as const };
+  });
+}
+
+/**
+ * The text recorded for `messageId`: its pending inbox item, else its `turn.intent`.
+ * Undefined when the message was never seen. Used to refuse reusing an idempotency key
+ * with a different payload.
+ */
+export function messageText(sessionId: string, messageId: string): string | undefined {
+  assertValidSessionId(sessionId);
+  const pending = listPending(sessionId).find((i) => i.kind === 'message' && i.messageId === messageId);
+  if (pending && pending.kind === 'message') return pending.text;
+  for (const e of readJournal(sessionId)) {
+    if (e.type === 'turn.intent' && e.messageId === messageId) return e.text;
+  }
+  return undefined;
+}
