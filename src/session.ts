@@ -4,7 +4,7 @@
  * the session's durable inbox, state is derived from its journal, and a suspended session
  * is woken on send (agents-first; design §4.3–4.5).
  */
-import { upsertRecord, removeRecord } from './registry.ts';
+import { upsertRecord, removeRecord, updateRegistry } from './registry.ts';
 import { removeSessionDir, removeSystemPromptFile } from './session-files.ts';
 import { removeWorktree } from './worktree.ts';
 import { parseTranscript } from './transcript.ts';
@@ -102,6 +102,23 @@ export interface AttachOptions {
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Un-kill a record for a resume: drop status/killedAt/stoppedBy on the registry's copy of
+ * EXACTLY this record (same id + sessionId), in place. Returns the updated record, or
+ * undefined when it is gone (pruned meanwhile) — it is never re-inserted.
+ */
+export async function clearStoppedMarker(rec: SessionRecord): Promise<SessionRecord | undefined> {
+  return updateRegistry((records) => {
+    const i = records.findIndex((r) => r.id === rec.id && r.sessionId === rec.sessionId);
+    if (i < 0) return { records, value: undefined };
+    const { status: _s, killedAt: _k, stoppedBy: _b, ...rest } = records[i]!;
+    const next: SessionRecord = rest;
+    const out = [...records];
+    out[i] = next;
+    return { records: out, value: next };
+  });
+}
 
 /** What `provider.ready` reported (Session.awaitReady). */
 export interface ProviderReadyInfo {
@@ -613,10 +630,13 @@ export class Session {
     // leaves a consistent `suspended` session (listed, not prunable) instead of a hidden
     // `dead` record over a resumable kernel.
     if (this.record.status === 'dead' || this.record.killedAt || this.record.stoppedBy) {
-      delete this.record.status;
-      delete this.record.killedAt;
-      delete this.record.stoppedBy;
-      await upsertRecord(this.record);
+      // Patched in place, never re-inserted: a concurrent `prune --suspended` may have
+      // removed the session (record + dir) since reopen — then there is nothing to resume.
+      const cleared = await clearStoppedMarker(this.record);
+      if (!cleared) {
+        throw new SessionNotControllableError(`session ${this.id} was pruned while resuming`, 'ORC_SESSION_UNKNOWN');
+      }
+      this.record = cleared;
     }
     const hook = wakePolicyHook(this.record);
     // An explicit resume is the "force" path: it clears the consecutive start-failure

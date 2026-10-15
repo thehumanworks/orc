@@ -9,14 +9,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { FAKE_PROVIDER_ENV, agent } from '../src/agent.ts';
 import { getSession, listSessions, pruneSessions } from '../src/index.ts';
-import { readRegistry, upsertRecord } from '../src/registry.ts';
+import { readRegistry, removeRecord, upsertRecord } from '../src/registry.ts';
 import { acquireLock } from '../src/lock.ts';
 import { SPAWN_PENDING_GRACE_MS, kernelLiveness, sessionStatusOf } from '../src/session-status.ts';
 import type { LivenessProbe } from '../src/session-status.ts';
 import { readSpawnSpec } from '../src/runtime/spec.ts';
 import { ACTOR_LOCK_OPTIONS, readActorState, leaseLive, writeActorState } from '../src/runtime/actor-state.ts';
 import { sessionPaths } from '../src/runtime/layout.ts';
-import { deliveryVerdict, stop } from '../src/runtime/client.ts';
+import { deliveryVerdict, ensureAwake, reopen, stop } from '../src/runtime/client.ts';
+import { clearStoppedMarker } from '../src/session.ts';
 import type { Session } from '../src/session.ts';
 import { renderCapture } from '../src/journal-render.ts';
 import { actorPids, fakeProviderPids, killSessionProcesses, mkTmp, waitFor } from './runtime-helpers.ts';
@@ -277,6 +278,62 @@ describe('agent() + Session on the actor runtime', () => {
       // Without a resume, a stopped session is pruned as usual.
       await stop(s.sessionId);
       expect(await pruneSessions()).toContain(s.id);
+    },
+    T,
+  );
+
+  test(
+    'prune --suspended landing inside a resume (race2): prune wins cleanly, no orphan record',
+    async () => {
+      // Interleaving 1: after resume's reopen(), before it un-kills the record.
+      const a = await spawn();
+      await a.kill();
+      const recA = a.toJSON();
+      expect(await reopen(recA.sessionId, { reason: 'resume' })).toEqual({ status: 'reopened' });
+      expect(await pruneSessions({ suspended: true })).toContain(a.id);
+      expect(fs.existsSync(sessionPaths(a.sessionId).dir)).toBe(false);
+      expect(await clearStoppedMarker(recA)).toBeUndefined(); // never re-inserted
+      await expect(ensureAwake(recA.sessionId, { force: true })).rejects.toThrow(/unknown session/);
+      expect((await readRegistry()).some((r) => r.id === a.id)).toBe(false);
+
+      // Interleaving 2: after the un-kill, before the wake.
+      const b = await spawn();
+      await b.kill();
+      const recB = b.toJSON();
+      await reopen(recB.sessionId, { reason: 'resume' });
+      expect(await clearStoppedMarker(recB)).toBeDefined();
+      expect(await pruneSessions({ suspended: true })).toContain(b.id);
+      await expect(ensureAwake(recB.sessionId, { force: true })).rejects.toThrow(/unknown session/);
+      expect((await readRegistry()).some((r) => r.id === b.id)).toBe(false);
+      for (const sid of [a.sessionId, b.sessionId]) {
+        expect(actorPids(sid)).toEqual([]);
+        expect(fakeProviderPids(sid)).toEqual([]);
+      }
+
+      // Default prune in the same window keeps the reopened session; the resume completes.
+      const c = await spawn();
+      await c.kill();
+      const recC = c.toJSON();
+      await reopen(recC.sessionId, { reason: 'resume' });
+      expect(await pruneSessions()).not.toContain(c.id);
+      expect(await clearStoppedMarker(recC)).toBeDefined();
+      expect((await ensureAwake(recC.sessionId, { force: true })).status).toBe('started');
+      expect(await (await getSession(c.id))!.status()).toBe('running');
+      await c.kill();
+    },
+    T,
+  );
+
+  test(
+    'Session.resume() of a session whose record was pruned meanwhile fails without re-inserting it',
+    async () => {
+      const s = await spawn();
+      await s.kill();
+      const sess = (await getSession(s.id))!;
+      await removeRecord(s.id); // pruned between the caller's lookup and its resume
+      await expect(sess.resume()).rejects.toThrow(/pruned while resuming/);
+      expect((await readRegistry()).some((r) => r.id === s.id)).toBe(false);
+      expect(actorPids(s.sessionId)).toEqual([]);
     },
     T,
   );

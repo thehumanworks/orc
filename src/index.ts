@@ -9,8 +9,9 @@ import { Session } from './session.ts';
 import { removeSessionDir } from './session-files.ts';
 import { isSpawnPending, kernelLiveness, sessionStatusOf } from './session-status.ts';
 import type { LivenessProbe } from './session-status.ts';
-import { stop as kernelStop } from './runtime/client.ts';
-import { leaseLive, readActorState, withActorLock } from './runtime/actor-state.ts';
+import { initialActorState, leaseLive, readActorState, withActorLock } from './runtime/actor-state.ts';
+import { finalizeStopLocked } from './runtime/stop.ts';
+import type { ActorStateFile } from './runtime/types.ts';
 import { readSpawnSpec } from './runtime/spec.ts';
 import type { SessionRecord, SessionStatus } from './types.ts';
 
@@ -291,17 +292,29 @@ export async function listSessions(filter?: {
  * while holding it, so a concurrent `orc resume` (reopen → wake, same lock) either wins
  * (the session is kept) or finds nothing to revive — never an actor in a deleted dir.
  */
-/** Under the actor lock: may this session's dir go? (legacy / never created / stopped). */
-function kernelAllowsRemoval(rec: SessionRecord, suspendedToo: boolean): boolean {
+/**
+ * Under the actor lock: may this session's record + dir go? Legacy, never created (no
+ * spawn.json) and `stopped` sessions may; live ones never; suspended ones only with
+ * `suspendedToo` (they are stopped first).
+ */
+async function settleForRemoval(rec: SessionRecord, suspendedToo: boolean): Promise<boolean> {
   if (rec.legacy) return true;
+  let st: ActorStateFile | undefined;
   try {
     if (!readSpawnSpec(rec.sessionId)) return true;
-    const st = readActorState(rec.sessionId);
-    if (leaseLive(st)) return false;
-    return st?.phase === 'stopped' || suspendedToo;
+    st = readActorState(rec.sessionId);
   } catch {
     return true; // invalid id / unreadable: nothing the kernel can run
   }
+  if (leaseLive(st)) return false; // never remove a live session
+  if (st?.phase === 'stopped') return true;
+  // Not stopped: suspended — possibly reopened by a concurrent `orc resume` (reopen runs
+  // under this same lock before it un-kills the record). Kept, unless prune --suspended:
+  // then its sticky stop is finalized HERE, in the same lock section, so no wake can slip
+  // between the stop and the removal.
+  if (!suspendedToo) return false;
+  await finalizeStopLocked(rec.sessionId, st ?? initialActorState(rec.sessionId, 'suspended'), 'prune');
+  return true;
 }
 
 export async function pruneSessions(opts?: {
@@ -327,10 +340,6 @@ export async function pruneSessions(opts?: {
   const candidates = (await readRegistry()).filter((r) => prunable(r) !== undefined);
   const removed: SessionRecord[] = [];
   for (const cand of candidates) {
-    // --suspended: make the stop sticky first so no sender can wake it meanwhile.
-    if (prunable(cand) === 'suspended' && !cand.legacy) {
-      await kernelStop(cand.sessionId, { reason: 'prune', graceMs: 1_000 }).catch(() => {});
-    }
     const gone = await withActorLock(cand.sessionId, async () => {
       const current = await findRecord(cand.id);
       // Only the exact record that was judged (a replacement with the same id survives),
@@ -338,7 +347,7 @@ export async function pruneSessions(opts?: {
       // authoritative here: `orc resume` reopens under this lock BEFORE it clears the
       // record's dead marker, so a session the kernel no longer calls stopped is kept.
       if (!current || current.sessionId !== cand.sessionId || prunable(current) === undefined) return undefined;
-      if (!kernelAllowsRemoval(current, opts?.suspended === true)) return undefined;
+      if (!(await settleForRemoval(current, opts?.suspended === true))) return undefined;
       const taken = await updateRegistry((records) => {
         const hit = records.find((r) => r.id === cand.id && r.sessionId === cand.sessionId);
         return { records: hit ? records.filter((r) => r !== hit) : records, value: hit };
