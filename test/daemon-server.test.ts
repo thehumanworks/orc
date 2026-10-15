@@ -54,11 +54,11 @@ afterAll(() => {
 const url = (s: Bun.Server<undefined>, p: string) => `http://127.0.0.1:${s.port}${p}`;
 
 describe('daemon over a live loopback socket', () => {
-  test('GET /health needs NO auth and reports ok/version/host', async () => {
+  test('GET /health needs NO auth and reports ok/version/host/api', async () => {
     const s = start({ secret: 'topsecret', allowlist: ['mini'] });
     const res = await fetch(url(s, '/health'));
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, version: 'test', host: 'testhost' });
+    expect(await res.json()).toEqual({ ok: true, version: 'test', host: 'testhost', api: 2 });
   });
 
   test('a gated route with NO secret and NO identity → 401 (fail closed)', async () => {

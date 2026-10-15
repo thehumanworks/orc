@@ -232,7 +232,7 @@ export function createFetch(opts: DaemonOptions): (req: Request, server: Bun.Ser
 
     // /health is the ONLY unauthenticated route (liveness).
     if (authReq.type === 'public' || match.name === 'health') {
-      return json({ ok: true, version: await versionPromise, host: hostName });
+      return json({ ok: true, version: await versionPromise, host: hostName, api: DAEMON_API_VERSION });
     }
 
     // ---- Authn + authz (fail closed) — every other route. ----
