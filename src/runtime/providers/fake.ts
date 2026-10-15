@@ -71,6 +71,8 @@ export interface FakeScript {
   exitAtStart?: number;
   /** Exit immediately with this code when started in RESUME mode (provider rejects the resume). */
   exitOnResume?: number;
+  /** Env var names whose values the child reports in `ready.info.env` (absent → omitted). */
+  reportEnv?: string[];
   /**
    * On stdin EOF keep running for this long before exiting (simulates a provider that
    * outlives its actor). Default: exit immediately on EOF.

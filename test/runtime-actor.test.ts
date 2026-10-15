@@ -208,6 +208,62 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
   );
 
   test(
+    "a waker never hands its ORC_* lineage to the session it wakes (spec.env is the authority)",
+    async () => {
+      const reported = [
+        'ORC_RESULT_PATH',
+        'ORC_ATTEMPT_ID',
+        'ORC_RUN_ID',
+        'ORC_STEP_ID',
+        'ORC_DEPTH',
+        'ORC_PARENT_SESSION_ID',
+        'ORC_POLICY_MAX_DEPTH',
+        'ORC_HOME',
+        'ORC_TEST_INHERITED',
+      ];
+      const spec = fakeSpec(mkTmp('orc-actor-cwd-'), { reportEnv: reported });
+      spec.env = { ...spec.env, ORC_DEPTH: '1', ORC_PARENT_SESSION_ID: 'helper-parent' };
+      sids.push(spec.sessionId);
+      await createSession(spec);
+      await crashActor(spec.sessionId);
+
+      // A workflow step agent `orc send`s the suspended helper: its env carries the STEP's lineage.
+      const waker: Record<string, string> = {
+        ORC_RESULT_PATH: '/tmp/step/result.json',
+        ORC_ATTEMPT_ID: 'att-step',
+        ORC_RUN_ID: 'run-step',
+        ORC_STEP_ID: 'step-a',
+        ORC_DEPTH: '7',
+        ORC_POLICY_MAX_DEPTH: '9',
+        ORC_TEST_INHERITED: 'kept',
+      };
+      const saved = Object.fromEntries(Object.keys(waker).map((k) => [k, process.env[k]]));
+      Object.assign(process.env, waker);
+      try {
+        expect((await send(spec.sessionId, { messageId: 'w1', text: 'hi' })).woke).toBe(true);
+      } finally {
+        for (const [k, v] of Object.entries(saved)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
+      const info = entries(spec.sessionId, 'provider.ready').at(-1)!.info as { env: Record<string, string> };
+      expect(info.env).toEqual({
+        ORC_DEPTH: '1',
+        ORC_PARENT_SESSION_ID: 'helper-parent',
+        ORC_HOME: home,
+        ORC_TEST_INHERITED: 'kept',
+      });
+      if (fs.existsSync('/proc/self/environ')) {
+        const environ = fs.readFileSync(`/proc/${actorPid(spec.sessionId)}/environ`, 'utf8').split('\0');
+        expect(environ.filter((l) => /^ORC_(RESULT_PATH|ATTEMPT_ID|RUN_ID|STEP_ID|DEPTH|POLICY_)/.test(l))).toEqual([]);
+        expect(environ).toContain(`ORC_HOME=${home}`);
+      }
+    },
+    T,
+  );
+
+  test(
     'the actor survives its launcher',
     async () => {
       const spec = fakeSpec(mkTmp('orc-actor-cwd-'));

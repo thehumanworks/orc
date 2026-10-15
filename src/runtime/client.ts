@@ -30,6 +30,7 @@ import {
 } from './actor-state.ts';
 import { TurnLedger, staleProviders, summarizeLedger, verdictFor } from './derive.ts';
 import { abandonedStopReason, finalizeStopLocked, isAbandonedStop } from './stop.ts';
+import { withoutInheritedLineage } from './env.ts';
 import type { DeliveryVerdict, SessionView } from './derive.ts';
 
 export { readJournal, followJournal, JournalCursor } from './journal.ts';
@@ -108,7 +109,8 @@ function spawnActorLocked(sessionId: string, state: ActorStateFile): ProcessIden
   const spec = requireSpec(sessionId);
   const actor = spawnDetached([...selfArgv(), '__actor', sessionId], {
     cwd: spec.cwd,
-    env: process.env,
+    // Never hand the WAKER's lineage (ORC_RESULT_PATH, ORC_ATTEMPT_ID, …) to the session.
+    env: withoutInheritedLineage(process.env),
     logPath: sessionPaths(sessionId).actorLog,
   });
   const next: ActorStateFile = {
