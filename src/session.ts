@@ -28,14 +28,16 @@ import {
   send as kernelSend,
   sessionPaths,
   stop as kernelStop,
+  JournalCursor,
+  isLiveProcess,
+  leaseLive,
 } from './runtime/client.ts';
 import type { DerivedState } from './runtime/client.ts';
-import { JournalCursor } from './runtime/journal.ts';
 import { TurnLedger, summarizeLedger } from './runtime/derive.ts';
 import type { SessionView } from './runtime/derive.ts';
 import { listPending } from './runtime/inbox.ts';
 import { readSpawnSpec } from './runtime/spec.ts';
-import { isLiveProcess, leaseLive, readActorState } from './runtime/actor-state.ts';
+import { readActorState } from './runtime/actor-state.ts';
 import { readFileTail } from './runtime/fsutil.ts';
 import { ulid } from './runtime/ulid.ts';
 import type { JournalEntry, ProcessIdentity, SpawnSpec } from './runtime/types.ts';

@@ -8,7 +8,8 @@
  *              spawn.json
  */
 import { readSpawnSpec } from './runtime/spec.ts';
-import { leaseLive, readActorState } from './runtime/actor-state.ts';
+import { readActorState } from './runtime/actor-state.ts';
+import { leaseLive } from './runtime/client.ts';
 import type { SessionRecord, SessionStatus } from './types.ts';
 
 /** How liveness is observed. Injectable (tests); default = the kernel. */
