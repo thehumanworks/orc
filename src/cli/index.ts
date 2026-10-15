@@ -563,7 +563,8 @@ async function cmdResume(args: string[]): Promise<number> {
     printError('resume requires <id|@alias>', json);
     return 1;
   }
-  // A killed session is dead, so an @alias no longer resolves: resolve ids directly.
+  // @alias resolves only active (running/suspended) sessions; a killed or taken-over
+  // session is addressed by its id.
   const session = await getSessionForCli(idOrName, json);
   if (session === undefined) return 1;
   if (!session) {

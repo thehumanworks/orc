@@ -23,6 +23,7 @@ import {
 } from './lineage.ts';
 import { createSession, stop as kernelStop } from './runtime/client.ts';
 import { RUNTIME_SCHEMA_VERSION } from './runtime/types.ts';
+import { readSpawnSpec } from './runtime/spec.ts';
 import type { SpawnSpec } from './runtime/types.ts';
 
 /**
@@ -226,9 +227,16 @@ export async function agent(opts: AgentOptions): Promise<Session> {
     // Persist the launched record, clearing any transient alias reservation marker.
     await upsertRecord(record);
 
-    const session = new Session(record);
+    let session = new Session(record);
     if (opts.waitForReady ?? true) {
       await session.awaitReady(opts.readyTimeoutMs);
+      // Record the provider-side session id (codex: its thread id) once known.
+      const psid = readSpawnSpec(sessionId)?.providerSessionId;
+      if (psid) {
+        record = { ...record, providerSessionId: psid };
+        await upsertRecord(record);
+        session = new Session(record);
+      }
       if (opts.prompt) await session.send(opts.prompt);
     } else if (opts.prompt) {
       // Durably queued; the actor delivers it once the provider is ready.

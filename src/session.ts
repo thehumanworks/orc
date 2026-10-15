@@ -375,6 +375,7 @@ export class Session {
       );
     const prior = messageText(this.sessionId, messageId);
     if (prior !== undefined && prior !== text) throw conflict();
+    const beforeWake = wakePolicyHook(this.record);
     let r;
     try {
       r = await kernelSend(
@@ -383,7 +384,7 @@ export class Session {
         {
           ...(options.wake === false ? { wake: false } : {}),
           ...(options.ackTimeoutMs !== undefined ? { ackTimeoutMs: options.ackTimeoutMs } : {}),
-          ...(wakePolicyHook(this.record) ? { beforeWake: wakePolicyHook(this.record)! } : {}),
+          ...(beforeWake ? { beforeWake } : {}),
         },
       );
     } catch (e) {

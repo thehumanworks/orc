@@ -69,6 +69,9 @@ describe('agent() + Session on the actor runtime', () => {
       expect(rec.runtime).toBe('actor');
       expect('tmuxName' in rec).toBe(false);
       const spec = readSpawnSpec(s.sessionId)!;
+      // The provider-side id (server-assigned for the fake, like codex) is on the record.
+      expect(rec.providerSessionId).toBe(spec.providerSessionId!);
+      expect(rec.providerSessionId).toMatch(/^fake-/);
       expect(spec.provider).toBe('fake');
       expect(spec.env.ORC_PARENT_SESSION_ID).toBe(s.id);
       expect(spec.env.ORC_DEPTH).toBe('1');
