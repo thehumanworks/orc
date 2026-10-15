@@ -39,6 +39,41 @@ function live(): { pid: number; stat: string; cmd: string }[] {
     .filter((p) => !p.stat.startsWith('Z'));
 }
 
+/** A process's environment entries (Linux /proc; macOS `ps eww`), or null when unreadable. */
+function envOf(pid: number): string[] | null {
+  try {
+    return fs.readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0');
+  } catch {
+    if (process.platform === 'linux') return null;
+  }
+  const r = Bun.spawnSync(['ps', 'eww', '-o', 'command=', '-p', String(pid)], { stdout: 'pipe', stderr: 'ignore' });
+  const out = r.stdout.toString().trim();
+  return r.exitCode === 0 && out.length > 0 ? out.split(/\s+/) : null;
+}
+
+/** The process runs with an ORC_HOME inside `root` (unreadable env → assume it does). */
+function underRoot(pid: number, root: string): boolean {
+  const env = envOf(pid);
+  if (env === null) return true;
+  return env.some((e) => e === `ORC_HOME=${root}` || e.startsWith(`ORC_HOME=${root}/`));
+}
+
+/**
+ * Processes this test's all.ts run started: anything naming its temp root on the command
+ * line, plus actors / fake providers from this checkout whose ORC_HOME is under that root
+ * (a concurrent dev session or test from the same checkout is NOT ours).
+ */
+function ourProcs(root: string) {
+  return live().filter(
+    (p) =>
+      p.cmd.includes(root) ||
+      ((p.cmd.includes(FAKE_CLAUDE) ||
+        p.cmd.includes(FAKE) ||
+        p.cmd.includes(`${path.join(REPO, 'src', 'cli', 'index.ts')} __actor`)) &&
+        underRoot(p.pid, root)),
+  );
+}
+
 async function run(args: string[], env: Record<string, string>) {
   const proc = Bun.spawn([process.execPath, SCRIPT, ...args], { cwd: REPO, env, stdout: 'pipe', stderr: 'pipe' });
   const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
@@ -106,14 +141,6 @@ describe('verify-runtime/all.ts', () => {
     return { out, before, code, root: root! };
   }
 
-  const ourProcs = (root: string) =>
-    live().filter(
-      (p) =>
-        p.cmd.includes(root) ||
-        p.cmd.includes(FAKE_CLAUDE) ||
-        p.cmd.includes(FAKE) ||
-        p.cmd.includes(`${path.join(REPO, 'src', 'cli', 'index.ts')} __actor`),
-    );
 
   test(
     'Ctrl-C during the workflow kills the detached runner FIRST, then every session',
@@ -187,4 +214,27 @@ describe('verify-runtime/all.ts', () => {
     expect((await run(['--bogus'], env)).code).toBe(2);
     expect((await run(['--providers', 'claude,gemini'], env)).code).toBe(2);
   });
+
+  test('ourProcs is hermetic: lookalike processes from another ORC_HOME are not ours', async () => {
+    const root = fs.mkdtempSync(path.join(tmp, 'hermetic-'));
+    const decoy = (home: string) =>
+      Bun.spawn([process.execPath, '-e', 'setTimeout(() => {}, 30_000)', FAKE], {
+        env: { ...(process.env as Record<string, string>), ORC_HOME: home },
+        stdout: 'ignore',
+        stderr: 'ignore',
+      });
+    const other = decoy(path.join(tmp, 'someone-else', 'orc-home'));
+    const mine = decoy(path.join(root, 'workflow', 'orc-home'));
+    try {
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline && !live().some((p) => p.pid === mine.pid && p.cmd.includes(FAKE))) await Bun.sleep(25);
+      const pids = ourProcs(root).map((p) => p.pid);
+      expect(pids).toContain(mine.pid);
+      expect(pids).not.toContain(other.pid);
+    } finally {
+      other.kill('SIGKILL');
+      mine.kill('SIGKILL');
+      await Promise.all([other.exited, mine.exited]);
+    }
+  }, 15_000);
 });
