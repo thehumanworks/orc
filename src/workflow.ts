@@ -710,6 +710,20 @@ export function createAttempt(args: {
   };
 }
 
+/** Forward order of the in-flight attempt phases (terminal phases rank last). */
+const ATTEMPT_PROGRESS: Partial<Record<AttemptPhase, number>> = {
+  queued: 0,
+  spawning: 1,
+  dispatched: 2,
+  running: 3,
+  waiting: 3,
+  verifying: 4,
+};
+
+function attemptProgress(phase: AttemptPhase): number {
+  return ATTEMPT_PROGRESS[phase] ?? 5;
+}
+
 export function transitionAttempt(
   attempt: StepAttempt,
   phase: AttemptPhase,
@@ -1470,9 +1484,13 @@ async function runWorkflowOwned(
   const recordAttempt = (attempt: StepAttempt) => {
     const list = run.attempts ?? [];
     const idx = list.findIndex((a) => a.attemptId === attempt.attemptId);
+    const prevPhase = idx >= 0 ? list[idx]!.phase : undefined;
     if (idx >= 0) list[idx] = attempt;
     else list.push(attempt);
     run.attempts = list;
+    // A same-phase re-record only attaches data (e.g. baselineSha at `spawning`): it is
+    // persisted, but it is not a transition.
+    if (prevPhase === attempt.phase) return;
     emit({
       type: 'attempt-transition',
       runId,
@@ -1724,7 +1742,9 @@ async function runWorkflowOwned(
       const completed = result;
       await serialize(async () => {
         if (cancelled) return;
-        if (completed.sessionId) {
+        // Executors that report no mid-flight transitions still pass through
+        // dispatched → verifying; never step BACK to a phase the executor already passed.
+        if (completed.sessionId && attemptProgress(attempt.phase) < attemptProgress('dispatched')) {
           attempt = transitionAttempt(attempt, 'dispatched', { sessionId: completed.sessionId }, now());
           recordAttempt(attempt);
         }

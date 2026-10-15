@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { FAKE_PROVIDER_ENV } from '../src/agent.ts';
 import { runWorkflow } from '../src/workflow.ts';
-import type { StepDoneCtx, WorkflowDef } from '../src/workflow.ts';
+import type { StepDoneCtx, WorkflowDef, WorkflowEvent } from '../src/workflow.ts';
 import { readRegistry } from '../src/registry.ts';
 import { readRun } from '../src/runs.ts';
 import { killSessionProcesses, mkTmp } from './runtime-helpers.ts';
@@ -37,7 +37,53 @@ afterAll(async () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+/** attempt-transition phases per step, in emission order. */
+function phasesByStep(events: WorkflowEvent[]): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const e of events) if (e.type === 'attempt-transition') (out[e.stepId] ??= []).push(e.phase);
+  return out;
+}
+
 describe('runWorkflow with the default executor', () => {
+  test(
+    'attempt transitions are emitted once each, strictly forward (no duplicate spawning, no step back)',
+    async () => {
+      const events: WorkflowEvent[] = [];
+      const def: WorkflowDef = {
+        name: 'wf-events',
+        steps: [{ id: 'one', provider: 'claude', cwd: work, prompt: 'events please', allowUnverified: true }],
+      };
+      const run = await runWorkflow(def, { runId: 'wfev1', onEvent: (e) => events.push(e) });
+      expect(run.status).toBe('done');
+      expect(phasesByStep(events)).toEqual({
+        one: ['queued', 'spawning', 'dispatched', 'running', 'verifying', 'succeeded'],
+      });
+      // The data attached by the same-phase re-record is still persisted.
+      const att = (await readRun('wfev1'))!.attempts!.find((a) => a.stepId === 'one')!;
+      expect(att.resultPath).toBeString();
+      expect(att.phase).toBe('succeeded');
+
+      // An executor reporting no mid-flight transitions is still walked forward.
+      const stubEvents: WorkflowEvent[] = [];
+      const stub = await runWorkflow(def, {
+        runId: 'wfev2',
+        onEvent: (e) => stubEvents.push(e),
+        execStep: async ({ step }) => ({
+          id: step.id,
+          sessionId: 'sess-stub',
+          provider: step.provider,
+          state: 'done',
+          ok: true,
+          outcome: 'succeeded',
+          commitsAhead: 0,
+        }),
+      });
+      expect(stub.status).toBe('done');
+      expect(phasesByStep(stubEvents)).toEqual({ one: ['queued', 'spawning', 'dispatched', 'verifying', 'succeeded'] });
+    },
+    T,
+  );
+
   test(
     'two steps: instructions delivered once, capture = last reply + final turn',
     async () => {
