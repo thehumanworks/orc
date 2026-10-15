@@ -517,7 +517,7 @@ describe('codex runtime + harness child (fake Responses API)', () => {
   test(
     'fresh turn → ready (live default model) → assistant.text → turn.completed with usage; SIWC request shape',
     async () => {
-      const spec = mkSpec();
+      const spec = mkSpec({ env: { ORC_EXTRA_SECRET: 'super-secret-env-value' } });
       const before = fake.responses().length;
       const { rt, c, ready, launch } = await start(spec);
       expect(rt.provider).toBe('codex');
@@ -562,6 +562,9 @@ describe('codex runtime + harness child (fake Responses API)', () => {
       ]);
       const raw = fs.readFileSync(launch.rawLogPath, 'utf8');
       expect(raw).not.toContain('tok-orc-1');
+      // spec.env values never reach the raw log (keys do).
+      expect(raw).not.toContain('super-secret-env-value');
+      expect(raw).toContain('ORC_EXTRA_SECRET');
       expect(fs.statSync(ready.transcriptPath!).mode & 0o777).toBe(0o600);
     },
     T,

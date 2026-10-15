@@ -11,8 +11,9 @@
  * `<dirname(rawLogPath)>/provider.stderr.log` (diagnostics only, never parsed).
  *
  * Raw log (launch.rawLogPath), one JSON object per line:
- *   {"ts","dir":"send","line"}  line written to the harness's stdin (the init line's spec
- *                               is logged as-is: it holds no credentials)
+ *   {"ts","dir":"send","line"}  line written to the harness's stdin; in the init line the
+ *                               spec.env VALUES are redacted (keys kept): extraEnv may carry
+ *                               secrets
  *   {"ts","dir":"recv","line"}  line read from the harness's stdout
  *   {"ts","dir":"info","line"}  lifecycle note (spawn argv, stdin closed, exit)
  *
@@ -276,7 +277,7 @@ class CodexRuntime implements ProviderRuntime {
   private async write(cmd: HarnessCommand): Promise<void> {
     if (this.hasExited || this.stdinEnded) throw new Error('codex runtime: stdin closed');
     const line = encodeLine(cmd);
-    this.raw('send', line);
+    this.raw('send', cmd.type === 'init' ? encodeLine(redactInit(cmd)) : line);
     const sink = this.proc.stdin;
     sink.write(`${line}\n`);
     await sink.flush();
@@ -471,6 +472,13 @@ class CodexRuntime implements ProviderRuntime {
       return '';
     }
   }
+}
+
+/** The init command as logged: spec.env values replaced (keys kept for debugging). */
+export function redactInit(cmd: Extract<HarnessCommand, { type: 'init' }>): Extract<HarnessCommand, { type: 'init' }> {
+  const env: Record<string, string> = {};
+  for (const k of Object.keys(cmd.spec.env ?? {})) env[k] = '<redacted>';
+  return { ...cmd, spec: { ...cmd.spec, env } };
 }
 
 /** Unbounded single-consumer queue that buffers until (and while) the consumer iterates. */
