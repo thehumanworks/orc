@@ -1,7 +1,8 @@
 # Design: tmux-free agent runtime — durable session actors over structured provider protocols
 
-Status: **proposed, judge-reviewed** (2026-10-14). Supersedes the tmux driver decision in
-`RESEARCH.md` §F.16c and the `Driver` section of `ARCHITECTURE.md`.
+Status: **implemented (2026-10-15)**; proposed and judge-reviewed 2026-10-14. Supersedes the tmux
+driver decision in `RESEARCH.md` §F.16c and the old `Driver` section of `ARCHITECTURE.md`.
+§1–6 are the decision record as reviewed; §7 lists where the build differs and what it added.
 
 ## 1. Goal and constraints
 
@@ -205,3 +206,51 @@ S2, S3, S4 and S6a run in parallel in separate worktrees after S1. Each slice: H
 gatherer → Opus implementor → Fable judge; the orchestrator integrates. A
 `scripts/verify-runtime.ts` script runs the live gates for all three providers so they can be
 re-run on any authenticated macOS or Linux host.
+
+## 7. Implementation notes and deviations
+
+### 7.1 Design text vs the build
+
+| # | Design says | Built | Where |
+|---|---|---|---|
+| 1 | Status "proposed" | Implemented; slices S1–S6b and S7 merged, plus S8 (one-command live verification) | git history of `feat/actor-runtime` |
+| 2 | Journal vocabulary includes `provider.raw` (§4.3) | No `provider.raw` event: verbatim protocol lines go to `provider.jsonl` (debug only). Added events: `provider.spawned`, `provider.ready`, `inbox.dropped`, `actor.reopened` | `runtime/types.ts` `JournalEvent`; `runtime/layout.ts` |
+| 3 | Lease `{pid, pidStartTime, expiresAt}` (§4.2) | `ActorLease {pid, startTime, token, expiresAt}`; the token identifies the actor incarnation | `runtime/types.ts` |
+| 4 | `classifyState(pane)` → `deriveState(journalTail, liveness)` (§4.4) | `deriveState(view)` over a folded journal summary + inbox + `state.json`; `classifyState` / `reduceWait` deleted. An interrupted last turn is `done` (only a failed one is `failed`) | `runtime/derive.ts` |
+| 5 | `StepDoneCtx.capture` = last assistant message + short final turn (§4.5) | As designed, bounded to 8000 chars | `workflow.ts`, `journal-render.ts` |
+| 6 | `runnerTmux` → `runner {pid, startTime, logPath, startedAt}` (§4.6) | Done. Liveness checks pid **and** start time (pid-reuse safe); a legacy `runnerTmux` is read as `legacyRunnerTmux` (never persisted; such runs reconcile to `orphaned`). Schema 4 → 5 | `run-schema.ts`, `runs.ts`, `workflow-runner.ts` |
+| 7 | Daemon raw views return `journal` (§4.8; "server.ts ~392–453, client.ts ~35–40") | Daemon `api: 2` on `GET /health`; `read?raw` → `{kind:'raw', journal}`, logs `--raw` → `{step, provider, journal}`. v1 `pane` shapes stay in the client's types so a v2 client can read an old daemon | `daemon/server.ts` (`sessions.read`, `workflows.runs.logs`), `daemon/client.ts` |
+| 8 | One `scripts/verify-runtime.ts` (§6) | `scripts/verify-runtime/{claude,codex,pi}.ts` (runtime gates) + `all.ts` (gates, CLI end-to-end, detached workflow, tmux shim); `bun run verify:live` | `scripts/verify-runtime/README.md` |
+| 9 | Two-poll debounce goes away (§4.4) | Done: `waitFor` returns on the first matching observation (250 ms journal poll) | `session.ts` |
+| 10 | TUI-only slash commands unavailable (§5) | Verified live (claude 2.1.300, haiku, through `orc send`): `/compact` works over stream-json (`compact_boundary`, the turn completes with an empty result, context survives as a summary) and `/goal <condition>` installs a session Stop hook and the turn runs until the condition holds. Pickers / `/login` remain unavailable. codex/pi slash commands unverified | `skills/orc/SKILL.md` |
+| 11 | Takeover = stop, then native resume (§4.5) | As designed: sticky stop → wait (≤ 15 s) for the provider group to exit → `cd <cwd> && <native resume>`; handback `orc resume` | `session.ts` `takeover` / `resume`, `provider-cli.ts` |
+| 12 | S7 gate: `grep -ri tmux` clean outside history docs | Remaining mentions are intentional: legacy-record / legacy-run normalisation and errors, tests that shadow `tmux` on PATH, the `verify:live` tmux shim, upgrade notes, and history (`RESEARCH.md`, this design) | — |
+| 13 | `spawn.json` holds an "argv template" (§4.3) | It holds the inputs (provider, cwd, env additions, model, agent, system prompt file, provider session id, transcript path); each runtime builds argv per launch | `runtime/spec.ts`, `runtime/types.ts` `SpawnSpec` |
+
+### 7.2 Added during the build
+
+- **Start-failure counter.** `state.json.startFailures` counts consecutive starts that never
+  reached `ready`; after 3, auto-wake is refused (`send` only queues, `ensureAwake` throws
+  `ORC_SESSION_START_FAILED`) until a forced wake (`orc resume`). Reset on `ready`.
+- **`provider.spawned`.** Journaled (fsync'd) from the runtime's `onSpawn` callback right after the
+  child exists, so a provider started by an actor that dies before writing `state.json` is still
+  found and killed before the next start (`staleProviders`).
+- **`inbox.dropped`.** A message still queued when a stop lands is removed with this fact (delivery
+  verdict `failed`) instead of waiting forever in a session that will not wake.
+- **`actor.reopened` / reopen.** `orc resume` journals it, clears the sticky stop and force-wakes.
+  Takeover and kill share the sticky stop, so a send can never start a second writer while a
+  human runs the native resume command.
+- **Abandoned stops.** An actor that dies mid-stop leaves phase `stopping` with a dead lease; it is
+  reported as stopped and the next lock holder finalises it (never woken).
+- **Status is three-valued + spawn-pending.** `running | suspended | dead`; a young record without
+  `spawn.json` is a spawn in progress (listed, counted against `maxConcurrentSessions`, never
+  pruned).
+- **Timeouts.** Send ack wait 10 s; `agent()` readiness 60 s (`readyTimeoutMs`); the actor's
+  provider-ready bound 120 s (`ORC_ACTOR_READY_TIMEOUT_MS`); claude initialize 60 s
+  (`ORC_CLAUDE_READY_TIMEOUT_MS`); actor stop grace 5 s.
+- **Detached runners.** Preconditions, then spawn, then stamp `runner` on the run: a failed
+  precondition or spawn writes nothing, and a stamp that loses a race stops the new runner. The
+  runner heartbeats its owner lease; `cancel` SIGTERMs a live runner (exit 143).
+- **Privacy.** Beyond §4.3's 0700/0600 session dirs, every file orc writes under `ORC_HOME`
+  (registry, peers, run records, instruction drops, locks, artifacts) is owner-only, with explicit
+  chmod; older state is tightened on its next write (`src/private-fs.ts`).
