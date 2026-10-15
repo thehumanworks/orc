@@ -41,6 +41,7 @@ if (typeof script.exitAtStart === 'number') process.exit(script.exitAtStart);
 interface Turn {
   messageId: string;
   timers: ReturnType<typeof setTimeout>[];
+  ignoreInterrupt: boolean;
 }
 let turn: Turn | undefined;
 
@@ -55,7 +56,7 @@ function onSend(messageId: string, text: string): void {
     return;
   }
   const b = pick(text);
-  const t: Turn = { messageId, timers: [] };
+  const t: Turn = { messageId, timers: [], ignoreInterrupt: b.ignoreInterrupt === true };
   turn = t;
   const schedule = (ms: number, fn: () => void) => {
     t.timers.push(
@@ -111,7 +112,7 @@ function onSend(messageId: string, text: string): void {
 
 function onInterrupt(): void {
   const t = turn;
-  if (t) {
+  if (t && !t.ignoreInterrupt) {
     for (const x of t.timers) clearTimeout(x);
     turn = undefined;
     emit({ type: 'turn.interrupted', messageId: t.messageId });

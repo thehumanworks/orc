@@ -225,6 +225,48 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
   );
 
   test(
+    'stop mid-turn interrupts the provider first, then closes it',
+    async () => {
+      const sid = await newSession({ rules: [{ match: 'HANG', action: 'hang' }] });
+      expect((await send(sid, { messageId: 'h1', text: 'HANG' })).verdict).toBe('acknowledged');
+      expect(await stop(sid, { graceMs: 3_000 })).toEqual({ status: 'stopped' });
+      const j = readJournal(sid);
+      const at = (pred: (e: (typeof j)[number]) => boolean) => j.findIndex(pred);
+      const req = at((e) => e.type === 'interrupt.requested' && e.messageId === 'h1');
+      const outcome = at((e) => e.type === 'turn.interrupted' && e.messageId === 'h1');
+      const exited = at((e) => e.type === 'provider.exited');
+      expect(req).toBeGreaterThan(-1);
+      expect(req).toBeLessThan(outcome);
+      // Reported by the provider itself while still running (before it was closed).
+      expect(outcome).toBeLessThan(exited);
+      expect(j[outcome]).toMatchObject({ reason: 'interrupt' });
+      expect(exited).toBeLessThan(at((e) => e.type === 'actor.stopped'));
+      const raw = fs.readFileSync(sessionPaths(sid).providerRaw, 'utf8');
+      expect(raw).toContain('{\\"op\\":\\"interrupt\\"}');
+      expect(deliveryVerdict(sid, 'h1')).toBe('interrupted');
+    },
+    T,
+  );
+
+  test(
+    'stop mid-turn: a provider that ignores the interrupt is closed after a bounded wait',
+    async () => {
+      const sid = await newSession({ rules: [{ match: 'HANG', action: 'hang', ignoreInterrupt: true }] });
+      expect((await send(sid, { messageId: 'h1', text: 'HANG' })).verdict).toBe('acknowledged');
+      const t0 = Date.now();
+      expect(await stop(sid, { graceMs: 600 })).toEqual({ status: 'stopped' });
+      expect(Date.now() - t0).toBeLessThan(4_000);
+      const types = readJournal(sid).map((e) => e.type);
+      expect(types.indexOf('interrupt.requested')).toBeLessThan(types.indexOf('interrupt.acked'));
+      // No provider outcome: the kernel closes the turn after the provider is gone.
+      expect(types.indexOf('provider.exited')).toBeLessThan(types.indexOf('turn.interrupted'));
+      expect(entries(sid, 'turn.interrupted', 'h1')).toMatchObject([{ reason: 'interrupt' }]);
+      expect(fakeProviderPids(sid)).toEqual([]);
+    },
+    T,
+  );
+
+  test(
     'crash after ack: verdict acknowledged, turn.interrupted{recovered} on wake, resume, one provider',
     async () => {
       const sid = await newSession({ rules: [{ match: 'HANG', action: 'hang' }] });
@@ -573,15 +615,13 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
         st.lease!.token = 'stolen-by-another-actor';
         writeActorState(st);
       });
+      const journalBefore = readJournal(sid).length;
       // The next heartbeat (≤ LEASE_HEARTBEAT_MS) detects the foreign token.
-      await waitForEntry(
-        sid,
-        (e) => e.type === 'actor.stopped' && e.reason === 'lease-lost',
-        'lease-lost',
-        LEASE_HEARTBEAT_MS + 5_000,
-      );
-      await waitFor(() => !isLiveProcess(actor), 'actor to exit');
+      await waitFor(() => !isLiveProcess(actor), 'actor to exit', LEASE_HEARTBEAT_MS + 5_000);
       expect(isLiveProcess(provider)).toBe(false);
+      expect(fs.readFileSync(sessionPaths(sid).actorLog, 'utf8')).toContain('lease lost');
+      // The journal now belongs to whoever holds the lease: the loser writes nothing to it.
+      expect(readJournal(sid).length).toBe(journalBefore);
       expect(readActorState(sid)?.lease?.token).toBe('stolen-by-another-actor');
       expect(fakeProviderPids(sid)).toEqual([]);
     },

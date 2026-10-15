@@ -50,6 +50,8 @@ export interface FakeBehaviour {
   exitCode?: number;
   /** permission.requested detail. */
   detail?: unknown;
+  /** Acknowledge interrupts but keep the turn running (a provider that ignores them). */
+  ignoreInterrupt?: boolean;
 }
 
 export interface FakeRule extends FakeBehaviour {
