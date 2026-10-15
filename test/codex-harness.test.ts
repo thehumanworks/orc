@@ -239,6 +239,21 @@ describe('credential resolution (orc store → pi store → OPENAI_API_KEY → e
     expect(((await a.store.read('openai')) as { access: string }).access).toBe('tok-orc');
   });
 
+  test('ORC_AUTH_DIR points every ORC_HOME at one shared store (lock kept beside it)', async () => {
+    const shared = path.join(root, 'shared-auth');
+    process.env.ORC_AUTH_DIR = shared;
+    try {
+      expect(orcChatGPTAuthPath()).toBe(path.join(shared, 'chatgpt.json'));
+      await new OrcChatGPTStore().modify('openai', async () => oauthCred({ access: 'tok-shared' }));
+      expect(JSON.parse(fs.readFileSync(path.join(shared, 'chatgpt.json'), 'utf8')).openai.access).toBe('tok-shared');
+      expect(fs.existsSync(path.join(shared, '.locks'))).toBe(true);
+      expect((await resolveCodexAuth(env())).source).toBe('orc');
+    } finally {
+      delete process.env.ORC_AUTH_DIR;
+    }
+    expect(orcChatGPTAuthPath()).toBe(path.join(orcHome, 'auth', 'chatgpt.json'));
+  });
+
   test('PI_CODING_AGENT_DIR and ~ expansion follow pi', () => {
     expect(piAuthPath({ HOME: '/h' })).toBe('/h/.pi/agent/auth.json');
     expect(piAuthPath({ HOME: '/h', PI_CODING_AGENT_DIR: '~/custom' })).toBe('/h/custom/auth.json');

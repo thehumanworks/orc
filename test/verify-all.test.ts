@@ -2,8 +2,9 @@
  * scripts/verify-runtime/all.ts end to end, FULLY OFFLINE: pi through the conversational
  * stand-in (test/fixtures/pi-chat-fake.ts), claude through the scripted fake
  * (test/fixtures/claude-stream/fake-claude.ts) and codex forced to SKIP. No real provider
- * is ever launched: ORC_CLAUDE_BIN / ORC_CODEX_BIN point at guaranteed-missing paths
- * unless a test passes an explicit --<p>-bin stand-in.
+ * is ever launched: ORC_CLAUDE_BIN points at a guaranteed-missing path unless a test passes
+ * an explicit --<p>-bin stand-in, and codex finds no OpenAI credential (empty auth dirs, no
+ * OPENAI_API_KEY).
  */
 import { afterAll, describe, expect, test } from 'bun:test';
 import fs from 'node:fs';
@@ -18,12 +19,14 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orc-verify-all-test-'));
 
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-/** Offline env: real claude/codex can never be resolved (bin overrides point nowhere). */
+/** Offline env: real claude can never be resolved and codex has no credential. */
 function offlineEnv(extra: Record<string, string> = {}): Record<string, string> {
   return {
     ...(process.env as Record<string, string>),
     ORC_CLAUDE_BIN: path.join(tmp, 'absent', 'claude'),
-    ORC_CODEX_BIN: path.join(tmp, 'absent', 'codex'),
+    ORC_AUTH_DIR: path.join(tmp, 'absent', 'orc-auth'),
+    PI_CODING_AGENT_DIR: path.join(tmp, 'absent', 'pi-agent'),
+    OPENAI_API_KEY: '',
     ...extra,
   };
 }
@@ -82,10 +85,10 @@ async function run(args: string[], env: Record<string, string>) {
 
 describe('verify-runtime/all.ts', () => {
   test(
-    'pi via the stand-in passes every check; claude/codex without a binary are SKIP; results file is clean',
+    'pi via the stand-in passes every check; claude without a binary and codex without a credential are SKIP; results file is clean',
     async () => {
       const results = path.join(tmp, 'results.json');
-      // A PATH that has bun, git and ps but no codex; a lineage var that must not leak in.
+      // No claude binary, no OpenAI credential; a lineage var that must not leak in.
       const env = offlineEnv({
         ORC_ROOT_RUN_ID: 'must-not-leak',
         ORC_HOME: path.join(tmp, 'must-not-be-used'),
@@ -213,6 +216,10 @@ describe('verify-runtime/all.ts', () => {
     const env = offlineEnv();
     expect((await run(['--bogus'], env)).code).toBe(2);
     expect((await run(['--providers', 'claude,gemini'], env)).code).toBe(2);
+    // codex is orc's built-in harness: there is no codex binary to override.
+    const cb = await run(['--codex-bin', '/usr/bin/true'], env);
+    expect(cb.code).toBe(2);
+    expect(cb.err).toContain('built-in harness');
   });
 
   test('ourProcs is hermetic: lookalike processes from another ORC_HOME are not ours', async () => {

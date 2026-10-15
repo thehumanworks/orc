@@ -4,12 +4,14 @@
  *
  *   bun scripts/verify-runtime/all.ts [--providers claude,codex,pi] [--claude-model M]
  *       [--codex-model M] [--pi-model M] [--keep]
- *       [--claude-bin P] [--codex-bin P] [--pi-bin P] [--no-runtime-gates] [--no-e2e] [--no-workflow]
+ *       [--claude-bin P] [--pi-bin P] [--no-runtime-gates] [--no-e2e] [--no-workflow]
  *       [--results <file>]   (default: <repo>/verify-results.json)
  *
- * 1. Preflight: OS/arch, bun, each provider's binary + version (a missing provider is SKIP,
- *    never a failure). A `tmux` shim that logs its argv and exits 127 is first on PATH for
- *    everything below; the run fails if it is ever invoked.
+ * 1. Preflight: OS/arch, bun, each provider's binary + version; for codex (orc's built-in
+ *    harness, no binary) an OpenAI credential: `orc login chatgpt`, pi's ChatGPT login or
+ *    OPENAI_API_KEY (a missing provider is SKIP, never a failure). A `tmux` shim that logs
+ *    its argv and exits 127 is first on PATH for everything below; the run fails if it is
+ *    ever invoked.
  * 2. Runtime gates: scripts/verify-runtime/{claude,codex,pi}.ts as subprocesses.
  * 3. CLI end-to-end per provider, from source (`bun src/cli/index.ts`) with an isolated
  *    ORC_HOME and a temp git repo as cwd (see README.md for every check).
@@ -17,15 +19,18 @@
  * 5. A PASS/FAIL/SKIP table on stdout + verify-results.json in the repo root (no env, no
  *    credentials, no emails). Exit 1 on any FAIL. Temp dirs are removed unless --keep.
  *
- * Safety: every orc call runs with a temp ORC_HOME (your ~/.orc is never touched), inherited
- * ORC_* lineage/test variables are dropped, and provider configs are never modified. Only
- * processes this run started are ever signalled. `--<p>-bin` points a provider at another
- * executable (e.g. test/fixtures/pi-chat-fake.ts) via a wrapper on PATH.
+ * Safety: every orc call runs with a temp ORC_HOME (your ~/.orc is never touched — except
+ * ~/.orc/auth, the codex login, which the temp homes use in place via ORC_AUTH_DIR so a
+ * token refresh lands in your real store), inherited ORC_* lineage/test variables are
+ * dropped, and provider configs are never modified. Only processes this run started are
+ * ever signalled. `--<p>-bin` points a provider at another executable (e.g.
+ * test/fixtures/pi-chat-fake.ts) via a wrapper on PATH.
  */
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { resolveClaudeTranscript } from '../../src/runtime/providers/claude.ts';
+import { resolveCodexAuth } from '../../src/codex/auth.ts';
 import { isSameProcessAlive } from '../../src/runtime/process.ts';
 import type { ProcessIdentity } from '../../src/runtime/types.ts';
 
@@ -48,7 +53,7 @@ interface Args {
 }
 
 const USAGE = `usage: bun scripts/verify-runtime/all.ts [--providers claude,codex,pi] [--claude-model M]
-       [--codex-model M] [--pi-model M] [--keep] [--claude-bin P] [--codex-bin P] [--pi-bin P]
+       [--codex-model M] [--pi-model M] [--keep] [--claude-bin P] [--pi-bin P]
        [--no-runtime-gates] [--no-e2e] [--no-workflow] [--results <file>]`;
 
 function parseArgs(argv: string[]): Args {
@@ -69,6 +74,11 @@ function parseArgs(argv: string[]): Args {
       for (const p of list) if (!(PROVIDERS as readonly string[]).includes(p)) throw new Error(`unknown provider '${p}'`);
       a.providers = list as Provider[];
     } else if (pm) {
+      if (pm[1] === 'codex' && pm[2] === 'bin') {
+        throw new Error(
+          '--codex-bin: codex is orc\'s built-in harness (no codex binary); use scripts/verify-runtime/codex.ts --orc-bin <orc> for a compiled orc',
+        );
+      }
       a[pm[2] as 'model' | 'bin'][pm[1] as Provider] = val();
     } else if (k === '--results') a.results = path.resolve(val());
     else if (k === '--keep') a.keep = true;
@@ -284,19 +294,41 @@ function removeClaudeTranscripts(root: string, sids: Iterable<string>, env: Reco
 const REPO = path.resolve(import.meta.dir, '..', '..');
 const CLI = path.join(REPO, 'src', 'cli', 'index.ts');
 const BUN = process.execPath;
-const BIN_ENV: Record<Provider, string | undefined> = { claude: 'ORC_CLAUDE_BIN', codex: 'ORC_CODEX_BIN', pi: undefined };
+const BIN_ENV: Record<Provider, string | undefined> = { claude: 'ORC_CLAUDE_BIN', codex: undefined, pi: undefined };
+
+/** The real orc credential dir (codex login), resolved BEFORE any temp ORC_HOME applies. */
+function realOrcAuthDir(): string {
+  if (process.env.ORC_AUTH_DIR) return path.resolve(process.env.ORC_AUTH_DIR);
+  const home = process.env.ORC_HOME ? path.resolve(process.env.ORC_HOME) : path.join(os.homedir(), '.orc');
+  return path.join(home, 'auth');
+}
 
 /** process.env minus ORC_* (except provider bin overrides), with the shim dir first on PATH. */
 function baseEnv(shimDir: string): Record<string, string> {
   const env: Record<string, string> = {};
-  const keep = new Set(['ORC_CLAUDE_BIN', 'ORC_CODEX_BIN', 'ORC_CLAUDE_KEEP_ENV']);
+  const keep = new Set(['ORC_CLAUDE_BIN', 'ORC_CLAUDE_KEEP_ENV']);
   for (const [k, v] of Object.entries(process.env)) {
     if (typeof v !== 'string') continue;
     if (k.startsWith('ORC_') && !keep.has(k)) continue;
     env[k] = v;
   }
   env.PATH = `${shimDir}${path.delimiter}${process.env.PATH ?? ''}`;
+  env.ORC_AUTH_DIR = realOrcAuthDir();
   return env;
+}
+
+/** codex preflight: which OpenAI credential the harness would use (never a secret). */
+async function codexCredential(env: Record<string, string>): Promise<string | undefined> {
+  const prev = process.env.ORC_AUTH_DIR;
+  process.env.ORC_AUTH_DIR = env.ORC_AUTH_DIR;
+  try {
+    return (await resolveCodexAuth(env)).label;
+  } catch {
+    return undefined;
+  } finally {
+    if (prev === undefined) delete process.env.ORC_AUTH_DIR;
+    else process.env.ORC_AUTH_DIR = prev;
+  }
 }
 
 function writeExecutable(file: string, body: string): void {
@@ -519,10 +551,7 @@ async function cliE2E(p: Provider, ctx: Ctx, model: string | undefined): Promise
       check(gone, `the pre-crash provider ${oldProvider?.pid} is still running`);
       const others = liveProcs().filter((x) => x.cmd.includes(sid) && !x.cmd.includes('__actor') && x.pid !== fresh.pid);
       check(others.length === 0, `other live processes for the session: ${others.map((o) => o.pid).join(',')}`);
-      // codex app-server's argv carries no session id, so the argv scan cannot see a stray
-      // codex; the pid + start-time checks on the recorded providers still hold.
-      const how = p === 'codex' ? ' (codex: pid + start-time identity only; no session id in its argv)' : '';
-      return `pre-crash provider ${oldProvider?.pid ?? '?'} gone; one live provider ${fresh.pid}${how}`;
+      return `pre-crash provider ${oldProvider?.pid ?? '?'} gone; one live provider ${fresh.pid}`;
     });
     await s.step('e2e takeover → resume command; send refused', async () => {
       const live = notePids().provider;
@@ -772,6 +801,19 @@ async function main(): Promise<number> {
   for (const p of PROVIDERS) {
     if (!args.providers.includes(p)) {
       providerInfo[p] = { selected: false };
+      continue;
+    }
+    if (p === 'codex') {
+      const cred = await codexCredential(env);
+      if (!cred) {
+        providerInfo[p] = { selected: true };
+        record(p, 'preflight', 'SKIP', 'no OpenAI credential: run `orc login chatgpt`, log in to pi, or set OPENAI_API_KEY');
+        continue;
+      }
+      providerInfo[p] = { selected: true, bin: 'built-in harness', version: sanitize(cred), model: args.model[p] ?? '(account default)' };
+      record(p, 'preflight', 'PASS', `built-in harness — ${sanitize(cred)}`);
+      if (!args.model[p]) console.log(`  note  codex will use the first model your account lists (pass --codex-model <id> to choose)`);
+      available.push(p);
       continue;
     }
     const bin = resolveBin(p, env);

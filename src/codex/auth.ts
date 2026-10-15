@@ -4,8 +4,9 @@
  * Resolution order (first hit wins; decided per request, so a later `orc login chatgpt`
  * takes over without restarting anything):
  *   1. orc's own Sign in with ChatGPT credential: `$ORC_HOME/auth/chatgpt.json`
- *      (`{"openai": <oauth credential>}`, 0600, written atomically under the orc lock
- *      `auth-chatgpt`). Created by `orc login chatgpt`.
+ *      (`$ORC_AUTH_DIR` overrides the dir; `{"openai": <oauth credential>}`, 0600, written
+ *      atomically under the orc lock `auth-chatgpt` kept beside it). Created by
+ *      `orc login chatgpt`.
  *   2. pi's existing ChatGPT login: `auth.json` in pi's agent dir (`$PI_CODING_AGENT_DIR`,
  *      else `~/.pi/agent`), entry `openai` of type `oauth`. Used only when (1) is absent.
  *   3. `OPENAI_API_KEY` (plain API-key Responses API; resolved by pi-ai's ambient env auth).
@@ -59,9 +60,20 @@ type Env = Record<string, string | undefined>;
 // Paths
 // ---------------------------------------------------------------------------------
 
-/** `$ORC_HOME/auth` (0700). */
+/**
+ * `$ORC_AUTH_DIR`, else `$ORC_HOME/auth` (0700). The override lets sessions under another
+ * ORC_HOME (e.g. the live verification's temp homes) use — and refresh in place — the
+ * user's real login instead of a forked copy.
+ */
 export function orcAuthDir(): string {
+  const override = process.env.ORC_AUTH_DIR;
+  if (override && override.length > 0) return path.resolve(override);
   return path.join(orcHome(), 'auth');
+}
+
+/** The orc store's lock lives beside the credential, so every ORC_HOME sharing it excludes. */
+function orcAuthLockOptions(): { locksDir: string } {
+  return { locksDir: path.join(orcAuthDir(), '.locks') };
 }
 
 /** orc's own ChatGPT credential file. */
@@ -206,18 +218,22 @@ export class OrcChatGPTStore implements CredentialStore {
         this.save({ ...data, [providerId]: next });
         return next;
       },
-      { timeoutMs: 60_000 },
+      { timeoutMs: 60_000, ...orcAuthLockOptions() },
     );
   }
 
   async delete(providerId: string, options?: AuthOperationOptions): Promise<void> {
     options?.signal?.throwIfAborted();
-    await withLock('auth-chatgpt', async () => {
-      const data = this.load();
-      if (!(providerId in data)) return;
-      delete data[providerId];
-      this.save(data);
-    });
+    await withLock(
+      'auth-chatgpt',
+      async () => {
+        const data = this.load();
+        if (!(providerId in data)) return;
+        delete data[providerId];
+        this.save(data);
+      },
+      orcAuthLockOptions(),
+    );
   }
 }
 
