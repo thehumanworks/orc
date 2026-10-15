@@ -43,7 +43,9 @@ export function renderSessionLine(rec: SessionView, opts?: { lineage?: boolean }
   }
   const state = rec.state ? ` ${rec.state}` : '';
   const legacy = rec.legacy ? ` legacy=${rec.legacy}` : '';
-  return `${rec.id}  ${rec.provider} ${status}${state}${model}${agent}${alias}${legacy}  cwd=${rec.cwd}${wt}${lineage}`.trim();
+  // Kept by `orc prune` (unless --taken-over): the human holds it; hand back with resume.
+  const taken = rec.stoppedBy === 'takeover' ? ` taken-over(hand back: orc resume ${rec.id})` : '';
+  return `${rec.id}  ${rec.provider} ${status}${state}${model}${agent}${alias}${legacy}${taken}  cwd=${rec.cwd}${wt}${lineage}`.trim();
 }
 
 /** Multi-line human detail of a session record. */
@@ -272,7 +274,7 @@ Usage:
   orc kill   <id|@alias> [--worktree] [--purge]       Stop the session (sticky; record kept; --purge removes record + journal)
   orc resume <id|@alias>                              Hand a killed/taken-over/suspended session back to an actor
   orc takeover <id|@alias>                            Stop orc's actor and print the provider's own resume command
-  orc prune  [--worktree] [--suspended]               Drop dead records (+ journals; optional worktrees)
+  orc prune  [--worktree] [--suspended] [--taken-over] Drop dead records (+ journals; optional worktrees)
   orc workflow <run|list|status|attach|logs|resume|retry|cancel|cleanup> ...  Workflows (alias: wf)
   orc daemon [--port 8787] [--bind <ip>] [--insecure] Serve the HTTP API over tailscale
   orc remote <add|list|rm> <host> [--port P]          Manage trusted peers (~/.orc/peers.json)
@@ -374,9 +376,11 @@ Global:
 
 Sessions run as detached per-session actors that drive each provider CLI over its
 structured protocol (no terminal). Status: running (actor live) | suspended (actor gone
-without a stop — crash/reboot; the next send or \`orc resume\` wakes it) | dead (killed,
-taken over, or pre-actor legacy). \`orc list\` shows running + suspended; --dead/--all
-include dead. \`orc prune\` never removes suspended sessions unless --suspended.
+without a stop — crash/reboot; the next send or \`orc resume\` wakes it) | spawning
+(being created right now) | dead (killed, taken over, or pre-actor legacy). \`orc list\` shows running + suspended; --dead/--all
+include dead. \`orc prune\` never removes suspended sessions unless --suspended, nor
+sessions taken over by \`orc takeover\` unless --taken-over (their dir holds the system
+prompt the printed provider resume command uses; hand back with \`orc resume <id>\`).
 
 read defaults to the latest parsed conversation turn. --full emits the full parsed
 transcript, --index N emits zero-based parsed turn N, and --raw emits the session journal

@@ -103,6 +103,12 @@ export interface AttachOptions {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/** What `provider.ready` reported (Session.awaitReady). */
+export interface ProviderReadyInfo {
+  providerSessionId: string;
+  transcriptPath?: string;
+}
+
 /** A stopped session refused a send; carries the `orc resume` hint. */
 export class SessionNotControllableError extends Error {
   constructor(
@@ -237,7 +243,8 @@ export class Session {
     if (this.legacy || !hasSpawnSpec(this.sessionId)) {
       return {
         id: this.id,
-        state: 'failed',
+        // A reservation whose kernel session is being created right now.
+        state: status === 'spawning' ? 'starting' : 'failed',
         status,
         stopped: this.record.status === 'dead',
         suspended: false,
@@ -299,23 +306,28 @@ export class Session {
 
   /**
    * Wait until the provider reported ready (`provider.ready` after the latest actor
-   * start). Throws — with the journal error and the actor.log tail — when the actor
-   * stops or dies first, or on timeout.
+   * start) and return what that entry says (provider session id — codex: its thread id —
+   * and transcript path). Throws — with the journal error and the actor.log tail — when
+   * the actor stops or dies first, or on timeout.
    */
-  async awaitReady(timeoutMs = DEFAULT_READY_TIMEOUT_MS): Promise<void> {
+  async awaitReady(timeoutMs = DEFAULT_READY_TIMEOUT_MS): Promise<ProviderReadyInfo> {
     this.assertControllable('start');
     const sid = this.sessionId;
     const deadline = Date.now() + timeoutMs;
     const cursor = JournalCursor.forSession(sid);
-    let readySeq = 0;
+    let ready: Extract<JournalEntry, { type: 'provider.ready' }> | undefined;
     let stopped: Extract<JournalEntry, { type: 'actor.stopped' }> | undefined;
+    const readyInfo = (e: Extract<JournalEntry, { type: 'provider.ready' }>): ProviderReadyInfo => ({
+      providerSessionId: e.providerSessionId,
+      ...(e.transcriptPath ? { transcriptPath: e.transcriptPath } : {}),
+    });
     while (true) {
       for (const e of cursor.readNew()) {
         if (e.type === 'actor.started') {
-          readySeq = 0;
+          ready = undefined;
           stopped = undefined;
         } else if (e.type === 'provider.ready') {
-          readySeq = e.seq;
+          ready = e;
           stopped = undefined;
         } else if (e.type === 'actor.stopped') {
           stopped = e;
@@ -328,11 +340,12 @@ export class Session {
           })${actorLogTail(sid)}`,
         );
       }
-      if (readySeq > 0) return;
+      if (ready) return readyInfo(ready);
       if (!leaseLive(readActorState(sid))) {
         // Give the journal one more read: the actor may have journaled on its way out.
         await sleep(20);
-        if (cursor.readNew().some((e) => e.type === 'provider.ready')) return;
+        const late = cursor.readNew().find((e) => e.type === 'provider.ready');
+        if (late?.type === 'provider.ready') return readyInfo(late);
         throw new Error(`session ${this.id}: actor exited before its provider was ready${actorLogTail(sid)}`);
       }
       if (Date.now() >= deadline) {
@@ -596,6 +609,15 @@ export class Session {
   async resume(opts: { readyTimeoutMs?: number } = {}): Promise<SessionStateDetail> {
     this.assertControllable('be resumed');
     await reopen(this.sessionId, { reason: 'resume' });
+    // The kernel is resumable now: un-kill the record BEFORE waking, so a failed wake
+    // leaves a consistent `suspended` session (listed, not prunable) instead of a hidden
+    // `dead` record over a resumable kernel.
+    if (this.record.status === 'dead' || this.record.killedAt || this.record.stoppedBy) {
+      delete this.record.status;
+      delete this.record.killedAt;
+      delete this.record.stoppedBy;
+      await upsertRecord(this.record);
+    }
     const hook = wakePolicyHook(this.record);
     // An explicit resume is the "force" path: it clears the consecutive start-failure
     // counter that blocks automatic wake-on-send after repeated failed starts.
@@ -605,12 +627,6 @@ export class Session {
     }
     if (r.status === 'started' && 'sessionError' in r && r.sessionError) {
       throw new Error(`session ${this.id} failed to resume: ${String(r.sessionError)}`);
-    }
-    if (this.record.status === 'dead' || this.record.killedAt || this.record.stoppedBy) {
-      delete this.record.status;
-      delete this.record.killedAt;
-      delete this.record.stoppedBy;
-      await upsertRecord(this.record);
     }
     if (r.status === 'started') await this.awaitReady(opts.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS);
     return this.stateDetail();

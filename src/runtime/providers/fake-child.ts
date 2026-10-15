@@ -159,7 +159,14 @@ setTimeout(
       type: 'ready',
       providerSessionId,
       capabilities: ['interrupt'],
-      info: { fake: true, mode, pid: process.pid },
+      info: {
+        fake: true,
+        mode,
+        pid: process.pid,
+        ...(script.reportEnv
+          ? { env: Object.fromEntries(script.reportEnv.filter((k) => k in process.env).map((k) => [k, process.env[k]])) }
+          : {}),
+      },
     }),
   Math.max(0, script.readyDelayMs ?? 0),
 );

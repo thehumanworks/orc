@@ -278,7 +278,7 @@ export type StepAdopter = (args: {
 export type AdoptionProbe = (
   attempt: StepAttempt,
   runId: string,
-) => Promise<{ sessionAlive: boolean | null; verdict?: DeliveryVerdict }>;
+) => Promise<{ sessionAlive: boolean | null; verdict?: DeliveryVerdict; takenOver?: boolean }>;
 
 export interface RunWorkflowOptions {
   onEvent?: (e: WorkflowEvent) => void;
@@ -710,6 +710,20 @@ export function createAttempt(args: {
   };
 }
 
+/** Forward order of the in-flight attempt phases (terminal phases rank last). */
+const ATTEMPT_PROGRESS: Partial<Record<AttemptPhase, number>> = {
+  queued: 0,
+  spawning: 1,
+  dispatched: 2,
+  running: 3,
+  waiting: 3,
+  verifying: 4,
+};
+
+function attemptProgress(phase: AttemptPhase): number {
+  return ATTEMPT_PROGRESS[phase] ?? 5;
+}
+
 export function transitionAttempt(
   attempt: StepAttempt,
   phase: AttemptPhase,
@@ -757,7 +771,9 @@ export function projectStepsFromAttempts(
  * - `adopt`          — in flight, its session still continuable (exists, not stopped) and
  *                      the instruction is queued / acknowledged / completed: keep waiting
  * - `require_retry`  — delivery `unknown` (cut before the provider acked it): never
- *                      re-sent automatically; an explicit retry is required
+ *                      re-sent automatically; an explicit retry is required. Also when
+ *                      the session was TAKEN OVER by a human: a resume must never launch a
+ *                      competing agent (hand it back with `orc resume <id>` first)
  * - `spawn_new`      — no attempt, terminal non-success, session gone/stopped, or the
  *                      instruction failed / was never enqueued / was interrupted
  * `verdict` is the kernel delivery verdict of the attempt's instruction message; without
@@ -768,6 +784,8 @@ export function adoptionDecision(args: {
   sessionAlive: boolean | null;
   verdict?: DeliveryVerdict;
   allowUnknownDeliveryRetry?: boolean;
+  /** The attempt's session was taken over (`orc takeover`): never relaunch around it. */
+  takenOver?: boolean;
 }): 'skip_succeeded' | 'adopt' | 'require_retry' | 'spawn_new' {
   const a = args.attempt;
   if (!a) return 'spawn_new';
@@ -775,6 +793,7 @@ export function adoptionDecision(args: {
   if (a.phase === 'cancelled' || a.phase === 'abandoned') return 'spawn_new';
   if (a.phase === 'failed') return 'spawn_new';
   if (TERMINAL_ATTEMPT_PHASES.has(a.phase)) return 'spawn_new';
+  if (args.takenOver) return 'require_retry';
   const unknown = a.deliveryPhase === 'unknown' || args.verdict === 'unknown';
   if (unknown) return args.allowUnknownDeliveryRetry ? 'spawn_new' : 'require_retry';
   if (!a.sessionId) return 'spawn_new';
@@ -801,6 +820,7 @@ export function decideAdoption(args: {
   sessionAlive: boolean | null;
   verdict?: DeliveryVerdict;
   allowUnknownDeliveryRetry?: boolean;
+  takenOver?: boolean;
 }): 'skip_succeeded' | 'adopt' | 'require_retry' | 'spawn_new' {
   return adoptionDecision(args);
 }
@@ -1236,10 +1256,13 @@ const defaultAdoptStep: StepAdopter = async ({ step, runId, attempt, transition,
 export async function probeAttemptSession(
   attempt: StepAttempt,
   runId: string,
-): Promise<{ sessionAlive: boolean | null; verdict?: DeliveryVerdict }> {
+): Promise<{ sessionAlive: boolean | null; verdict?: DeliveryVerdict; takenOver?: boolean }> {
   if (!attempt.sessionId) return { sessionAlive: false };
   const rec = await findRecord(attempt.sessionId);
   if (!rec) return { sessionAlive: false };
+  // A human holds it (`orc takeover`): not continuable by the workflow, and not to be
+  // replaced by a competing agent either.
+  if (rec.stoppedBy === 'takeover') return { sessionAlive: false, takenOver: true };
   if (sessionStatusOf(rec) === 'dead') return { sessionAlive: false };
   try {
     const messageId = attempt.messageId ?? instructionMessageId(runId, attempt.stepId, attempt.attemptId);
@@ -1461,9 +1484,13 @@ async function runWorkflowOwned(
   const recordAttempt = (attempt: StepAttempt) => {
     const list = run.attempts ?? [];
     const idx = list.findIndex((a) => a.attemptId === attempt.attemptId);
+    const prevPhase = idx >= 0 ? list[idx]!.phase : undefined;
     if (idx >= 0) list[idx] = attempt;
     else list.push(attempt);
     run.attempts = list;
+    // A same-phase re-record only attaches data (e.g. baselineSha at `spawning`): it is
+    // persisted, but it is not a transition.
+    if (prevPhase === attempt.phase) return;
     emit({
       type: 'attempt-transition',
       runId,
@@ -1715,7 +1742,9 @@ async function runWorkflowOwned(
       const completed = result;
       await serialize(async () => {
         if (cancelled) return;
-        if (completed.sessionId) {
+        // Executors that report no mid-flight transitions still pass through
+        // dispatched → verifying; never step BACK to a phase the executor already passed.
+        if (completed.sessionId && attemptProgress(attempt.phase) < attemptProgress('dispatched')) {
           attempt = transitionAttempt(attempt, 'dispatched', { sessionId: completed.sessionId }, now());
           recordAttempt(attempt);
         }
@@ -1807,18 +1836,37 @@ async function runWorkflowOwned(
       const a = latestAttemptForStep(run.attempts, id);
       if (!a || !IN_FLIGHT_PHASES.has(a.phase)) continue;
       const facts = await probe(a, runId).catch(() => ({ sessionAlive: null }) as const);
+      const takenOver = 'takenOver' in facts && facts.takenOver === true;
       const decision = adoptionDecision({
         attempt: a,
         sessionAlive: facts.sessionAlive,
         ...('verdict' in facts && facts.verdict ? { verdict: facts.verdict } : {}),
         allowUnknownDeliveryRetry: allowUnknown,
+        takenOver,
       });
       if (decision === 'adopt' && stepsById.has(id)) {
         toAdopt.push(a);
         continue;
       }
       const ts = now();
-      if (decision === 'require_retry') {
+      if (decision === 'require_retry' && takenOver) {
+        const sid = a.sessionId ?? '';
+        const failed: StepResult = {
+          id,
+          sessionId: sid,
+          provider: a.provider,
+          state: 'failed',
+          ok: false,
+          outcome: 'failed',
+          commitsAhead: 0,
+        };
+        const msg =
+          `session ${sid} was taken over (\`orc takeover\`); not relaunched — hand it back with ` +
+          `\`orc resume ${sid}\`, then \`orc workflow retry ${runId} --step ${id}\``;
+        recordAttempt(transitionAttempt(a, 'failed', { result: failed, errorCategory: 'taken_over', errorMessage: msg }, ts));
+        upsertResult(failed);
+        emit({ type: 'step-error', runId, stepId: id, error: msg });
+      } else if (decision === 'require_retry') {
         const failed: StepResult = {
           id,
           sessionId: a.sessionId ?? '',

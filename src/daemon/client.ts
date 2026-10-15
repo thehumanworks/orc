@@ -70,7 +70,8 @@ export type RemoteSessionView = SessionRecord & {
 export interface RemoteSendResult {
   ok: boolean;
   id: string;
-  phase?: 'queued' | 'acknowledged' | 'unknown' | 'failed';
+  /** v2 phases; a v1 (pre-actor) daemon may answer `submitted` (written, not yet acked). */
+  phase?: 'queued' | 'acknowledged' | 'unknown' | 'failed' | 'submitted';
   messageId?: string;
   replayed?: boolean;
 }

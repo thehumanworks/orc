@@ -13,6 +13,7 @@ import {
   createAttempt,
   instructionMessageId,
   planDigest,
+  probeAttemptSession,
   resumeWorkflow,
   retryWorkflow,
   transitionAttempt,
@@ -159,6 +160,33 @@ describe('resume adopts in-flight attempts (D10)', () => {
     expect(h.execCalls).toEqual(['a', 'b']);
   });
 
+  test('a taken-over step session is never relaunched around: failed (taken_over), told to hand it back', async () => {
+    await orphanedRun('adopt-taken');
+    const h = harness('acknowledged', false);
+    h.opts.probeAdoption = async () => ({ sessionAlive: false, takenOver: true });
+    const run = await resumeWorkflow('adopt-taken', def, h.opts);
+    expect(run.status).toBe('failed');
+    expect(h.execCalls).toEqual([]);
+    expect(h.adoptCalls).toEqual([]);
+    const a = run.attempts!.find((x) => x.stepId === 'a')!;
+    expect(a).toMatchObject({ phase: 'failed', errorCategory: 'taken_over' });
+    expect(a.errorMessage).toContain('orc resume sess-a');
+    const err = h.events.find((e) => e.type === 'step-error');
+    expect(err && err.type === 'step-error' && err.error).toContain('orc resume sess-a');
+    expect(run.attempts!.filter((x) => x.stepId === 'a')).toHaveLength(1);
+
+    // A later resume (e.g. after `orc resume sess-a`) still never relaunches around it…
+    const again = harness(undefined);
+    const resumed = await resumeWorkflow('adopt-taken', def, again.opts);
+    expect(again.execCalls).toEqual([]);
+    expect(resumed.attempts!.filter((x) => x.stepId === 'a')).toHaveLength(1);
+    // …only an explicit retry does.
+    const r = harness(undefined);
+    const retried = await retryWorkflow('adopt-taken', def, r.opts);
+    expect(retried.status).toBe('done');
+    expect(r.execCalls).toEqual(['a', 'b']);
+  });
+
   test('allowUnknownDeliveryRetry relaunches an unknown delivery on resume', async () => {
     await orphanedRun('adopt-allow');
     const h = harness('unknown');
@@ -185,6 +213,12 @@ describe('adoptionDecision with kernel verdicts', () => {
       'spawn_new',
     );
     expect(adoptionDecision({ attempt: running, sessionAlive: false, verdict: 'acknowledged' })).toBe('spawn_new');
+    // Taken over: never relaunched, whatever the verdict or retry flag.
+    for (const verdict of ['acknowledged', 'unknown', 'absent'] as const) {
+      expect(
+        adoptionDecision({ attempt: running, sessionAlive: false, verdict, takenOver: true, allowUnknownDeliveryRetry: true }),
+      ).toBe('require_retry');
+    }
     const noSession = transitionAttempt(createAttempt({ stepId: 'a', provider: 'claude', attemptNumber: 1 }), 'spawning');
     expect(adoptionDecision({ attempt: noSession, sessionAlive: true })).toBe('spawn_new');
   });
@@ -223,6 +257,22 @@ describe('default adopter + kernel probe (real actor, fake provider)', () => {
       const disk = await readRun('adopt-real');
       expect(disk!.steps.find((x) => x.id === 'a')!.sessionId).toBe(s.id);
       await s.kill();
+    } finally {
+      if (prevFake === undefined) delete process.env[FAKE_PROVIDER_ENV];
+      else process.env[FAKE_PROVIDER_ENV] = prevFake;
+    }
+  }, 45_000);
+
+  test('probeAttemptSession reports a real taken-over session as takenOver', async () => {
+    const prevFake = process.env[FAKE_PROVIDER_ENV];
+    process.env[FAKE_PROVIDER_ENV] = '1';
+    try {
+      const s = await agent({ provider: 'claude', cwd: mkTmp('orc-adopt-cwd-'), rootRunId: 'adopt-probe' });
+      sids.push(s.sessionId);
+      const a = await orphanedRun('adopt-probe', s.id);
+      await s.takeover();
+      expect(await probeAttemptSession(a, 'adopt-probe')).toEqual({ sessionAlive: false, takenOver: true });
+      await s.kill({ purge: true });
     } finally {
       if (prevFake === undefined) delete process.env[FAKE_PROVIDER_ENV];
       else process.env[FAKE_PROVIDER_ENV] = prevFake;

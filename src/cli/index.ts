@@ -292,6 +292,26 @@ export function sendExitCode(phase: SendResult['phase']): number {
   }
 }
 
+/**
+ * `orc --host … send` exit code for a phase from ANY daemon version: a v1 (pre-actor)
+ * daemon reports `submitted` for a prompt it wrote but could not yet confirm — delivered
+ * as far as v1 knew, so success like v2 `queued`. A missing phase (older v1) = acked.
+ */
+export function remoteSendExitCode(phase: string | undefined): number {
+  switch (phase) {
+    case undefined:
+    case 'submitted':
+      return 0;
+    case 'acknowledged':
+    case 'queued':
+    case 'unknown':
+    case 'failed':
+      return sendExitCode(phase);
+    default:
+      return 1;
+  }
+}
+
 function renderSendResult(id: string, r: { phase: string; messageId?: string; replayed?: boolean }): string {
   const replay = r.replayed ? ', replayed' : '';
   const key = r.messageId ? ` [${r.messageId}]` : '';
@@ -652,6 +672,7 @@ async function cmdPrune(args: string[]): Promise<number> {
   const { values } = parse(args, {
     worktree: { type: 'boolean' },
     suspended: { type: 'boolean' },
+    'taken-over': { type: 'boolean' },
     json: { type: 'boolean' },
   });
   const json = jsonFlag(values);
@@ -660,6 +681,7 @@ async function cmdPrune(args: string[]): Promise<number> {
     removed = await pruneSessions({
       removeWorktree: values.worktree === true,
       suspended: values.suspended === true,
+      takenOver: values['taken-over'] === true,
     });
   } catch (e) {
     printError((e as Error).message, json);
@@ -1649,8 +1671,8 @@ async function remoteSend(client: DaemonClient, args: string[]): Promise<number>
       ...(key !== undefined ? { messageId: key } : {}),
       ...(values['no-wake'] === true ? { wake: false } : {}),
     });
-    const phase = (r.phase ?? 'acknowledged') as SendResult['phase'];
-    const code = sendExitCode(phase);
+    const phase = r.phase ?? 'acknowledged';
+    const code = remoteSendExitCode(r.phase);
     if (json) printJson(r);
     else if (code === 0) process.stdout.write(renderSendResult(r.id, { ...r, phase }));
     else process.stderr.write(`error: delivery to ${r.id} ${phase}\n`);

@@ -11,7 +11,8 @@
  */
 import path from 'node:path';
 import os from 'node:os';
-import { agent } from '../agent.ts';
+import { agent, validateOptions } from '../agent.ts';
+import { PolicyViolationError } from '../policy.ts';
 import { listSessions, getSession } from '../index.ts';
 import {
   runWorkflow,
@@ -267,10 +268,37 @@ export function createFetch(opts: DaemonOptions): (req: Request, server: Bun.Ser
         spawnRunner: opts.spawnRunner,
       });
     } catch (e) {
-      if (e instanceof HttpError) return jsonError(e.status, e.message);
-      return jsonError(500, (e as Error).message);
+      return jsonError(httpStatusFor(e), (e as Error).message);
     }
   };
+}
+
+/**
+ * HTTP status for an error escaping a route (documented daemon contract):
+ * - 400 invalid request (route validation: HttpError(400))
+ * - 403 PolicyViolationError — the execution policy forbids it (spawn / wake)
+ * - 404 ORC_SESSION_UNKNOWN — no runtime state (purged / never started)
+ * - 409 ORC_SESSION_STOPPED (killed / taken over: `orc resume` first),
+ *       ORC_MESSAGE_CONFLICT (idempotency key reused with a different prompt),
+ *       ORC_SESSION_LEGACY (pre-actor session: read-only)
+ * - 502 ORC_SESSION_START_FAILED — the provider CLI failed to start
+ * - 500 anything else
+ */
+export function httpStatusFor(e: unknown): number {
+  if (e instanceof HttpError) return e.status;
+  if (e instanceof PolicyViolationError) return 403;
+  switch ((e as { code?: unknown } | null)?.code) {
+    case 'ORC_SESSION_STOPPED':
+    case 'ORC_MESSAGE_CONFLICT':
+    case 'ORC_SESSION_LEGACY':
+      return 409;
+    case 'ORC_SESSION_UNKNOWN':
+      return 404;
+    case 'ORC_SESSION_START_FAILED':
+      return 502;
+    default:
+      return 500;
+  }
 }
 
 interface DispatchCtx {
@@ -322,6 +350,7 @@ async function dispatch(
       let agentOpts;
       try {
         agentOpts = mapSpawnRequest(body);
+        validateOptions(agentOpts); // option-combination errors are 400s, not 500s
       } catch (e) {
         throw new HttpError(400, (e as Error).message);
       }

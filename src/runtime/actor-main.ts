@@ -55,6 +55,7 @@ import { TurnLedger, staleProviders } from './derive.ts';
 import { abandonedStopReason, finalizeStopLocked, isAbandonedStop } from './stop.ts';
 import { getRuntimeFactory } from './providers/index.ts';
 import { ulidTime } from './ulid.ts';
+import { providerEnv } from './env.ts';
 
 /** Provider must emit `ready` within this long (override: ORC_ACTOR_READY_TIMEOUT_MS). */
 const DEFAULT_READY_TIMEOUT_MS = 120_000;
@@ -78,12 +79,6 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
       timer = setTimeout(() => resolve(undefined), ms);
     }),
   ]).finally(() => clearTimeout(timer));
-}
-
-function mergeEnv(base: NodeJS.ProcessEnv, add: Record<string, string>): Record<string, string> {
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(base)) if (typeof v === 'string') out[k] = v;
-  return Object.assign(out, add);
 }
 
 function readyTimeoutMs(): number {
@@ -363,7 +358,7 @@ class Actor {
       const rt = await factory.start({
         spec: this.spec,
         resume,
-        env: mergeEnv(process.env, this.spec.env),
+        env: providerEnv(process.env, this.spec.env),
         rawLogPath: this.paths.providerRaw,
         onSpawn: (id) => this.onProviderSpawned(id),
       });
@@ -426,14 +421,8 @@ class Actor {
         }
         this.ready = true;
         clearTimeout(this.readyTimer);
-        this.append({
-          type: 'provider.ready',
-          providerSessionId: ev.providerSessionId,
-          providerPid: this.rt?.pid ?? 0,
-          ...(ev.transcriptPath ? { transcriptPath: ev.transcriptPath } : {}),
-          ...(ev.capabilities ? { capabilities: ev.capabilities } : {}),
-          ...(ev.info ? { info: ev.info } : {}),
-        });
+        // spawn.json FIRST: whoever observes provider.ready must also find the provider
+        // session id (codex thread id) and transcript path on disk.
         if (
           this.spec.providerSessionId !== ev.providerSessionId ||
           (ev.transcriptPath !== undefined && this.spec.transcriptPath !== ev.transcriptPath)
@@ -443,8 +432,20 @@ class Actor {
             providerSessionId: ev.providerSessionId,
             ...(ev.transcriptPath ? { transcriptPath: ev.transcriptPath } : {}),
           };
-          writeSpawnSpec(this.spec);
+          try {
+            writeSpawnSpec(this.spec);
+          } catch (e) {
+            this.log(`could not persist providerSessionId to spawn.json: ${errMsg(e)}`);
+          }
         }
+        this.append({
+          type: 'provider.ready',
+          providerSessionId: ev.providerSessionId,
+          providerPid: this.rt?.pid ?? 0,
+          ...(ev.transcriptPath ? { transcriptPath: ev.transcriptPath } : {}),
+          ...(ev.capabilities ? { capabilities: ev.capabilities } : {}),
+          ...(ev.info ? { info: ev.info } : {}),
+        });
         this.providerSessionId = ev.providerSessionId;
         this.startFailures = 0;
         this.lastStartError = undefined;

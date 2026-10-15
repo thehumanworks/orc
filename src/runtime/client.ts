@@ -30,6 +30,7 @@ import {
 } from './actor-state.ts';
 import { TurnLedger, staleProviders, summarizeLedger, verdictFor } from './derive.ts';
 import { abandonedStopReason, finalizeStopLocked, isAbandonedStop } from './stop.ts';
+import { withoutInheritedLineage } from './env.ts';
 import type { DeliveryVerdict, SessionView } from './derive.ts';
 
 export { readJournal, followJournal, JournalCursor } from './journal.ts';
@@ -108,7 +109,8 @@ function spawnActorLocked(sessionId: string, state: ActorStateFile): ProcessIden
   const spec = requireSpec(sessionId);
   const actor = spawnDetached([...selfArgv(), '__actor', sessionId], {
     cwd: spec.cwd,
-    env: process.env,
+    // Never hand the WAKER's lineage (ORC_RESULT_PATH, ORC_ATTEMPT_ID, …) to the session.
+    env: withoutInheritedLineage(process.env),
     logPath: sessionPaths(sessionId).actorLog,
   });
   const next: ActorStateFile = {
@@ -432,6 +434,8 @@ async function waitForDelivery(
  * Durably enqueue a message, wake the session (unless `wake: false`) and wait (bounded)
  * for its turn.started. Idempotent per messageId: if an inbox item or a journal intent
  * for it already exists nothing is enqueued and its current status is returned.
+ * A wake rejected by `beforeWake` (policy) drops the message (inbox.dropped{policy}) and
+ * rethrows: a later wake must never deliver it behind the caller's back.
  * Throws SessionStoppedError for a stopped or stopping session — also when the stop lands
  * while the message waits (it is then dropped with an inbox.dropped fact, never left
  * queued in a session that will not wake).
@@ -476,10 +480,24 @@ export async function send(
   let woke = false;
   let sessionError: string | undefined;
   if (opts.wake !== false) {
+    const beforeWake = opts.beforeWake;
+    // Runs under the actor lock with no live actor (ensureAwake only calls it before a
+    // spawn). A rejected wake (policy) must not leave this message queued for a LATER wake
+    // to deliver behind the caller's back: drop it atomically, then rethrow.
+    const beforeSpawn = beforeWake
+      ? async () => {
+          try {
+            await beforeWake();
+          } catch (e) {
+            dropPendingLocked(sessionId, ulid, 'policy');
+            throw e;
+          }
+        }
+      : undefined;
     let r: EnsureAwakeResult;
     try {
       r = await ensureAwake(sessionId, {
-        ...(opts.beforeWake ? { beforeSpawn: opts.beforeWake } : {}),
+        ...(beforeSpawn ? { beforeSpawn } : {}),
         ...(opts.startTimeoutMs !== undefined ? { startTimeoutMs: opts.startTimeoutMs } : {}),
       });
     } catch (e) {
@@ -528,17 +546,25 @@ async function dropIfUndelivered(sessionId: string, ulid: string): Promise<void>
   while (leaseLive(readActorState(sessionId)) && Date.now() < deadline) await Bun.sleep(25);
   await withActorLock(sessionId, async () => {
     if (leaseLive(readActorState(sessionId))) return;
-    const item = listPending(sessionId).find((i) => i.ulid === ulid);
-    if (!item || item.kind !== 'message') return;
-    if (TurnLedger.from(readJournal(sessionId)).intentUlids.has(ulid)) return;
-    const j = JournalWriter.forSession(sessionId);
-    try {
-      j.append({ type: 'inbox.dropped', ulid, messageId: item.messageId, reason: 'stopped' });
-    } finally {
-      j.close();
-    }
-    removeInboxItem(sessionId, ulid);
+    dropPendingLocked(sessionId, ulid, 'stopped');
   });
+}
+
+/**
+ * Remove a still-queued message with an inbox.dropped fact (unless it already became an
+ * intent). Caller holds the actor lock and no actor is live (sole journal writer).
+ */
+function dropPendingLocked(sessionId: string, ulid: string, reason: 'stopped' | 'policy'): void {
+  const item = listPending(sessionId).find((i) => i.ulid === ulid);
+  if (!item || item.kind !== 'message') return;
+  if (TurnLedger.from(readJournal(sessionId)).intentUlids.has(ulid)) return;
+  const j = JournalWriter.forSession(sessionId);
+  try {
+    j.append({ type: 'inbox.dropped', ulid, messageId: item.messageId, reason });
+  } finally {
+    j.close();
+  }
+  removeInboxItem(sessionId, ulid);
 }
 
 /**

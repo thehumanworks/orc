@@ -11,9 +11,12 @@ export type SystemPromptMode = 'append' | 'replace';
  * - `running`   — the session's actor holds a live lease.
  * - `suspended` — not live and not stopped, spawn.json present: resumable (an `orc send`
  *   or `orc resume` wakes it).
- * - `dead`      — stopped (killed / taken over), a legacy tmux record, or no spawn.json.
+ * - `spawning`  — reserved by agent()/`orc spawn` moments ago, kernel session not created
+ *   yet (no spawn.json, record younger than SPAWN_PENDING_GRACE_MS). Never pruned.
+ * - `dead`      — stopped (killed / taken over), a legacy tmux record, or no spawn.json
+ *   (past the spawn grace).
  */
-export type SessionStatus = 'running' | 'suspended' | 'dead';
+export type SessionStatus = 'running' | 'suspended' | 'spawning' | 'dead';
 
 /**
  * State of an agent session, derived from its durable journal (design §4.4). This is the
