@@ -204,7 +204,7 @@ and open modes are umask-filtered) and tightens older state on its next write
 - `bun test`: pure logic, the kernel against the scripted `fake` provider (crash, torn tail,
   stale-provider kill, two senders → one actor), provider mappers over captured CLI output,
   workflows, daemon routes/auth. The CLI suite shadows `tmux` on `PATH` and fails if it is called.
-- `bun run typecheck` covers `src`, `test` and `scripts/verify-runtime`.
+- `bun run typecheck` covers `src`, `test`, `scripts/verify-runtime` and `scripts/dogfood`.
 - Live gates, on an authenticated host: `bun run verify:live` (`scripts/verify-runtime/all.ts`) —
   per-provider runtime gates, CLI end-to-end including SIGKILL → suspended → wake and
   takeover/resume, a detached workflow, and "tmux never invoked".

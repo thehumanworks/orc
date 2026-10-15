@@ -360,7 +360,7 @@ delete a session's dir.
 
 ```sh
 bun test                                   # unit + fake-provider suites
-bun run typecheck                          # tsc --noEmit (src, test, scripts/verify-runtime)
+bun run typecheck                          # tsc --noEmit (src, test, scripts)
 bun run verify:live --claude-model haiku   # live end-to-end on an authenticated host
 ```
 
