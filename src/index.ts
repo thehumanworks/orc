@@ -10,6 +10,8 @@ import { removeSessionDir } from './session-files.ts';
 import { isSpawnPending, kernelLiveness, sessionStatusOf } from './session-status.ts';
 import type { LivenessProbe } from './session-status.ts';
 import { stop as kernelStop } from './runtime/client.ts';
+import { leaseLive, readActorState, withActorLock } from './runtime/actor-state.ts';
+import { readSpawnSpec } from './runtime/spec.ts';
 import type { SessionRecord, SessionStatus } from './types.ts';
 
 export { agent, validateOptions } from './agent.ts';
@@ -279,55 +281,75 @@ export async function listSessions(filter?: {
 }
 
 /**
- * Remove dead records (killed / taken over / legacy / no runtime state) and their session
- * dirs. Suspended (resumable) sessions are NEVER removed unless `suspended: true`, which
- * also stops them first. A young record whose spawn is still in progress is kept.
+ * Remove dead records (killed / legacy / no runtime state) and their session dirs.
+ * - Suspended (resumable) sessions are NEVER removed unless `suspended: true`, which also
+ *   stops them first.
+ * - Sessions TAKEN OVER by a human (`orc takeover`) are kept unless `takenOver: true`:
+ *   their dir holds the system prompt the printed provider resume command refers to.
+ * - A young record whose spawn is still in progress is kept.
+ * Each removal re-checks the session under its actor lock and deletes the record + dir
+ * while holding it, so a concurrent `orc resume` (reopen → wake, same lock) either wins
+ * (the session is kept) or finds nothing to revive — never an actor in a deleted dir.
  */
+/** Under the actor lock: may this session's dir go? (legacy / never created / stopped). */
+function kernelAllowsRemoval(rec: SessionRecord, suspendedToo: boolean): boolean {
+  if (rec.legacy) return true;
+  try {
+    if (!readSpawnSpec(rec.sessionId)) return true;
+    const st = readActorState(rec.sessionId);
+    if (leaseLive(st)) return false;
+    return st?.phase === 'stopped' || suspendedToo;
+  } catch {
+    return true; // invalid id / unreadable: nothing the kernel can run
+  }
+}
+
 export async function pruneSessions(opts?: {
   removeWorktree?: boolean;
   suspended?: boolean;
+  takenOver?: boolean;
   liveness?: LivenessProbe;
 }): Promise<string[]> {
   const probe = opts?.liveness ?? kernelLiveness;
-  const records = await readRegistry();
-  const observed = new Map<string, { sessionId: string; status: SessionStatus }>();
-  for (const r of records) {
+  const prunable = (r: SessionRecord): SessionStatus | undefined => {
     let status: SessionStatus;
     try {
       status = probe(r);
     } catch {
-      continue; // liveness unknowable → keep
+      return undefined; // liveness unknowable → keep
     }
-    if (status === 'running') continue;
-    if (status === 'suspended' && !opts?.suspended) continue;
-    if (status === 'dead' && isSpawnPending(r)) continue;
-    observed.set(r.id, { sessionId: r.sessionId, status });
-  }
-  if (observed.size === 0) return [];
-  // Suspended sessions selected by --suspended: make the stop sticky before removal so a
-  // concurrent sender cannot wake an actor into a deleted dir.
-  for (const r of records) {
-    const o = observed.get(r.id);
-    if (o?.status === 'suspended' && !r.legacy) {
-      await kernelStop(r.sessionId, { reason: 'prune', graceMs: 1_000 }).catch(() => {});
+    if (status === 'running' || status === 'spawning') return undefined;
+    if (status === 'suspended' && !opts?.suspended) return undefined;
+    if (status === 'dead' && isSpawnPending(r)) return undefined;
+    if (r.stoppedBy === 'takeover' && !opts?.takenOver) return undefined;
+    return status;
+  };
+  const candidates = (await readRegistry()).filter((r) => prunable(r) !== undefined);
+  const removed: SessionRecord[] = [];
+  for (const cand of candidates) {
+    // --suspended: make the stop sticky first so no sender can wake it meanwhile.
+    if (prunable(cand) === 'suspended' && !cand.legacy) {
+      await kernelStop(cand.sessionId, { reason: 'prune', graceMs: 1_000 }).catch(() => {});
     }
-  }
-  const removed = await updateRegistry((current) => {
-    const toRemove = new Set<string>();
-    for (const r of current) {
-      // Only the exact record that was judged (a replacement with the same id survives).
-      if (observed.get(r.id)?.sessionId === r.sessionId) toRemove.add(r.id);
-    }
-    return {
-      records: current.filter((r) => !toRemove.has(r.id)),
-      value: current.filter((r) => toRemove.has(r.id)),
-    };
-  });
-  for (const r of removed) {
-    // A legacy record's dir holds at most its old codex persona file: remove it too.
-    await removeSessionDir(r.sessionId);
-    if (opts?.removeWorktree && r.worktreePath) {
-      await removeWorktree(r.cwd, r.worktreePath, { branch: r.branch }).catch(() => {});
+    const gone = await withActorLock(cand.sessionId, async () => {
+      const current = await findRecord(cand.id);
+      // Only the exact record that was judged (a replacement with the same id survives),
+      // and only if it is STILL prunable now that no resume can interleave. The kernel is
+      // authoritative here: `orc resume` reopens under this lock BEFORE it clears the
+      // record's dead marker, so a session the kernel no longer calls stopped is kept.
+      if (!current || current.sessionId !== cand.sessionId || prunable(current) === undefined) return undefined;
+      if (!kernelAllowsRemoval(current, opts?.suspended === true)) return undefined;
+      const taken = await updateRegistry((records) => {
+        const hit = records.find((r) => r.id === cand.id && r.sessionId === cand.sessionId);
+        return { records: hit ? records.filter((r) => r !== hit) : records, value: hit };
+      });
+      if (taken) await removeSessionDir(taken.sessionId);
+      return taken;
+    });
+    if (!gone) continue;
+    removed.push(gone);
+    if (opts?.removeWorktree && gone.worktreePath) {
+      await removeWorktree(gone.cwd, gone.worktreePath, { branch: gone.branch }).catch(() => {});
     }
   }
   return removed.map((r) => r.id);

@@ -243,7 +243,8 @@ export class Session {
     if (this.legacy || !hasSpawnSpec(this.sessionId)) {
       return {
         id: this.id,
-        state: 'failed',
+        // A reservation whose kernel session is being created right now.
+        state: status === 'spawning' ? 'starting' : 'failed',
         status,
         stopped: this.record.status === 'dead',
         suspended: false,
@@ -608,6 +609,15 @@ export class Session {
   async resume(opts: { readyTimeoutMs?: number } = {}): Promise<SessionStateDetail> {
     this.assertControllable('be resumed');
     await reopen(this.sessionId, { reason: 'resume' });
+    // The kernel is resumable now: un-kill the record BEFORE waking, so a failed wake
+    // leaves a consistent `suspended` session (listed, not prunable) instead of a hidden
+    // `dead` record over a resumable kernel.
+    if (this.record.status === 'dead' || this.record.killedAt || this.record.stoppedBy) {
+      delete this.record.status;
+      delete this.record.killedAt;
+      delete this.record.stoppedBy;
+      await upsertRecord(this.record);
+    }
     const hook = wakePolicyHook(this.record);
     // An explicit resume is the "force" path: it clears the consecutive start-failure
     // counter that blocks automatic wake-on-send after repeated failed starts.
@@ -617,12 +627,6 @@ export class Session {
     }
     if (r.status === 'started' && 'sessionError' in r && r.sessionError) {
       throw new Error(`session ${this.id} failed to resume: ${String(r.sessionError)}`);
-    }
-    if (this.record.status === 'dead' || this.record.killedAt || this.record.stoppedBy) {
-      delete this.record.status;
-      delete this.record.killedAt;
-      delete this.record.stoppedBy;
-      await upsertRecord(this.record);
     }
     if (r.status === 'started') await this.awaitReady(opts.readyTimeoutMs ?? DEFAULT_READY_TIMEOUT_MS);
     return this.stateDetail();

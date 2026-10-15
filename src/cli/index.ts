@@ -652,6 +652,7 @@ async function cmdPrune(args: string[]): Promise<number> {
   const { values } = parse(args, {
     worktree: { type: 'boolean' },
     suspended: { type: 'boolean' },
+    'taken-over': { type: 'boolean' },
     json: { type: 'boolean' },
   });
   const json = jsonFlag(values);
@@ -660,6 +661,7 @@ async function cmdPrune(args: string[]): Promise<number> {
     removed = await pruneSessions({
       removeWorktree: values.worktree === true,
       suspended: values.suspended === true,
+      takenOver: values['taken-over'] === true,
     });
   } catch (e) {
     printError((e as Error).message, json);

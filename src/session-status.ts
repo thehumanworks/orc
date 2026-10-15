@@ -4,8 +4,9 @@
  *
  *   running    actor lease live
  *   suspended  not live, not stopped, spawn.json present → resumable
+ *   spawning   young reservation whose spawn.json is not written yet (spawn in progress)
  *   dead       stopped (kill/takeover), legacy tmux record, record marked dead, or no
- *              spawn.json
+ *              spawn.json (past the spawn grace)
  */
 import { readSpawnSpec } from './runtime/spec.ts';
 import { readActorState } from './runtime/actor-state.ts';
@@ -19,11 +20,11 @@ export type LivenessProbe = (rec: SessionRecord) => SessionStatus;
 export const SPAWN_PENDING_GRACE_MS = 600_000;
 
 export function sessionStatusOf(
-  rec: Pick<SessionRecord, 'sessionId' | 'status' | 'legacy'>,
+  rec: Pick<SessionRecord, 'sessionId' | 'status' | 'legacy'> & { createdAt?: string },
 ): SessionStatus {
   if (rec.legacy) return 'dead';
   try {
-    if (!readSpawnSpec(rec.sessionId)) return 'dead';
+    if (!readSpawnSpec(rec.sessionId)) return isSpawnPending(rec) ? 'spawning' : 'dead';
     const st = readActorState(rec.sessionId);
     if (leaseLive(st)) return 'running';
     if (rec.status === 'dead' || st?.phase === 'stopped') return 'dead';
@@ -41,10 +42,10 @@ export const kernelLiveness: LivenessProbe = (rec) => sessionStatusOf(rec);
  * progress). Counted against maxConcurrentSessions and never pruned while young.
  */
 export function isSpawnPending(
-  rec: Pick<SessionRecord, 'sessionId' | 'status' | 'legacy' | 'createdAt'>,
+  rec: Pick<SessionRecord, 'sessionId' | 'status' | 'legacy'> & { createdAt?: string },
   now: number = Date.now(),
 ): boolean {
-  if (rec.legacy || rec.status === 'dead') return false;
+  if (rec.legacy || rec.status === 'dead' || !rec.createdAt) return false;
   try {
     if (readSpawnSpec(rec.sessionId)) return false;
   } catch {
@@ -56,5 +57,8 @@ export function isSpawnPending(
 
 /** Sessions that hold (or are about to hold) a live actor: the concurrency budget. */
 export function countLiveSessions(records: SessionRecord[], probe: LivenessProbe = kernelLiveness): number {
-  return records.filter((r) => probe(r) === 'running' || isSpawnPending(r)).length;
+  return records.filter((r) => {
+    const s = probe(r);
+    return s === 'running' || s === 'spawning' || isSpawnPending(r);
+  }).length;
 }

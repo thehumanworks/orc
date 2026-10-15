@@ -9,11 +9,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { FAKE_PROVIDER_ENV, agent } from '../src/agent.ts';
 import { getSession, listSessions, pruneSessions } from '../src/index.ts';
-import { readRegistry } from '../src/registry.ts';
+import { readRegistry, upsertRecord } from '../src/registry.ts';
+import { acquireLock } from '../src/lock.ts';
+import { SPAWN_PENDING_GRACE_MS, kernelLiveness, sessionStatusOf } from '../src/session-status.ts';
+import type { LivenessProbe } from '../src/session-status.ts';
 import { readSpawnSpec } from '../src/runtime/spec.ts';
-import { readActorState, leaseLive } from '../src/runtime/actor-state.ts';
+import { ACTOR_LOCK_OPTIONS, readActorState, leaseLive, writeActorState } from '../src/runtime/actor-state.ts';
 import { sessionPaths } from '../src/runtime/layout.ts';
-import { deliveryVerdict } from '../src/runtime/client.ts';
+import { deliveryVerdict, stop } from '../src/runtime/client.ts';
 import type { Session } from '../src/session.ts';
 import { renderCapture } from '../src/journal-render.ts';
 import { actorPids, fakeProviderPids, killSessionProcesses, mkTmp, waitFor } from './runtime-helpers.ts';
@@ -228,6 +231,100 @@ describe('agent() + Session on the actor runtime', () => {
       expect(await pruneSessions({ suspended: true })).toContain(susp.id);
       expect(fs.existsSync(sessionPaths(susp.sessionId).dir)).toBe(false);
       expect(actorPids(susp.sessionId)).toEqual([]);
+    },
+    T,
+  );
+
+  test(
+    'prune keeps taken-over sessions (their dir backs the printed resume command) unless --taken-over',
+    async () => {
+      const s = await spawn({ provider: 'codex', systemPrompt: 'be terse' });
+      await s.takeover();
+      const promptFile = s.toJSON().systemPromptPath!;
+      expect(await pruneSessions()).not.toContain(s.id);
+      expect(fs.existsSync(promptFile)).toBe(true);
+      expect((await readRegistry()).some((r) => r.id === s.id)).toBe(true);
+      expect(await pruneSessions({ takenOver: true })).toContain(s.id);
+      expect(fs.existsSync(sessionPaths(s.sessionId).dir)).toBe(false);
+    },
+    T,
+  );
+
+  test(
+    'prune re-checks under the actor lock: a resume that reopened the session first keeps it',
+    async () => {
+      const s = await spawn();
+      await s.kill(); // dead: kernel stopped + record dead
+      let first = true;
+      const probe: LivenessProbe = (r) => {
+        if (r.id === s.id && first) {
+          first = false;
+          return 'dead'; // judged prunable before the resume lands
+        }
+        return kernelLiveness(r);
+      };
+      // A resume holds the actor lock and reopens (kernel stopped → suspended) while prune
+      // waits for that lock; the record's dead marker is cleared only afterwards.
+      const release = await acquireLock(`actor-${s.sessionId}`, ACTOR_LOCK_OPTIONS);
+      const pruning = pruneSessions({ liveness: probe });
+      const st = readActorState(s.sessionId)!;
+      writeActorState({ ...st, phase: 'suspended' });
+      await release();
+      expect(await pruning).not.toContain(s.id);
+      expect(fs.existsSync(sessionPaths(s.sessionId).dir)).toBe(true);
+      expect((await readRegistry()).some((r) => r.id === s.id)).toBe(true);
+      expect(first).toBe(false);
+      // Without a resume, a stopped session is pruned as usual.
+      await stop(s.sessionId);
+      expect(await pruneSessions()).toContain(s.id);
+    },
+    T,
+  );
+
+  test(
+    'a resume whose wake fails leaves a consistent suspended session (listed, not pruned)',
+    async () => {
+      const policy = { maxConcurrentSessions: 1 };
+      const a = await spawn({ rootRunId: 'root-resume-fail', policy });
+      await a.takeover();
+      const b = await spawn({ rootRunId: 'root-resume-fail', policy });
+      await expect((await getSession(a.id))!.resume()).rejects.toThrow(/maxConcurrentSessions=1/);
+      const rec = (await readRegistry()).find((r) => r.id === a.id)!;
+      expect(rec.status).toBeUndefined();
+      expect(rec.stoppedBy).toBeUndefined();
+      expect(await (await getSession(a.id))!.status()).toBe('suspended');
+      expect((await listSessions({ all: true })).some((x) => x.id === a.id)).toBe(true);
+      expect(await pruneSessions()).not.toContain(a.id);
+      await b.kill();
+      expect((await (await getSession(a.id))!.resume()).status).toBe('running');
+      await a.kill();
+    },
+    T,
+  );
+
+  test(
+    'a just-reserved record with no kernel session yet is `spawning`, never pruned',
+    async () => {
+      const sid = crypto.randomUUID();
+      await upsertRecord({
+        id: sid.slice(0, 8),
+        sessionId: sid,
+        provider: 'claude',
+        cwd,
+        workspace: cwd,
+        createdAt: new Date().toISOString(),
+      });
+      const rec = (await readRegistry()).find((r) => r.sessionId === sid)!;
+      expect(sessionStatusOf(rec)).toBe('spawning');
+      const listed = (await listSessions({ all: true })).find((x) => x.sessionId === sid)!;
+      expect(await listed.status()).toBe('spawning');
+      expect((await listed.stateDetail()).state).toBe('starting');
+      expect(await pruneSessions()).not.toContain(rec.id);
+      // Past the spawn grace it is dead (and prunable).
+      const old = { ...rec, createdAt: new Date(Date.now() - SPAWN_PENDING_GRACE_MS - 1_000).toISOString() };
+      expect(sessionStatusOf(old)).toBe('dead');
+      await upsertRecord(old);
+      expect(await pruneSessions()).toContain(rec.id);
     },
     T,
   );
