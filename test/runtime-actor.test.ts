@@ -29,9 +29,10 @@ import {
 } from '../src/runtime/actor-state.ts';
 import { readSpawnSpec } from '../src/runtime/spec.ts';
 import { sessionPaths } from '../src/runtime/layout.ts';
-import { isPidAlive } from '../src/runtime/process.ts';
+import { isPidAlive, selfArgv, spawnDetached } from '../src/runtime/process.ts';
 import type { FakeScript } from '../src/runtime/providers/fake.ts';
 import { LEASE_HEARTBEAT_MS } from '../src/runtime/types.ts';
+import type { ProcessIdentity } from '../src/runtime/types.ts';
 import {
   actorPid,
   actorPids,
@@ -63,11 +64,34 @@ afterAll(async () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-async function newSession(script: FakeScript = {}): Promise<string> {
+async function newSession(script: FakeScript = {}, opts: { startTimeoutMs?: number } = {}): Promise<string> {
   const spec = fakeSpec(mkTmp('orc-actor-cwd-'), script);
   sids.push(spec.sessionId);
-  await createSession(spec);
+  await createSession(spec, opts);
   return spec.sessionId;
+}
+
+/**
+ * The R1 crash window: the actor is SIGKILLed after spawning its provider but before the
+ * pid reached state.json (a provider handshake takes seconds). Reproduced exactly: wait
+ * for provider.spawned while the (simulated) handshake runs, kill the actor, and make sure
+ * state.json does not name the provider. Returns the orphan.
+ */
+async function orphanDuringHandshake(sid: string, nth = 1): Promise<ProcessIdentity> {
+  await waitFor(() => entries(sid, 'provider.spawned').length >= nth, `provider.spawned #${nth}`);
+  const spawned = entries(sid, 'provider.spawned')[nth - 1]!;
+  const orphan = { pid: spawned.pid, startTime: spawned.startTime };
+  process.kill(actorPid(sid), 'SIGKILL');
+  await waitFor(() => !leaseLive(readActorState(sid)), 'lease to die');
+  await withActorLock(sid, async () => {
+    const st = readActorState(sid)!;
+    delete st.provider;
+    writeActorState(st);
+  });
+  expect(entries(sid, 'provider.ready')).toHaveLength(nth - 1);
+  expect(isLiveProcess(orphan)).toBe(true);
+  expect(fakeProviderPids(sid)).toEqual([orphan.pid]);
+  return orphan;
 }
 
 /** SIGKILL only the actor (its provider lives in its own group) and wait until not live. */
@@ -291,6 +315,47 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
       expect(now[0]).not.toBe(oldProvider.pid);
       expect(now[0]).toBe(readActorState(sid)!.provider!.pid);
       expect(actorPids(sid)).toHaveLength(1);
+    },
+    T,
+  );
+
+  test(
+    'provider spawned but not yet recorded in state: ensureAwake and actor boot kill it first',
+    async () => {
+      const script: FakeScript = { ignoreStdinEofMs: 60_000, startDelayMs: 1_000 };
+      const sid = await newSession(script, { startTimeoutMs: 300 });
+      const orphan = await orphanDuringHandshake(sid);
+
+      // ensureAwake kills it under the lock before spawning the new actor.
+      expect((await ensureAwake(sid, { startTimeoutMs: 300 })).status).toBe('started');
+      expect(isLiveProcess(orphan)).toBe(false);
+      await waitFor(() => readActorState(sid)?.phase === 'running', 'running', 10_000);
+      expect(fakeProviderPids(sid)).toEqual([readActorState(sid)!.provider!.pid]);
+      expect(entries(sid, 'provider.spawned')).toHaveLength(2);
+
+      // Actor boot path: orphan the second provider (known only from the journal), then
+      // start an actor directly (no ensureAwake pre-kill).
+      const orphan2 = await orphanDuringHandshake(sid, 2);
+      const spec = readSpawnSpec(sid)!;
+      spawnDetached([...selfArgv(), '__actor', sid], { cwd: spec.cwd, env: process.env, logPath: sessionPaths(sid).actorLog });
+      await waitFor(() => entries(sid, 'provider.spawned').length === 3, 'boot provider.spawned');
+      expect(isLiveProcess(orphan2)).toBe(false);
+      await waitFor(() => readActorState(sid)?.phase === 'running', 'running again', 10_000);
+      expect(fakeProviderPids(sid)).toEqual([readActorState(sid)!.provider!.pid]);
+      expect(await stop(sid)).toEqual({ status: 'stopped' });
+      expect(fakeProviderPids(sid)).toEqual([]);
+    },
+    T,
+  );
+
+  test(
+    'stop() with no live actor kills a provider that never reached state.json',
+    async () => {
+      const sid = await newSession({ ignoreStdinEofMs: 60_000, startDelayMs: 1_000 }, { startTimeoutMs: 300 });
+      const orphan = await orphanDuringHandshake(sid);
+      expect(await stop(sid)).toEqual({ status: 'stopped' });
+      expect(isLiveProcess(orphan)).toBe(false);
+      expect(fakeProviderPids(sid)).toEqual([]);
     },
     T,
   );

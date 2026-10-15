@@ -15,7 +15,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { signalProcessGroup } from '../process.ts';
+import { processStartTime, signalProcessGroup } from '../process.ts';
 import type {
   ProviderEvent,
   ProviderLaunch,
@@ -60,6 +60,11 @@ export interface FakeRule extends FakeBehaviour {
 export interface FakeScript {
   /** Delay before `ready`. Default 0. */
   readyDelayMs?: number;
+  /**
+   * The factory's start() resolves this long AFTER spawning the child (simulates a
+   * provider handshake: the window between spawn and the runtime being returned).
+   */
+  startDelayMs?: number;
   /** Exit immediately at start with this code (provider fails to start). */
   exitAtStart?: number;
   /**
@@ -224,6 +229,9 @@ export const fakeRuntimeFactory: ProviderRuntimeFactory = {
         detached: true,
       },
     );
+    launch.onSpawn?.({ pid: proc.pid, startTime: processStartTime(proc.pid) });
+    // Simulated start handshake (claude/codex take seconds between spawn and ready).
+    if (script.startDelayMs) await Bun.sleep(script.startDelayMs);
     return new FakeRuntime(proc, launch.rawLogPath);
   },
 };

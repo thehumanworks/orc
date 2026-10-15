@@ -44,7 +44,7 @@ import {
   withActorLock,
   writeActorState,
 } from './actor-state.ts';
-import { TurnLedger } from './derive.ts';
+import { TurnLedger, staleProviders } from './derive.ts';
 import { getRuntimeFactory } from './providers/index.ts';
 import { ulidTime } from './ulid.ts';
 
@@ -267,21 +267,23 @@ class Actor {
   // Boot
   // -------------------------------------------------------------------------------
 
-  private append(ev: JournalEvent): JournalEntry {
+  private append(ev: JournalEvent, opts: { fsync?: boolean } = {}): JournalEntry {
     if (!this.journal) throw new Error('journal not open');
-    const e = this.journal.append(ev);
+    const e = this.journal.append(ev, opts);
     this.ledger.apply(e);
     return e;
   }
 
   private async boot(): Promise<void> {
-    // Never two writers: a provider left behind by a crashed actor dies first.
-    if (this.staleProvider && (await terminateGroup(this.staleProvider, 1_000))) {
-      this.log(`terminated stale provider group ${this.staleProvider.pid}`);
-    }
     ensureSessionDirs(this.sid);
     this.journal = JournalWriter.open(this.paths.journal);
     this.ledger = TurnLedger.from(readJournalFile(this.paths.journal));
+    // Never two writers: providers left behind by crashed actors die first — the one in
+    // state.json and any journaled provider.spawned that never exited (an actor killed
+    // during a provider handshake, before the pid reached state.json).
+    for (const id of staleProviders({ provider: this.staleProvider }, this.ledger)) {
+      if (await terminateGroup(id, 1_000)) this.log(`terminated stale provider group ${id.pid}`);
+    }
     for (const t of this.ledger.openTurns()) {
       // Brief decision 1: close it; delivery verdict is acknowledged iff turn.started exists.
       this.append({ type: 'turn.interrupted', messageId: t.messageId, reason: 'recovered' });
@@ -304,9 +306,10 @@ class Actor {
         resume,
         env: mergeEnv(process.env, this.spec.env),
         rawLogPath: this.paths.providerRaw,
+        onSpawn: (id) => this.onProviderSpawned(id),
       });
       this.rt = rt;
-      this.providerId = { pid: rt.pid, startTime: processStartTime(rt.pid) };
+      if (this.providerId?.pid !== rt.pid) this.providerId = { pid: rt.pid, startTime: processStartTime(rt.pid) };
       return rt;
     })();
     this.starting = started.catch(() => undefined);
@@ -322,6 +325,24 @@ class Actor {
       if (!this.ready) this.fatal(new Error(`provider not ready after ${readyMs}ms`));
     }, readyMs);
     this.startInboxLoop();
+  }
+
+  /**
+   * ProviderLaunch.onSpawn: runs synchronously right after the provider child exists. The
+   * pid is journaled (fsync) before the factory's handshake can take seconds, so an actor
+   * SIGKILLed in that window never leaves an unrecorded provider. Never throws.
+   */
+  private onProviderSpawned(id: ProcessIdentity): void {
+    this.providerId = id;
+    try {
+      this.append({ type: 'provider.spawned', pid: id.pid, startTime: id.startTime }, { fsync: true });
+    } catch (e) {
+      this.log(`could not journal provider.spawned ${id.pid}: ${errMsg(e)}`);
+    }
+    this.log(`provider spawned pid=${id.pid}`);
+    void this.persist((s) => {
+      s.provider = id;
+    });
   }
 
   // -------------------------------------------------------------------------------

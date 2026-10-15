@@ -7,6 +7,7 @@ import type {
   ActorPhase,
   ActorStateFile,
   JournalEntry,
+  ProcessIdentity,
   SpawnSpec,
   TurnInterruptReason,
 } from './types.ts';
@@ -54,6 +55,8 @@ export class TurnLedger {
   lastActorStopped?: { seq: number; at: string; reason: string; error?: string };
   providerSessionId?: string;
   transcriptPath?: string;
+  /** Every provider.spawned, in order; `exited` once a later provider.exited closed it. */
+  readonly spawnedProviders: Array<ProcessIdentity & { seq: number; exited: boolean }> = [];
 
   static from(entries: Iterable<JournalEntry>): TurnLedger {
     const l = new TurnLedger();
@@ -120,6 +123,20 @@ export class TurnLedger {
       case 'actor.stopped':
         this.lastActorStopped = { seq: e.seq, at: e.ts, reason: e.reason, ...(e.error ? { error: e.error } : {}) };
         break;
+      case 'provider.spawned':
+        this.spawnedProviders.push({ pid: e.pid, startTime: e.startTime, seq: e.seq, exited: false });
+        break;
+      case 'provider.exited': {
+        // One provider per actor: an exit closes the most recent still-open spawn.
+        for (let i = this.spawnedProviders.length - 1; i >= 0; i--) {
+          const p = this.spawnedProviders[i]!;
+          if (!p.exited) {
+            p.exited = true;
+            break;
+          }
+        }
+        break;
+      }
       case 'provider.ready':
         this.providerSessionId = e.providerSessionId;
         if (e.transcriptPath) this.transcriptPath = e.transcriptPath;
@@ -140,6 +157,11 @@ export class TurnLedger {
   get openTurn(): TurnRecord | undefined {
     const open = this.openTurns();
     return open[open.length - 1];
+  }
+
+  /** Spawned providers with no journaled exit (possibly orphaned by an actor crash). */
+  unexitedProviders(): ProcessIdentity[] {
+    return this.spawnedProviders.filter((p) => !p.exited).map(({ pid, startTime }) => ({ pid, startTime }));
   }
 
   /** A permission request newer than the last turn outcome and the last actor start. */
@@ -333,4 +355,23 @@ export function verdictFor(turn: TurnRecord | undefined, inInbox: boolean, live:
     }
   }
   return inInbox ? 'queued' : 'absent';
+}
+
+/**
+ * Provider processes that may still be running for a session with no live actor: the one
+ * recorded in state.json plus every journaled provider.spawned without a later
+ * provider.exited (an actor killed between spawn and recording it in state). Callers
+ * terminate each with terminateGroup, which re-checks pid + start time first.
+ */
+export function staleProviders(
+  state: Pick<ActorStateFile, 'provider'> | undefined,
+  ledger: TurnLedger,
+): ProcessIdentity[] {
+  const out: ProcessIdentity[] = [];
+  const add = (id: ProcessIdentity | undefined) => {
+    if (id && !out.some((o) => o.pid === id.pid && o.startTime === id.startTime)) out.push(id);
+  };
+  add(state?.provider);
+  for (const p of ledger.unexitedProviders()) add(p);
+  return out;
 }

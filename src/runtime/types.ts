@@ -74,6 +74,12 @@ export interface ProviderLaunch {
   env: Record<string, string>;
   /** Where the runtime must append verbatim provider protocol lines (debug stream). */
   rawLogPath: string;
+  /**
+   * Called by the factory synchronously, IMMEDIATELY after the child is spawned (before
+   * any handshake), so the kernel can record the pid before a long start can be cut by an
+   * actor crash. Must not throw.
+   */
+  onSpawn?: (id: ProcessIdentity) => void;
 }
 
 export interface TurnUsage {
@@ -186,6 +192,8 @@ export type JournalEvent =
   | { type: 'turn.failed'; messageId: string; error: string }
   | { type: 'turn.interrupted'; messageId: string; reason: TurnInterruptReason }
   | { type: 'permission.requested'; messageId?: string; detail: unknown }
+  /** Provider child spawned (journaled synchronously from ProviderLaunch.onSpawn, fsync'd). */
+  | { type: 'provider.spawned'; pid: number; startTime: string | null }
   | { type: 'provider.exited'; code: number | null; signal: string | null }
   | {
       type: 'actor.stopped';

@@ -27,7 +27,7 @@ import {
   withSessionLock,
   writeActorState,
 } from './actor-state.ts';
-import { TurnLedger, summarizeLedger, verdictFor } from './derive.ts';
+import { TurnLedger, staleProviders, summarizeLedger, verdictFor } from './derive.ts';
 import type { DeliveryVerdict, SessionView } from './derive.ts';
 
 export { readJournal, followJournal, JournalCursor } from './journal.ts';
@@ -106,6 +106,17 @@ function spawnActorLocked(sessionId: string, state: ActorStateFile): ProcessIden
   delete next.stopReason;
   writeActorState(next, { fsync: true });
   return actor;
+}
+
+/**
+ * Kill every provider that may outlive a dead actor (caller holds the actor lock and no
+ * actor is live): state.provider plus journaled provider.spawned with no provider.exited.
+ */
+async function terminateStaleProviders(sessionId: string, st: ActorStateFile): Promise<void> {
+  for (const id of staleProviders(st, TurnLedger.from(readJournal(sessionId)))) {
+    await terminateGroup(id, 1_000);
+  }
+  if (st.provider && !isLiveProcess(st.provider)) delete st.provider;
 }
 
 /** The launched actor died before journaling actor.started: release its lease. */
@@ -205,11 +216,9 @@ export async function ensureAwake(sessionId: string, opts: EnsureAwakeOptions = 
     await opts.beforeSpawn?.();
     // Alive but lease expired = wedged actor: it must not keep writing.
     if (st.lease && isLiveProcess(st.lease)) await terminateGroup(st.lease, 1_000);
-    // Orphaned provider from a crashed actor: kill before a new one can start.
-    if (st.provider) {
-      await terminateGroup(st.provider, 1_000);
-      if (!isLiveProcess(st.provider)) delete st.provider;
-    }
+    // Orphaned providers from crashed actors (state.json + unexited provider.spawned):
+    // kill before a new one can start.
+    await terminateStaleProviders(sessionId, st);
     return { status: 'started', actor: spawnActorLocked(sessionId, st) };
   });
   if (r.status === 'started') {
@@ -418,7 +427,7 @@ export async function stop(
       // Someone woke it meanwhile: ask it to stop first (once).
       if (leaseLive(cur) && !asked) return 'retry';
       if (cur.lease && isLiveProcess(cur.lease)) await terminateGroup(cur.lease, 1_000);
-      if (cur.provider) await terminateGroup(cur.provider, 1_000);
+      await terminateStaleProviders(sessionId, cur);
       // No live actor and we hold the lock: we are the only journal writer.
       const j = JournalWriter.forSession(sessionId);
       try {
