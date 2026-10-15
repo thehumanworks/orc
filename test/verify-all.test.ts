@@ -161,6 +161,27 @@ describe('verify-runtime/all.ts', () => {
     90_000,
   );
 
+  test(
+    'a reply is only read from the provider transcript: the journal fallback is a FAIL',
+    async () => {
+      // The fake claude echoes the prompt (so the word IS in the journal) but writes no
+      // transcript: the read check must fail rather than match the prompt text.
+      const results = path.join(tmp, 'fallback.json');
+      const r = await run(
+        ['--providers', 'claude', '--claude-bin', FAKE_CLAUDE, '--no-runtime-gates', '--no-workflow', '--results', results],
+        offlineEnv(),
+      );
+      expect(r.code).toBe(1);
+      const j = JSON.parse(fs.readFileSync(results, 'utf8'));
+      const row = j.checks.find((x: { check: string }) => x.check === 'e2e read → assistant reply word');
+      expect(row.status).toBe('FAIL');
+      expect(row.detail).toMatch(/no provider transcript/);
+      const leak = j.checks.find((x: { check: string }) => x.check === 'e2e no orc/provider processes left');
+      expect(leak.status).toBe('PASS');
+    },
+    90_000,
+  );
+
   test('rejects unknown arguments and providers', async () => {
     const env = offlineEnv();
     expect((await run(['--bogus'], env)).code).toBe(2);

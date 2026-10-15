@@ -388,18 +388,39 @@ async function waitDone(ctx: Ctx, id: string): Promise<string> {
   return `done in ${(w.elapsedMs / 1000).toFixed(1)}s`;
 }
 
-async function readContains(ctx: Ctx, id: string, word: string): Promise<string> {
-  const r = await orc(ctx, ['read', id, '--json']);
-  check(r.code === 0, `read exited ${r.code}: ${r.err}`);
-  check(r.out.toUpperCase().includes(word.toUpperCase()), `read does not contain ${word}: ${clip(r.out, 100)}`);
-  let parsed: unknown = null;
-  try {
-    parsed = JSON.parse(r.out);
-  } catch {
-    /* fine */
+/**
+ * The latest parsed turn (`orc read --json`) must hold an ASSISTANT reply containing
+ * `word`. The prompt itself contains the word, so only assistant text counts, and the
+ * journal fallback (`{fallback: true}` — no provider transcript on disk) is a failure.
+ * Retries briefly: a provider may flush its transcript just after the turn's result.
+ */
+async function replyContains(ctx: Ctx, id: string, word: string): Promise<string> {
+  let last = '';
+  const deadline = Date.now() + 10_000;
+  while (true) {
+    const r = await orc(ctx, ['read', id, '--json']);
+    check(r.code === 0, `read exited ${r.code}: ${r.err}`);
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(r.out);
+    } catch {
+      throw new Error(`read --json is not JSON: ${clip(r.out, 100)}`);
+    }
+    if (Array.isArray(parsed)) {
+      const reply = parsed
+        .filter((t: { role?: string }) => t?.role === 'assistant')
+        .map((t: { text?: string }) => String(t?.text ?? ''))
+        .join('\n');
+      if (reply.toUpperCase().includes(word.toUpperCase())) return `assistant: "${clip(reply, 60)}"`;
+      last = reply ? `assistant reply lacks ${word}: "${clip(reply, 80)}"` : 'no assistant turn in the latest read';
+    } else {
+      last = (parsed as { fallback?: boolean })?.fallback
+        ? 'no provider transcript on disk (read fell back to the journal)'
+        : `unexpected read shape: ${clip(r.out, 80)}`;
+    }
+    if (Date.now() >= deadline) throw new Error(last);
+    await Bun.sleep(500);
   }
-  const fallback = !!parsed && typeof parsed === 'object' && !Array.isArray(parsed) && (parsed as { fallback?: boolean }).fallback;
-  return `contains ${word}${fallback ? ' (journal fallback: no transcript)' : ''}`;
 }
 
 function mkRepo(dir: string, env: Record<string, string>): void {
@@ -447,7 +468,7 @@ async function cliE2E(p: Provider, ctx: Ctx, model: string | undefined): Promise
       notePids();
       return `${id} ${await waitDone(ctx, id)}`;
     });
-    await s.step('e2e read → reply word', () => readContains(ctx, id, 'MANGO'));
+    await s.step('e2e read → assistant reply word', () => replyContains(ctx, id, 'MANGO'));
     await s.step('e2e send --idempotency-key k2 (+ replay)', async () => {
       const prompt = 'Do not use any tools. Reply with exactly one word: KIWI';
       const a = await orcJson<{ phase: string; replayed: boolean }>(ctx, ['send', id, prompt, '--idempotency-key', 'k2']);
@@ -456,8 +477,7 @@ async function cliE2E(p: Provider, ctx: Ctx, model: string | undefined): Promise
       const b = await orcJson<{ phase: string; replayed: boolean }>(ctx, ['send', id, prompt, '--idempotency-key', 'k2']);
       check(b.replayed === true, 'replay not reported as replayed');
       await waitDone(ctx, id);
-      await readContains(ctx, id, 'KIWI');
-      return `phase ${a.phase}; replay → replayed:true; reply KIWI`;
+      return `phase ${a.phase}; replay → replayed:true; ${await replyContains(ctx, id, 'KIWI')}`;
     });
     let oldProvider: ProcessIdentity | undefined;
     await s.step('e2e SIGKILL actor → list shows suspended', async () => {
@@ -485,7 +505,7 @@ async function cliE2E(p: Provider, ctx: Ctx, model: string | undefined): Promise
       ]);
       check(r.phase === 'acknowledged' || r.phase === 'queued', `phase ${r.phase}`);
       await waitDone(ctx, id);
-      return `woke (${r.phase}); ${await readContains(ctx, id, CODEWORD)}`;
+      return `woke (${r.phase}); ${await replyContains(ctx, id, CODEWORD)}`;
     });
     await s.step('e2e exactly one provider process for the session', async () => {
       const st = notePids();
@@ -515,7 +535,7 @@ async function cliE2E(p: Provider, ctx: Ctx, model: string | undefined): Promise
       const r = await orcJson<{ phase: string }>(ctx, ['send', id, 'Do not use any tools. Reply with exactly one word: LEMON']);
       check(r.phase === 'acknowledged' || r.phase === 'queued', `phase ${r.phase}`);
       await waitDone(ctx, id);
-      return `running; ${await readContains(ctx, id, 'LEMON')}`;
+      return `running; ${await replyContains(ctx, id, 'LEMON')}`;
     });
     await s.step('e2e kill → prune', async () => {
       notePids();
