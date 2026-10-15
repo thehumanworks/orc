@@ -227,7 +227,14 @@ export class OrcChatGPTStore implements CredentialStore {
     await withLock(
       'auth-chatgpt',
       async () => {
-        const data = this.load();
+        let data: Record<string, unknown>;
+        try {
+          data = this.load();
+        } catch {
+          // Corrupt/unreadable: it only ever holds orc's credentials, so logging out removes it.
+          fs.rmSync(this.path, { force: true });
+          return;
+        }
         if (!(providerId in data)) return;
         delete data[providerId];
         this.save(data);

@@ -1456,7 +1456,7 @@ async function cmdLogin(args: string[]): Promise<number> {
     const s = await login.loginStatus();
     if (json) printJson(s);
     else process.stdout.write(`${login.renderLoginStatus(s)}\n`);
-    return 0;
+    return s.active === 'error' ? 1 : 0;
   }
   if (what === 'chatgpt') {
     return login.loginChatGPT({ importPi: values['import-pi'] === true, noBrowser: values['no-browser'] === true });

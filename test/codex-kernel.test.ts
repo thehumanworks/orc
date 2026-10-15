@@ -316,6 +316,33 @@ describe('orc CLI with --provider codex', () => {
     T,
   );
 
+  test('a corrupt chatgpt.json is reported by `orc login status` (exit 1), not hidden as "none"; logout clears it', async () => {
+    const home = fs.mkdtempSync(path.join(root, 'corrupt-'));
+    const file = path.join(home, 'orc', 'auth', 'chatgpt.json');
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, '{"openai": {"type": "oauth", ', { mode: 0o600 });
+    const env = { ...cliEnv(), ORC_HOME: path.join(home, 'orc') };
+    const run = async (args: string[]) => {
+      const p = Bun.spawn([process.execPath, cliEntryPath(), ...args], { cwd: root, env, stdout: 'pipe', stderr: 'pipe' });
+      const [o, e] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text()]);
+      return { code: await p.exited, out: o + e };
+    };
+    const human = await run(['login', 'status']);
+    expect(human.code).toBe(1);
+    expect(human.out).toContain(`invalid JSON in ${file}`);
+    expect(human.out).not.toContain('none configured');
+    const json = await run(['login', 'status', '--json']);
+    const st = JSON.parse(json.out);
+    expect(st.active).toBe('error');
+    expect(st.error).toContain('invalid JSON');
+    expect(st.orc).toMatchObject({ credential: 'unreadable' });
+    expect((await run(['logout', 'chatgpt'])).code).toBe(0);
+    expect(fs.existsSync(file)).toBe(false);
+    const after = await run(['login', 'status', '--json']);
+    expect(after.code).toBe(0);
+    expect(JSON.parse(after.out).active).not.toBe('error');
+  });
+
   test('login status / logout never print secrets', async () => {
     const s = await orc(['login', 'status', '--json']);
     expect(s.code).toBe(0);

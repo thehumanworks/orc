@@ -18,6 +18,7 @@ import { createModels, type AuthEvent, type AuthInteraction, type AuthPrompt, ty
 import { openaiProvider } from '@earendil-works/pi-ai/providers/openai';
 import { registerBunOAuthFlows } from '@earendil-works/pi-ai/bun-oauth';
 import {
+  CodexAuthError,
   OPENAI_PROVIDER_ID,
   OrcChatGPTStore,
   PiAuthFileStore,
@@ -173,28 +174,44 @@ export async function loginChatGPT(opts: LoginOptions = {}): Promise<number> {
 }
 
 export interface LoginStatus {
-  /** What the codex harness would use now. */
-  active: 'orc' | 'pi' | 'env' | 'none';
-  orc: { path: string; credential: string };
-  pi: { path: string; credential: string };
+  /** What the codex harness would use now; `error` when a credential file cannot be read. */
+  active: 'orc' | 'pi' | 'env' | 'none' | 'error';
+  /** Why resolution failed (a corrupt/unreadable credential file), when `active` is `error`. */
+  error?: string;
+  orc: { path: string; credential: string; error?: string };
+  pi: { path: string; credential: string; error?: string };
   openaiApiKey: boolean;
 }
 
 /** Non-secret summary of every credential source, in resolution order. */
 export async function loginStatus(env: Record<string, string | undefined> = process.env): Promise<LoginStatus> {
   const store = codexCredentialStore(env);
-  const orcCred: Credential | undefined = await store.orc.read(OPENAI_PROVIDER_ID).catch(() => undefined);
-  const piCred: Credential | undefined = await store.pi?.read(OPENAI_PROVIDER_ID).catch(() => undefined);
+  const readSafe = async (r: () => Promise<Credential | undefined>) => {
+    try {
+      return { cred: await r() };
+    } catch (e) {
+      return { error: (e as Error).message };
+    }
+  };
+  const orcRead = await readSafe(() => store.orc.read(OPENAI_PROVIDER_ID));
+  const piRead = await readSafe(async () => store.pi?.read(OPENAI_PROVIDER_ID));
+  const describe = (r: { cred?: Credential; error?: string }) => (r.error ? 'unreadable' : describeOAuth(r.cred));
   let active: LoginStatus['active'] = 'none';
+  let error: string | undefined;
   try {
     active = (await resolveCodexAuth(env)).source;
-  } catch {
-    active = 'none';
+  } catch (e) {
+    // "No credential" is `none`; anything else (a corrupt file) must be shown, not hidden.
+    if (!(e instanceof CodexAuthError)) {
+      active = 'error';
+      error = (e as Error).message;
+    }
   }
   return {
     active,
-    orc: { path: orcChatGPTAuthPath(), credential: describeOAuth(orcCred) },
-    pi: { path: piAuthPath(env), credential: describeOAuth(piCred) },
+    ...(error ? { error } : {}),
+    orc: { path: orcChatGPTAuthPath(), credential: describe(orcRead), ...(orcRead.error ? { error: orcRead.error } : {}) },
+    pi: { path: piAuthPath(env), credential: describe(piRead), ...(piRead.error ? { error: piRead.error } : {}) },
     openaiApiKey: !!env.OPENAI_API_KEY,
   };
 }
@@ -206,7 +223,13 @@ export function renderLoginStatus(s: LoginStatus): string {
     `${mark('orc')} 1. orc login     ${s.orc.credential}  [${s.orc.path}]`,
     `${mark('pi')} 2. pi login      ${s.pi.credential}  [${s.pi.path}]`,
     `${mark('env')} 3. OPENAI_API_KEY ${s.openaiApiKey ? 'set' : 'not set'}`,
-    s.active === 'none' ? 'none configured: run `orc login chatgpt` or set OPENAI_API_KEY' : `active: ${s.active}`,
+    ...(s.orc.error ? [`orc credential file error: ${s.orc.error}`] : []),
+    ...(s.pi.error ? [`pi credential file error: ${s.pi.error}`] : []),
+    s.active === 'error'
+      ? `error: ${s.error} — fix or remove the file (\`orc logout chatgpt\` removes orc's), then \`orc login chatgpt\``
+      : s.active === 'none'
+        ? 'none configured: run `orc login chatgpt` or set OPENAI_API_KEY'
+        : `active: ${s.active}`,
   ].join('\n');
 }
 
