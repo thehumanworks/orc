@@ -4,11 +4,15 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   cliEntryPath,
+  isLiveProcess,
   isPidAlive,
   isSameProcessAlive,
+  isZombie,
+  probeProcess,
   processStartTime,
   selfArgv,
   spawnDetached,
+  terminateGroup,
   terminateProcessGroup,
 } from '../src/runtime/process.ts';
 
@@ -71,4 +75,38 @@ describe('runtime/process', () => {
     expect(await waitFor(() => !isPidAlive(id.pid) || !isSameProcessAlive(id))).toBe(true);
     expect(await terminateProcessGroup(id, 100)).toBe(false);
   });
+
+  test('liveness is zombie-aware: an unreaped child is dead for isPidAlive/isSameProcessAlive', async () => {
+    // `sleep 10` (exec'd shell) never reaps its finished `sleep 0.05` child → zombie.
+    const proc = Bun.spawn(['sh', '-c', 'sleep 0.05 & echo $!; exec sleep 10'], { stdout: 'pipe' });
+    const { value } = await proc.stdout.getReader().read();
+    const zpid = Number(new TextDecoder().decode(value).trim());
+    try {
+      const id = { pid: zpid, startTime: processStartTime(zpid) };
+      expect(await waitFor(() => isZombie(zpid), 3_000)).toBe(true);
+      expect(probeProcess(zpid)?.state?.startsWith('Z')).toBe(true);
+      expect(isPidAlive(zpid)).toBe(false);
+      expect(isSameProcessAlive(id)).toBe(false);
+      expect(isLiveProcess(id)).toBe(false);
+      expect(await terminateGroup(id, 100)).toBe(false);
+      const parent = { pid: proc.pid, startTime: processStartTime(proc.pid) };
+      expect(isPidAlive(proc.pid)).toBe(true);
+      expect(isSameProcessAlive(parent)).toBe(true);
+      expect(probeProcess(proc.pid)?.startTime).toBe(parent.startTime);
+    } finally {
+      proc.kill('SIGKILL');
+      await proc.exited;
+    }
+  }, 5_000);
+
+  test('terminateGroup falls back to the pid when it is not a group leader (ESRCH)', async () => {
+    // Not detached: the child shares OUR process group, so -pid names no group.
+    const proc = Bun.spawn(['sleep', '30'], { stdout: 'ignore', stderr: 'ignore' });
+    const id = { pid: proc.pid, startTime: processStartTime(proc.pid) };
+    expect(isLiveProcess(id)).toBe(true);
+    expect(await terminateGroup(id, 1_000)).toBe(true);
+    await proc.exited;
+    expect(proc.signalCode).toBe('SIGTERM');
+    expect(isLiveProcess(id)).toBe(false);
+  }, 5_000);
 });
