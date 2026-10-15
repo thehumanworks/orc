@@ -34,8 +34,15 @@ import type { SessionPaths } from './layout.ts';
 import { assertValidSessionId } from './fsutil.ts';
 import { readSpawnSpec, writeSpawnSpec } from './spec.ts';
 import { JournalWriter, readJournalFile } from './journal.ts';
-import { listPendingDetailed, quarantineInboxItem, removeInboxItem } from './inbox.ts';
 import {
+  listPending,
+  listPendingDetailed,
+  quarantineInboxItem,
+  removeInboxItem,
+  sweepStaleInboxTmp,
+} from './inbox.ts';
+import {
+  DEFAULT_STOP_GRACE_MS,
   initialActorState,
   isLiveProcess,
   leaseLive,
@@ -44,14 +51,14 @@ import {
   withActorLock,
   writeActorState,
 } from './actor-state.ts';
-import { TurnLedger } from './derive.ts';
+import { TurnLedger, staleProviders } from './derive.ts';
 import { getRuntimeFactory } from './providers/index.ts';
 import { ulidTime } from './ulid.ts';
 
 /** Provider must emit `ready` within this long (override: ORC_ACTOR_READY_TIMEOUT_MS). */
 const DEFAULT_READY_TIMEOUT_MS = 120_000;
-/** Provider close grace for stop/suspend when the stop item does not say. */
-export const DEFAULT_STOP_GRACE_MS = 5_000;
+/** Upper bound on waiting for an interrupted turn's outcome before closing the provider. */
+const INTERRUPT_BEFORE_CLOSE_MAX_MS = 2_000;
 
 class LeaseLostError extends Error {
   constructor(sessionId: string) {
@@ -135,6 +142,17 @@ class Actor {
   private processing = false;
   private rekick = false;
   private lastRenewedAt = Date.now();
+  private beating = false;
+  private leaseLost = false;
+  /**
+   * What state.json should say, kept in memory and re-applied on EVERY write, so a failed
+   * write (lock timeout, I/O error) is repaired by the next heartbeat instead of leaving
+   * e.g. `starting` behind forever.
+   */
+  private phase: ActorStateFile['phase'] = 'starting';
+  private providerSessionId?: string;
+  private startFailures = 0;
+  private lastStartError?: string;
   private readonly handlers: Array<[string, (...args: unknown[]) => void]> = [];
 
   constructor(private readonly sid: string) {
@@ -199,6 +217,8 @@ class Actor {
       this.interruptCutoffMs = Number.isFinite(launchedAt) ? Math.min(launchedAt, Date.now()) : Date.now();
       if (st.provider) this.staleProvider = st.provider;
       this.stateCompletedTurns = st.completedTurns;
+      this.startFailures = st.startFailures ?? 0;
+      this.lastStartError = st.lastStartError;
       st.lease = {
         pid: this.pid,
         startTime: this.startTime,
@@ -223,6 +243,16 @@ class Actor {
       const s = readActorState(this.sid);
       if (!s || s.lease?.token !== this.token) throw new LeaseLostError(this.sid);
       s.lease.expiresAt = new Date(Date.now() + LEASE_TTL_MS).toISOString();
+      s.phase = this.phase;
+      if (this.providerSessionId) s.providerSessionId = this.providerSessionId;
+      if (this.providerId) s.provider = this.providerId;
+      if (this.startFailures > 0) {
+        s.startFailures = this.startFailures;
+        if (this.lastStartError) s.lastStartError = this.lastStartError;
+      } else {
+        delete s.startFailures;
+        delete s.lastStartError;
+      }
       mut(s);
       if (this.journal) s.lastSeq = Math.max(s.lastSeq, this.journal.lastSeq);
       s.completedTurns = Math.max(s.completedTurns, this.completedTurns());
@@ -232,12 +262,22 @@ class Actor {
     });
   }
 
-  /** Heartbeat: renew the lease; if renewals kept failing past the TTL, assume it is lost. */
+  /**
+   * Heartbeat: renew the lease (re-applying the intended state); if renewals kept failing
+   * past the TTL, assume it is lost. At most one beat in flight (a slow lock must not pile
+   * up writers).
+   */
   private async beat(): Promise<void> {
-    await this.persist();
-    if (!this.shuttingDown && Date.now() - this.lastRenewedAt > LEASE_TTL_MS) {
-      this.log(`lease not renewed for ${LEASE_TTL_MS}ms`);
-      this.onLeaseLost();
+    if (this.beating) return;
+    this.beating = true;
+    try {
+      await this.persist();
+      if (!this.shuttingDown && Date.now() - this.lastRenewedAt > LEASE_TTL_MS) {
+        this.log(`lease not renewed for ${LEASE_TTL_MS}ms`);
+        this.onLeaseLost();
+      }
+    } finally {
+      this.beating = false;
     }
   }
 
@@ -252,6 +292,7 @@ class Actor {
   }
 
   private onLeaseLost(): void {
+    this.leaseLost = true;
     this.log('lease lost to another actor; stopping provider and exiting');
     void this.shutdown({
       phase: 'suspended',
@@ -267,21 +308,30 @@ class Actor {
   // Boot
   // -------------------------------------------------------------------------------
 
-  private append(ev: JournalEvent): JournalEntry {
+  private append(ev: JournalEvent, opts: { fsync?: boolean } = {}): JournalEntry | undefined {
+    if (this.leaseLost) {
+      // The journal belongs to the lease holder now.
+      this.log(`lease lost: not journaling ${ev.type}`);
+      return undefined;
+    }
     if (!this.journal) throw new Error('journal not open');
-    const e = this.journal.append(ev);
+    const e = this.journal.append(ev, opts);
     this.ledger.apply(e);
     return e;
   }
 
   private async boot(): Promise<void> {
-    // Never two writers: a provider left behind by a crashed actor dies first.
-    if (this.staleProvider && (await terminateGroup(this.staleProvider, 1_000))) {
-      this.log(`terminated stale provider group ${this.staleProvider.pid}`);
-    }
     ensureSessionDirs(this.sid);
+    const swept = sweepStaleInboxTmp(this.sid);
+    if (swept > 0) this.log(`swept ${swept} stale inbox temp file(s)`);
     this.journal = JournalWriter.open(this.paths.journal);
     this.ledger = TurnLedger.from(readJournalFile(this.paths.journal));
+    // Never two writers: providers left behind by crashed actors die first — the one in
+    // state.json and any journaled provider.spawned that never exited (an actor killed
+    // during a provider handshake, before the pid reached state.json).
+    for (const id of staleProviders({ provider: this.staleProvider }, this.ledger)) {
+      if (await terminateGroup(id, 1_000)) this.log(`terminated stale provider group ${id.pid}`);
+    }
     for (const t of this.ledger.openTurns()) {
       // Brief decision 1: close it; delivery verdict is acknowledged iff turn.started exists.
       this.append({ type: 'turn.interrupted', messageId: t.messageId, reason: 'recovered' });
@@ -304,17 +354,16 @@ class Actor {
         resume,
         env: mergeEnv(process.env, this.spec.env),
         rawLogPath: this.paths.providerRaw,
+        onSpawn: (id) => this.onProviderSpawned(id),
       });
       this.rt = rt;
-      this.providerId = { pid: rt.pid, startTime: processStartTime(rt.pid) };
+      if (this.providerId?.pid !== rt.pid) this.providerId = { pid: rt.pid, startTime: processStartTime(rt.pid) };
       return rt;
     })();
     this.starting = started.catch(() => undefined);
     const rt = await started;
     this.log(`provider ${this.spec.provider} started pid=${rt.pid} mode=${resume ? 'resume' : 'fresh'}`);
-    await this.updateState((s) => {
-      if (this.providerId) s.provider = this.providerId;
-    });
+    await this.updateState(() => {});
     if (this.shuttingDown) return;
     this.pumpDone = this.pump(rt);
     const readyMs = readyTimeoutMs();
@@ -322,6 +371,22 @@ class Actor {
       if (!this.ready) this.fatal(new Error(`provider not ready after ${readyMs}ms`));
     }, readyMs);
     this.startInboxLoop();
+  }
+
+  /**
+   * ProviderLaunch.onSpawn: runs synchronously right after the provider child exists. The
+   * pid is journaled (fsync) before the factory's handshake can take seconds, so an actor
+   * SIGKILLed in that window never leaves an unrecorded provider. Never throws.
+   */
+  private onProviderSpawned(id: ProcessIdentity): void {
+    this.providerId = id;
+    try {
+      this.append({ type: 'provider.spawned', pid: id.pid, startTime: id.startTime }, { fsync: true });
+    } catch (e) {
+      this.log(`could not journal provider.spawned ${id.pid}: ${errMsg(e)}`);
+    }
+    this.log(`provider spawned pid=${id.pid}`);
+    void this.persist();
   }
 
   // -------------------------------------------------------------------------------
@@ -369,11 +434,12 @@ class Actor {
           };
           writeSpawnSpec(this.spec);
         }
+        this.providerSessionId = ev.providerSessionId;
+        this.startFailures = 0;
+        this.lastStartError = undefined;
         if (!this.shuttingDown) {
-          await this.persist((s) => {
-            s.phase = 'running';
-            s.providerSessionId = ev.providerSessionId;
-          });
+          this.phase = 'running';
+          await this.persist();
         }
         this.kick();
         return;
@@ -421,6 +487,7 @@ class Actor {
           void this.shutdown({
             phase: 'suspended',
             reason: 'provider-exit',
+            error: `provider exited${this.ready ? '' : ' before ready'} (code=${ev.code} signal=${ev.signal})`,
             stopReason: `provider-exit (code=${ev.code} signal=${ev.signal})`,
             turnReason: 'provider-exit',
             code: 0,
@@ -587,9 +654,28 @@ class Actor {
       reason: 'error',
       error: errMsg(e),
       stopReason: `error: ${errMsg(e)}`,
-      turnReason: 'provider-exit',
+      // The provider is still alive unless it already exited: the turn is cut by us.
+      turnReason: this.providerExited ? 'provider-exit' : 'interrupt',
       code: 1,
     });
+  }
+
+  /**
+   * Graceful turn end before the provider is closed: journal interrupt.requested, ask the
+   * provider to interrupt, and wait (bounded) for it to report the outcome itself.
+   */
+  private async interruptOpenTurn(maxWaitMs: number): Promise<void> {
+    const t = this.openTurn;
+    if (!t || !this.rt || this.providerExited || !this.journal || this.journal.closed) return;
+    try {
+      this.append({ type: 'interrupt.requested', messageId: t.messageId });
+      await withTimeout(this.rt.interrupt(), maxWaitMs);
+    } catch (e) {
+      this.log(`interrupt before close failed: ${errMsg(e)}`);
+    }
+    const deadline = Date.now() + maxWaitMs;
+    while (this.openTurn === t && !this.providerExited && Date.now() < deadline) await Bun.sleep(20);
+    if (this.openTurn === t) this.log(`turn ${t.messageId} still open after interrupt; closing provider`);
   }
 
   private shutdown(o: ShutdownOptions): Promise<void> {
@@ -614,11 +700,11 @@ class Actor {
     const graceMs = o.graceMs ?? DEFAULT_STOP_GRACE_MS;
     try {
       if (owns && o.phase === 'stopped') {
-        await this.persist((s) => {
-          s.phase = 'stopping';
-        });
+        this.phase = 'stopping';
+        await this.persist();
       }
       if (this.starting) await withTimeout(this.starting, graceMs + 10_000);
+      if (owns) await this.interruptOpenTurn(Math.min(graceMs, INTERRUPT_BEFORE_CLOSE_MAX_MS));
       if (this.rt && !this.providerExited) {
         await withTimeout(
           this.rt.close({ graceMs }).catch((e) => this.log(`provider close failed: ${errMsg(e)}`)),
@@ -638,14 +724,24 @@ class Actor {
         /* group gone */
       }
     }
-    if (this.journal && !this.journal.closed) {
+    if (!owns) {
+      // Another actor owns the session (and its journal) now: never write to it.
+      this.log(`not journaling actor.stopped{${o.reason}}: lease lost`);
+    } else if (this.journal && !this.journal.closed) {
       try {
-        if (!owns) this.journal.resync();
         const t = this.openTurn;
-        if (owns && t) {
+        if (t) {
           this.openTurn = undefined;
           this.append({ type: 'turn.interrupted', messageId: t.messageId, reason: o.turnReason });
           removeInboxItem(this.sid, t.ulid);
+        }
+        // Sticky stop: queued messages will never be delivered — drop them as a fact.
+        if (o.phase === 'stopped') {
+          for (const item of listPending(this.sid)) {
+            if (item.kind !== 'message' || this.ledger.intentUlids.has(item.ulid)) continue;
+            this.append({ type: 'inbox.dropped', ulid: item.ulid, messageId: item.messageId, reason: 'stopped' });
+            removeInboxItem(this.sid, item.ulid);
+          }
         }
         this.append({ type: 'actor.stopped', reason: o.reason, ...(o.error ? { error: o.error } : {}) });
       } catch (e) {
@@ -658,9 +754,14 @@ class Actor {
     clearInterval(this.heartbeat);
     if (owns) {
       const providerGone = !this.providerId || !isLiveProcess(this.providerId);
+      this.phase = o.phase;
+      if (!this.ready && (o.reason === 'error' || o.reason === 'provider-exit')) {
+        // A start that never reached `ready` (e.g. a resume the provider rejects).
+        this.startFailures += 1;
+        this.lastStartError = o.error ?? o.stopReason;
+      }
       await this.persist(
         (s) => {
-          s.phase = o.phase;
           s.stopReason = o.stopReason;
           delete s.lease;
           if (providerGone) delete s.provider;

@@ -8,6 +8,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
+  SessionStartError,
   SessionStoppedError,
   createSession,
   deliveryVerdict,
@@ -27,11 +28,12 @@ import {
   withActorLock,
   writeActorState,
 } from '../src/runtime/actor-state.ts';
-import { readSpawnSpec } from '../src/runtime/spec.ts';
+import { readSpawnSpec, writeSpawnSpec } from '../src/runtime/spec.ts';
 import { sessionPaths } from '../src/runtime/layout.ts';
-import { isPidAlive } from '../src/runtime/process.ts';
+import { isPidAlive, selfArgv, spawnDetached } from '../src/runtime/process.ts';
 import type { FakeScript } from '../src/runtime/providers/fake.ts';
 import { LEASE_HEARTBEAT_MS } from '../src/runtime/types.ts';
+import type { ProcessIdentity } from '../src/runtime/types.ts';
 import {
   actorPid,
   actorPids,
@@ -63,11 +65,34 @@ afterAll(async () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-async function newSession(script: FakeScript = {}): Promise<string> {
+async function newSession(script: FakeScript = {}, opts: { startTimeoutMs?: number } = {}): Promise<string> {
   const spec = fakeSpec(mkTmp('orc-actor-cwd-'), script);
   sids.push(spec.sessionId);
-  await createSession(spec);
+  await createSession(spec, opts);
   return spec.sessionId;
+}
+
+/**
+ * The R1 crash window: the actor is SIGKILLed after spawning its provider but before the
+ * pid reached state.json (a provider handshake takes seconds). Reproduced exactly: wait
+ * for provider.spawned while the (simulated) handshake runs, kill the actor, and make sure
+ * state.json does not name the provider. Returns the orphan.
+ */
+async function orphanDuringHandshake(sid: string, nth = 1): Promise<ProcessIdentity> {
+  await waitFor(() => entries(sid, 'provider.spawned').length >= nth, `provider.spawned #${nth}`);
+  const spawned = entries(sid, 'provider.spawned')[nth - 1]!;
+  const orphan = { pid: spawned.pid, startTime: spawned.startTime };
+  process.kill(actorPid(sid), 'SIGKILL');
+  await waitFor(() => !leaseLive(readActorState(sid)), 'lease to die');
+  await withActorLock(sid, async () => {
+    const st = readActorState(sid)!;
+    delete st.provider;
+    writeActorState(st);
+  });
+  expect(entries(sid, 'provider.ready')).toHaveLength(nth - 1);
+  expect(isLiveProcess(orphan)).toBe(true);
+  expect(fakeProviderPids(sid)).toEqual([orphan.pid]);
+  return orphan;
 }
 
 /** SIGKILL only the actor (its provider lives in its own group) and wait until not live. */
@@ -201,6 +226,48 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
   );
 
   test(
+    'stop mid-turn interrupts the provider first, then closes it',
+    async () => {
+      const sid = await newSession({ rules: [{ match: 'HANG', action: 'hang' }] });
+      expect((await send(sid, { messageId: 'h1', text: 'HANG' })).verdict).toBe('acknowledged');
+      expect(await stop(sid, { graceMs: 3_000 })).toEqual({ status: 'stopped' });
+      const j = readJournal(sid);
+      const at = (pred: (e: (typeof j)[number]) => boolean) => j.findIndex(pred);
+      const req = at((e) => e.type === 'interrupt.requested' && e.messageId === 'h1');
+      const outcome = at((e) => e.type === 'turn.interrupted' && e.messageId === 'h1');
+      const exited = at((e) => e.type === 'provider.exited');
+      expect(req).toBeGreaterThan(-1);
+      expect(req).toBeLessThan(outcome);
+      // Reported by the provider itself while still running (before it was closed).
+      expect(outcome).toBeLessThan(exited);
+      expect(j[outcome]).toMatchObject({ reason: 'interrupt' });
+      expect(exited).toBeLessThan(at((e) => e.type === 'actor.stopped'));
+      const raw = fs.readFileSync(sessionPaths(sid).providerRaw, 'utf8');
+      expect(raw).toContain('{\\"op\\":\\"interrupt\\"}');
+      expect(deliveryVerdict(sid, 'h1')).toBe('interrupted');
+    },
+    T,
+  );
+
+  test(
+    'stop mid-turn: a provider that ignores the interrupt is closed after a bounded wait',
+    async () => {
+      const sid = await newSession({ rules: [{ match: 'HANG', action: 'hang', ignoreInterrupt: true }] });
+      expect((await send(sid, { messageId: 'h1', text: 'HANG' })).verdict).toBe('acknowledged');
+      const t0 = Date.now();
+      expect(await stop(sid, { graceMs: 600 })).toEqual({ status: 'stopped' });
+      expect(Date.now() - t0).toBeLessThan(4_000);
+      const types = readJournal(sid).map((e) => e.type);
+      expect(types.indexOf('interrupt.requested')).toBeLessThan(types.indexOf('interrupt.acked'));
+      // No provider outcome: the kernel closes the turn after the provider is gone.
+      expect(types.indexOf('provider.exited')).toBeLessThan(types.indexOf('turn.interrupted'));
+      expect(entries(sid, 'turn.interrupted', 'h1')).toMatchObject([{ reason: 'interrupt' }]);
+      expect(fakeProviderPids(sid)).toEqual([]);
+    },
+    T,
+  );
+
+  test(
     'crash after ack: verdict acknowledged, turn.interrupted{recovered} on wake, resume, one provider',
     async () => {
       const sid = await newSession({ rules: [{ match: 'HANG', action: 'hang' }] });
@@ -296,6 +363,47 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
   );
 
   test(
+    'provider spawned but not yet recorded in state: ensureAwake and actor boot kill it first',
+    async () => {
+      const script: FakeScript = { ignoreStdinEofMs: 60_000, startDelayMs: 1_000 };
+      const sid = await newSession(script, { startTimeoutMs: 300 });
+      const orphan = await orphanDuringHandshake(sid);
+
+      // ensureAwake kills it under the lock before spawning the new actor.
+      expect((await ensureAwake(sid, { startTimeoutMs: 300 })).status).toBe('started');
+      expect(isLiveProcess(orphan)).toBe(false);
+      await waitFor(() => readActorState(sid)?.phase === 'running', 'running', 10_000);
+      expect(fakeProviderPids(sid)).toEqual([readActorState(sid)!.provider!.pid]);
+      expect(entries(sid, 'provider.spawned')).toHaveLength(2);
+
+      // Actor boot path: orphan the second provider (known only from the journal), then
+      // start an actor directly (no ensureAwake pre-kill).
+      const orphan2 = await orphanDuringHandshake(sid, 2);
+      const spec = readSpawnSpec(sid)!;
+      spawnDetached([...selfArgv(), '__actor', sid], { cwd: spec.cwd, env: process.env, logPath: sessionPaths(sid).actorLog });
+      await waitFor(() => entries(sid, 'provider.spawned').length === 3, 'boot provider.spawned');
+      expect(isLiveProcess(orphan2)).toBe(false);
+      await waitFor(() => readActorState(sid)?.phase === 'running', 'running again', 10_000);
+      expect(fakeProviderPids(sid)).toEqual([readActorState(sid)!.provider!.pid]);
+      expect(await stop(sid)).toEqual({ status: 'stopped' });
+      expect(fakeProviderPids(sid)).toEqual([]);
+    },
+    T,
+  );
+
+  test(
+    'stop() with no live actor kills a provider that never reached state.json',
+    async () => {
+      const sid = await newSession({ ignoreStdinEofMs: 60_000, startDelayMs: 1_000 }, { startTimeoutMs: 300 });
+      const orphan = await orphanDuringHandshake(sid);
+      expect(await stop(sid)).toEqual({ status: 'stopped' });
+      expect(isLiveProcess(orphan)).toBe(false);
+      expect(fakeProviderPids(sid)).toEqual([]);
+    },
+    T,
+  );
+
+  test(
     'concurrent wakers (in-process and cross-process) on a suspended session yield one actor',
     async () => {
       const sid = await newSession();
@@ -354,6 +462,89 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
       expect(entries(sid, 'actor.started')).toHaveLength(1);
       expect(actorPids(sid)).toEqual([]);
       expect(fakeProviderPids(sid)).toEqual([]);
+    },
+    T,
+  );
+
+  test(
+    'stop while a send waits behind a turn: send throws SessionStoppedError, message dropped as a fact',
+    async () => {
+      const sid = await newSession({ rules: [{ match: 'HANG', action: 'hang' }] });
+      expect((await send(sid, { messageId: 'h1', text: 'HANG' })).verdict).toBe('acknowledged');
+      const outcome = send(sid, { messageId: 'm2', text: 'later' }, { ackTimeoutMs: 15_000 }).then(
+        (r) => r,
+        (e: unknown) => e,
+      );
+      await waitFor(() => listPending(sid).some((i) => i.kind === 'message' && i.messageId === 'm2'), 'm2 queued');
+      expect(await stop(sid)).toEqual({ status: 'stopped' });
+      expect(await outcome).toBeInstanceOf(SessionStoppedError);
+      expect(listPending(sid)).toEqual([]);
+      expect(entries(sid, 'inbox.dropped')).toMatchObject([{ messageId: 'm2', reason: 'stopped' }]);
+      expect(deliveryVerdict(sid, 'm2')).toBe('failed');
+      expect(deliveryVerdict(sid, 'h1')).toBe('interrupted');
+      expect(deriveState(inspect(sid))).toMatchObject({ stopped: true, pendingMessages: 0 });
+    },
+    T,
+  );
+
+  test(
+    'stop with no live actor drops queued messages as facts (verdict failed)',
+    async () => {
+      const sid = await newSession();
+      await send(sid, { messageId: 'd0', text: 'zero' });
+      await waitCompleted(sid, 'd0');
+      await crashActor(sid);
+      expect((await send(sid, { messageId: 'd1', text: 'queued' }, { wake: false })).verdict).toBe('queued');
+      expect(await stop(sid)).toEqual({ status: 'stopped' });
+      expect(listPending(sid)).toEqual([]);
+      expect(entries(sid, 'inbox.dropped')).toMatchObject([{ messageId: 'd1' }]);
+      expect(deliveryVerdict(sid, 'd1')).toBe('failed');
+      await expect(send(sid, { messageId: 'd1', text: 'queued' })).rejects.toBeInstanceOf(SessionStoppedError);
+    },
+    T,
+  );
+
+  test(
+    'stop ‖ send race: a send is either acknowledged or throws SessionStoppedError; nothing stays queued',
+    async () => {
+      for (const delay of [0, 1, 3, 6, 12, 25]) {
+        const sid = await newSession();
+        const messageId = `race-${delay}`;
+        const [stopped, sent] = await Promise.allSettled([
+          stop(sid),
+          Bun.sleep(delay).then(() => send(sid, { messageId, text: 'x' }, { ackTimeoutMs: 5_000 })),
+        ]);
+        expect(stopped).toMatchObject({ status: 'fulfilled', value: { status: 'stopped' } });
+        if (sent.status === 'fulfilled') {
+          expect(sent.value.verdict).toBe('acknowledged');
+          expect(['acknowledged', 'completed', 'interrupted']).toContain(deliveryVerdict(sid, messageId));
+        } else {
+          expect(sent.reason).toBeInstanceOf(SessionStoppedError);
+          expect(['absent', 'failed']).toContain(deliveryVerdict(sid, messageId));
+        }
+        expect(readActorState(sid)?.phase).toBe('stopped');
+        expect(listPending(sid).filter((i) => i.kind === 'message')).toEqual([]);
+        expect(fakeProviderPids(sid)).toEqual([]);
+      }
+    },
+    T,
+  );
+
+  test(
+    'actor boot sweeps stale inbox temp files but keeps fresh ones',
+    async () => {
+      const sid = await newSession();
+      await crashActor(sid);
+      const dir = sessionPaths(sid).inbox;
+      const stale = path.join(dir, '.tmp-01STALESTALESTALESTALESTALE');
+      const fresh = path.join(dir, '.tmp-01FRESHFRESHFRESHFRESHFRESH');
+      fs.writeFileSync(stale, '{}');
+      fs.writeFileSync(fresh, '{}');
+      const old = new Date(Date.now() - 5 * 60_000);
+      fs.utimesSync(stale, old, old);
+      expect((await ensureAwake(sid)).status).toBe('started');
+      expect(fs.existsSync(stale)).toBe(false);
+      expect(fs.existsSync(fresh)).toBe(true);
     },
     T,
   );
@@ -496,6 +687,79 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
   );
 
   test(
+    'host sleep: an alive actor with an expired lease is given a heartbeat to renew, not killed',
+    async () => {
+      const sid = await newSession({ rules: [{ match: 'HANG', action: 'hang' }] });
+      expect((await send(sid, { messageId: 'h1', text: 'HANG' })).verdict).toBe('acknowledged');
+      const before = readActorState(sid)!;
+      // As after a laptop sleep: the lease looks expired. Also rewind the phase, as if a
+      // state write had been lost — the next heartbeat must re-apply the intended phase.
+      await withActorLock(sid, async () => {
+        const st = readActorState(sid)!;
+        st.lease!.expiresAt = new Date(Date.now() - 1_000).toISOString();
+        st.phase = 'starting';
+        writeActorState(st);
+      });
+      expect(leaseLive(readActorState(sid))).toBe(false);
+      const r = await send(sid, { messageId: 'n2', text: 'next' }, { ackTimeoutMs: 300 });
+      expect(r).toMatchObject({ woke: false, verdict: 'queued' });
+      const after = readActorState(sid)!;
+      expect(after.lease?.pid).toBe(before.lease!.pid);
+      expect(after.provider?.pid).toBe(before.provider!.pid);
+      expect(after.phase).toBe('running');
+      expect(leaseLive(after)).toBe(true);
+      expect(deliveryVerdict(sid, 'h1')).toBe('acknowledged');
+      expect(entries(sid, 'actor.started')).toHaveLength(1);
+    },
+    T,
+  );
+
+  test(
+    'failed resumes: sessionError surfaced, never a fresh fallback, auto-wake refused after 3 until forced',
+    async () => {
+      const sid = await newSession({ exitOnResume: 7 });
+      await send(sid, { messageId: 'r0', text: 'first' });
+      await waitCompleted(sid, 'r0');
+      await crashActor(sid);
+
+      // Wake 1 (via send): the provider rejects the resume → surfaced, message stays queued.
+      const r1 = await send(sid, { messageId: 'r1', text: 'one' }, { ackTimeoutMs: 2_000 });
+      expect(r1).toMatchObject({ verdict: 'queued', woke: true });
+      expect(r1.sessionError).toMatch(/provider exited before ready \(code=7/);
+      expect(r1.sessionError).toContain('no conversation found'); // actor.log tail
+      expect(readActorState(sid)).toMatchObject({ phase: 'suspended', startFailures: 1 });
+      // Wakes 2 and 3 (explicit ensureAwake): same.
+      for (const n of [2, 3]) {
+        const w = await ensureAwake(sid);
+        expect(w).toMatchObject({ status: 'started' });
+        expect((w as { sessionError?: string }).sessionError).toMatch(/code=7/);
+        expect(readActorState(sid)?.startFailures).toBe(n);
+      }
+      expect(deriveState(inspect(sid))).toMatchObject({ suspended: true, startFailures: 3 });
+      // Refused now: no new actor, the message is still queued and the reason is surfaced.
+      await expect(ensureAwake(sid)).rejects.toBeInstanceOf(SessionStartError);
+      const r2 = await send(sid, { messageId: 'r2', text: 'two' });
+      expect(r2).toMatchObject({ verdict: 'queued', woke: false });
+      expect(r2.sessionError).toMatch(/3 times in a row/);
+      expect(listPending(sid).map((i) => (i as { messageId?: string }).messageId)).toEqual(['r1', 'r2']);
+      // Never fell back to a fresh session.
+      expect(entries(sid, 'actor.started').map((e) => e.mode)).toEqual(['fresh', 'resume', 'resume', 'resume']);
+
+      // Explicit resume after fixing the provider: forced wake → ready → counter reset → delivered in order.
+      const spec = readSpawnSpec(sid)!;
+      writeSpawnSpec({ ...spec, fakeScript: {} });
+      const forced = await ensureAwake(sid, { force: true });
+      expect(forced).toMatchObject({ status: 'started' });
+      expect((forced as { sessionError?: string }).sessionError).toBeUndefined();
+      await waitCompleted(sid, 'r2');
+      expect(readActorState(sid)?.startFailures).toBeUndefined();
+      expect(entries(sid, 'turn.intent').map((e) => e.messageId)).toEqual(['r0', 'r1', 'r2']);
+      expect(entries(sid, 'actor.started').at(-1)?.mode).toBe('resume');
+    },
+    T,
+  );
+
+  test(
     'lease lost → the actor kills its provider and exits without touching state.json',
     async () => {
       const sid = await newSession();
@@ -508,15 +772,13 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
         st.lease!.token = 'stolen-by-another-actor';
         writeActorState(st);
       });
+      const journalBefore = readJournal(sid).length;
       // The next heartbeat (≤ LEASE_HEARTBEAT_MS) detects the foreign token.
-      await waitForEntry(
-        sid,
-        (e) => e.type === 'actor.stopped' && e.reason === 'lease-lost',
-        'lease-lost',
-        LEASE_HEARTBEAT_MS + 5_000,
-      );
-      await waitFor(() => !isLiveProcess(actor), 'actor to exit');
+      await waitFor(() => !isLiveProcess(actor), 'actor to exit', LEASE_HEARTBEAT_MS + 5_000);
       expect(isLiveProcess(provider)).toBe(false);
+      expect(fs.readFileSync(sessionPaths(sid).actorLog, 'utf8')).toContain('lease lost');
+      // The journal now belongs to whoever holds the lease: the loser writes nothing to it.
+      expect(readJournal(sid).length).toBe(journalBefore);
       expect(readActorState(sid)?.lease?.token).toBe('stolen-by-another-actor');
       expect(fakeProviderPids(sid)).toEqual([]);
     },
@@ -532,7 +794,8 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
       const prevBin = process.env.ORC_CLAUDE_BIN;
       process.env.ORC_CLAUDE_BIN = path.join(root, 'no-such-claude-binary');
       try {
-        await createSession(spec);
+        // Fails fast with the provider's start error (not a silent success).
+        await expect(createSession(spec)).rejects.toBeInstanceOf(SessionStartError);
       } finally {
         if (prevBin === undefined) delete process.env.ORC_CLAUDE_BIN;
         else process.env.ORC_CLAUDE_BIN = prevBin;
@@ -541,6 +804,7 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
       expect(stopped).toMatchObject({ reason: 'error' });
       expect(String((stopped as { error?: string }).error)).toMatch(/claude|no-such-claude-binary|ENOENT/i);
       await waitFor(() => readActorState(spec.sessionId)?.phase === 'suspended', 'suspended');
+      expect(readActorState(spec.sessionId)?.startFailures).toBe(1);
 
       await expect(createSession(spec)).rejects.toThrow(/already exists/);
       await expect(createSession(fakeSpec(path.join(root, 'missing-dir')))).rejects.toThrow(/does not exist/);

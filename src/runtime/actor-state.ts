@@ -1,5 +1,5 @@
 /**
- * Actor state file (state.json), the lease, and zombie-aware process liveness.
+ * Actor state file (state.json), the lease, and the per-session locks.
  *
  * state.json is written tmp+rename under the brief `actor-<sid>` lock. The lease
  * (pid + startTime + token + expiresAt) is the single-writer truth: a session is live iff
@@ -12,89 +12,23 @@ import { randomUUID } from 'node:crypto';
 import { acquireLock, sanitizeLockName } from '../lock.ts';
 import type { LockOptions } from '../lock.ts';
 import { locksDir } from '../paths.ts';
-import { isPidAlive, isSameProcessAlive, signalProcessGroup } from './process.ts';
+import { isLiveProcess, isPidAlive } from './process.ts';
 import { RUNTIME_SCHEMA_VERSION } from './types.ts';
-import type { ActorPhase, ActorStateFile, ProcessIdentity } from './types.ts';
+import type { ActorPhase, ActorStateFile } from './types.ts';
 import { sessionPaths } from './layout.ts';
 import { readJsonFile, writeFileAtomic } from './fsutil.ts';
 
-// ---------------------------------------------------------------------------------
-// Liveness (zombie-aware)
-// ---------------------------------------------------------------------------------
-
-/**
- * Process state letter (`R`, `S`, `Z`, …) or null when the process is gone/unknown.
- * Linux: /proc/<pid>/stat field 3. Elsewhere: `ps -o stat=`.
- */
-export function processStateLetter(pid: number): string | null {
-  if (!Number.isInteger(pid) || pid <= 0) return null;
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
-    return stat.slice(stat.lastIndexOf(')') + 2).split(' ')[0] ?? null;
-  } catch {
-    if (process.platform === 'linux') return null;
-  }
-  try {
-    const r = Bun.spawnSync(['ps', '-o', 'stat=', '-p', String(pid)], { stdout: 'pipe', stderr: 'ignore' });
-    const out = r.stdout.toString().trim();
-    return r.exitCode === 0 && out.length > 0 ? out : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * A dead-but-unreaped process. kill(pid, 0) succeeds on zombies, and orphans are not
- * reaped when PID 1 is not a real init (common in containers), so liveness must check.
- */
-export function isZombie(pid: number): boolean {
-  const s = processStateLetter(pid);
-  return s !== null && (s.startsWith('Z') || s.startsWith('X'));
-}
-
-/** Same process (pid + start time) and not a zombie. */
-export function isLiveProcess(id: ProcessIdentity | undefined | null): boolean {
-  return !!id && isSameProcessAlive(id) && !isZombie(id.pid);
-}
-
-function trySignalGroup(pgid: number, signal: NodeJS.Signals): void {
-  try {
-    signalProcessGroup(pgid, signal);
-  } catch {
-    /* EPERM / invalid: nothing we can do */
-  }
-}
-
-/**
- * Terminate the process group led by `id` iff it is still the same live process:
- * SIGTERM, wait up to graceMs, then SIGKILL. Stragglers in the group are SIGKILLed once
- * the leader is gone. Zombie-aware (unlike process.ts terminateProcessGroup, which waits
- * out the full grace on an unreaped zombie). Returns true when something was signalled.
- */
-export async function terminateGroup(
-  id: ProcessIdentity | undefined | null,
-  graceMs = 2_000,
-): Promise<boolean> {
-  if (!id || !isLiveProcess(id)) return false;
-  trySignalGroup(id.pid, 'SIGTERM');
-  const deadline = Date.now() + Math.max(0, graceMs);
-  while (Date.now() < deadline && isLiveProcess(id)) await Bun.sleep(25);
-  if (isLiveProcess(id)) {
-    trySignalGroup(id.pid, 'SIGKILL');
-    const killDeadline = Date.now() + 2_000;
-    while (Date.now() < killDeadline && isLiveProcess(id)) await Bun.sleep(25);
-  }
-  // Leader gone (or zombie): the pgid stays valid (and its id unreusable) while members
-  // remain — sweep them. ESRCH (no members) is ignored.
-  trySignalGroup(id.pid, 'SIGKILL');
-  return true;
-}
+// Liveness lives in ./process.ts (zombie-aware); re-exported here for kernel callers.
+export { isLiveProcess, isZombie, probeProcess, terminateGroup } from './process.ts';
 
 // ---------------------------------------------------------------------------------
 // state.json
 // ---------------------------------------------------------------------------------
 
 export const ACTOR_LOCK_OPTIONS: LockOptions = { staleMs: 10_000, timeoutMs: 15_000 };
+
+/** Provider close grace for stop when the caller does not say (client + actor). */
+export const DEFAULT_STOP_GRACE_MS = 5_000;
 
 export function actorLockName(sessionId: string): string {
   return `actor-${sessionId}`;
@@ -117,7 +51,7 @@ export function reclaimDeadOwnerLock(name: string): boolean {
   };
   const owner = readOwner();
   if (!owner?.pid || !owner.token) return false;
-  if (isPidAlive(owner.pid) && !isZombie(owner.pid)) return false;
+  if (isPidAlive(owner.pid)) return false; // zombie-aware
   const cleanup = `${lockPath}.cleanup`;
   let fd: number;
   try {

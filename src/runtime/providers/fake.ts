@@ -15,7 +15,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { signalProcessGroup } from '../process.ts';
+import { processStartTime, signalProcessGroup } from '../process.ts';
 import type {
   ProviderEvent,
   ProviderLaunch,
@@ -50,6 +50,8 @@ export interface FakeBehaviour {
   exitCode?: number;
   /** permission.requested detail. */
   detail?: unknown;
+  /** Acknowledge interrupts but keep the turn running (a provider that ignores them). */
+  ignoreInterrupt?: boolean;
 }
 
 export interface FakeRule extends FakeBehaviour {
@@ -60,8 +62,15 @@ export interface FakeRule extends FakeBehaviour {
 export interface FakeScript {
   /** Delay before `ready`. Default 0. */
   readyDelayMs?: number;
+  /**
+   * The factory's start() resolves this long AFTER spawning the child (simulates a
+   * provider handshake: the window between spawn and the runtime being returned).
+   */
+  startDelayMs?: number;
   /** Exit immediately at start with this code (provider fails to start). */
   exitAtStart?: number;
+  /** Exit immediately with this code when started in RESUME mode (provider rejects the resume). */
+  exitOnResume?: number;
   /**
    * On stdin EOF keep running for this long before exiting (simulates a provider that
    * outlives its actor). Default: exit immediately on EOF.
@@ -224,6 +233,9 @@ export const fakeRuntimeFactory: ProviderRuntimeFactory = {
         detached: true,
       },
     );
+    launch.onSpawn?.({ pid: proc.pid, startTime: processStartTime(proc.pid) });
+    // Simulated start handshake (claude/codex take seconds between spawn and ready).
+    if (script.startDelayMs) await Bun.sleep(script.startDelayMs);
     return new FakeRuntime(proc, launch.rawLogPath);
   },
 };

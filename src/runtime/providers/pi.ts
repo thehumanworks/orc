@@ -166,6 +166,7 @@ class PiRuntime implements ProviderRuntime {
     try {
       stderrFd = fs.openSync(stderrPath, 'a', 0o600);
       const proc = spawnPiProcess(argv, launch.spec.cwd, launch.env, stderrFd);
+      launch.onSpawn?.({ pid: proc.pid, startTime: processStartTime(proc.pid) });
       return new PiRuntime(proc, rawFd, stderrPath, argv, opts);
     } catch (e) {
       fs.closeSync(rawFd);

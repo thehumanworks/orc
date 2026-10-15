@@ -833,6 +833,7 @@ export async function startClaudeRuntime(
   } finally {
     fs.closeSync(errFd);
   }
+  launch.onSpawn?.({ pid: proc.pid, startTime: processStartTime(proc.pid) });
   const rt = new ClaudeRuntime(proc, launch, argv, env);
   const envTimeout = Number(launch.env.ORC_CLAUDE_READY_TIMEOUT_MS ?? process.env.ORC_CLAUDE_READY_TIMEOUT_MS);
   const readyTimeoutMs =

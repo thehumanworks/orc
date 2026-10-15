@@ -7,6 +7,7 @@ import type {
   ActorPhase,
   ActorStateFile,
   JournalEntry,
+  ProcessIdentity,
   SpawnSpec,
   TurnInterruptReason,
 } from './types.ts';
@@ -43,6 +44,8 @@ export class TurnLedger {
   readonly byMessageId = new Map<string, TurnRecord>();
   readonly intentUlids = new Set<string>();
   readonly acceptedUlids = new Set<string>();
+  /** messageId → ulid of queued messages dropped undelivered (inbox.dropped). */
+  readonly dropped = new Map<string, string>();
   private readonly openIds = new Set<string>();
   completedTurns = 0;
   startedTurns = 0;
@@ -54,6 +57,8 @@ export class TurnLedger {
   lastActorStopped?: { seq: number; at: string; reason: string; error?: string };
   providerSessionId?: string;
   transcriptPath?: string;
+  /** Every provider.spawned, in order; `exited` once a later provider.exited closed it. */
+  readonly spawnedProviders: Array<ProcessIdentity & { seq: number; exited: boolean }> = [];
 
   static from(entries: Iterable<JournalEntry>): TurnLedger {
     const l = new TurnLedger();
@@ -66,6 +71,9 @@ export class TurnLedger {
     switch (e.type) {
       case 'inbox.accepted':
         this.acceptedUlids.add(e.ulid);
+        break;
+      case 'inbox.dropped':
+        this.dropped.set(e.messageId, e.ulid);
         break;
       case 'turn.intent':
         this.intentUlids.add(e.ulid);
@@ -120,6 +128,20 @@ export class TurnLedger {
       case 'actor.stopped':
         this.lastActorStopped = { seq: e.seq, at: e.ts, reason: e.reason, ...(e.error ? { error: e.error } : {}) };
         break;
+      case 'provider.spawned':
+        this.spawnedProviders.push({ pid: e.pid, startTime: e.startTime, seq: e.seq, exited: false });
+        break;
+      case 'provider.exited': {
+        // One provider per actor: an exit closes the most recent still-open spawn.
+        for (let i = this.spawnedProviders.length - 1; i >= 0; i--) {
+          const p = this.spawnedProviders[i]!;
+          if (!p.exited) {
+            p.exited = true;
+            break;
+          }
+        }
+        break;
+      }
       case 'provider.ready':
         this.providerSessionId = e.providerSessionId;
         if (e.transcriptPath) this.transcriptPath = e.transcriptPath;
@@ -140,6 +162,11 @@ export class TurnLedger {
   get openTurn(): TurnRecord | undefined {
     const open = this.openTurns();
     return open[open.length - 1];
+  }
+
+  /** Spawned providers with no journaled exit (possibly orphaned by an actor crash). */
+  unexitedProviders(): ProcessIdentity[] {
+    return this.spawnedProviders.filter((p) => !p.exited).map(({ pid, startTime }) => ({ pid, startTime }));
   }
 
   /** A permission request newer than the last turn outcome and the last actor start. */
@@ -234,6 +261,9 @@ export interface DerivedState {
   providerSessionId?: string;
   transcriptPath?: string;
   stopReason?: string;
+  /** Consecutive failed starts (provider never ready); auto-wake stops at the max. */
+  startFailures?: number;
+  lastStartError?: string;
 }
 
 /**
@@ -275,8 +305,18 @@ export function deriveState(view: SessionView): DerivedState {
   const tpath = view.spec?.transcriptPath ?? s.transcriptPath;
   if (tpath) out.transcriptPath = tpath;
   if (view.actor?.stopReason) out.stopReason = view.actor.stopReason;
+  if (view.actor?.startFailures) {
+    out.startFailures = view.actor.startFailures;
+    if (view.actor.lastStartError) out.lastStartError = view.actor.lastStartError;
+  }
 
-  if (!view.exists || !view.actor) return out;
+  if (!view.exists) return out;
+  if (!view.actor) {
+    // spawn.json without state.json (creation interrupted): resumable by a wake.
+    out.phase = 'suspended';
+    out.suspended = true;
+    return out;
+  }
   if (view.actor.phase === 'stopped') {
     out.stopped = true;
     return out;
@@ -305,6 +345,7 @@ export function deriveState(view: SessionView): DerivedState {
  *                 stop) or before the actor died: may or may not have reached the provider.
  *                 Never auto-resubmitted.
  * - completed / failed / interrupted  turn outcome (interrupted = after the ack)
+ * - failed        also: dropped from the inbox undelivered (inbox.dropped — session stopped)
  * - absent        never seen
  */
 export type DeliveryVerdict =
@@ -316,7 +357,12 @@ export type DeliveryVerdict =
   | 'interrupted'
   | 'absent';
 
-export function verdictFor(turn: TurnRecord | undefined, inInbox: boolean, live: boolean): DeliveryVerdict {
+export function verdictFor(
+  turn: TurnRecord | undefined,
+  inInbox: boolean,
+  live: boolean,
+  dropped = false,
+): DeliveryVerdict {
   if (turn) {
     const started = turn.startedSeq !== undefined;
     switch (turn.outcome) {
@@ -332,5 +378,25 @@ export function verdictFor(turn: TurnRecord | undefined, inInbox: boolean, live:
         return live ? 'queued' : 'unknown';
     }
   }
-  return inInbox ? 'queued' : 'absent';
+  if (inInbox) return 'queued';
+  return dropped ? 'failed' : 'absent';
+}
+
+/**
+ * Provider processes that may still be running for a session with no live actor: the one
+ * recorded in state.json plus every journaled provider.spawned without a later
+ * provider.exited (an actor killed between spawn and recording it in state). Callers
+ * terminate each with terminateGroup, which re-checks pid + start time first.
+ */
+export function staleProviders(
+  state: Pick<ActorStateFile, 'provider'> | undefined,
+  ledger: TurnLedger,
+): ProcessIdentity[] {
+  const out: ProcessIdentity[] = [];
+  const add = (id: ProcessIdentity | undefined) => {
+    if (id && !out.some((o) => o.pid === id.pid && o.startTime === id.startTime)) out.push(id);
+  };
+  add(state?.provider);
+  for (const p of ledger.unexitedProviders()) add(p);
+  return out;
 }

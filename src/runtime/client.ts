@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { assertValidMessageId } from '../paths.ts';
 import { selfArgv, spawnDetached } from './process.ts';
-import { LEASE_TTL_MS } from './types.ts';
+import { LEASE_HEARTBEAT_MS, LEASE_TTL_MS, MAX_CONSECUTIVE_START_FAILURES } from './types.ts';
 import type { ActorStateFile, ProcessIdentity, SpawnSpec } from './types.ts';
 import { ensureSessionDirs, sessionPaths } from './layout.ts';
 import { assertValidSessionId, readFileTail } from './fsutil.ts';
@@ -18,6 +18,7 @@ import { readSpawnSpec, validateSpawnSpec, writeSpawnSpec } from './spec.ts';
 import { JournalCursor, JournalWriter, readJournal } from './journal.ts';
 import { enqueue, listPending, removeInboxItem } from './inbox.ts';
 import {
+  DEFAULT_STOP_GRACE_MS,
   initialActorState,
   isLiveProcess,
   leaseLive,
@@ -27,7 +28,7 @@ import {
   withSessionLock,
   writeActorState,
 } from './actor-state.ts';
-import { TurnLedger, summarizeLedger, verdictFor } from './derive.ts';
+import { TurnLedger, staleProviders, summarizeLedger, verdictFor } from './derive.ts';
 import type { DeliveryVerdict, SessionView } from './derive.ts';
 
 export { readJournal, followJournal, JournalCursor } from './journal.ts';
@@ -43,17 +44,34 @@ export type {
   TurnRecord,
 } from './derive.ts';
 export { sessionPaths } from './layout.ts';
-export { leaseLive, isLiveProcess } from './actor-state.ts';
+export { leaseLive, isLiveProcess, DEFAULT_STOP_GRACE_MS } from './actor-state.ts';
 
 export const DEFAULT_START_TIMEOUT_MS = 15_000;
 export const DEFAULT_ACK_TIMEOUT_MS = 10_000;
-export const DEFAULT_STOP_GRACE_MS = 5_000;
 
 export class SessionStoppedError extends Error {
   readonly code = 'ORC_SESSION_STOPPED';
   constructor(readonly sessionId: string) {
     super(`session ${sessionId} is stopped (stop is sticky; it never wakes)`);
     this.name = 'SessionStoppedError';
+  }
+}
+
+/**
+ * The session's actor could not get its provider to `ready` — on create, or for
+ * MAX_CONSECUTIVE_START_FAILURES wakes in a row (auto-wake is then refused until an
+ * explicit `ensureAwake(sid, { force: true })`). Never retried as a fresh session.
+ */
+export class SessionStartError extends Error {
+  readonly code = 'ORC_SESSION_START_FAILED';
+  constructor(
+    readonly sessionId: string,
+    message: string,
+    readonly failures: number,
+    readonly lastError?: string,
+  ) {
+    super(message);
+    this.name = 'SessionStartError';
   }
 }
 
@@ -108,6 +126,38 @@ function spawnActorLocked(sessionId: string, state: ActorStateFile): ProcessIden
   return actor;
 }
 
+/**
+ * Host sleep (laptops): an actor whose process is alive but whose lease expired is most
+ * likely healthy and renews on its next heartbeat. Give it one heartbeat (+1 s) before
+ * anyone treats it as wedged and kills it. Returns true when the lease is live (again).
+ * Called WITHOUT the actor lock (the actor needs it to renew).
+ */
+async function awaitLeaseRenewal(sessionId: string): Promise<boolean> {
+  const st = readActorState(sessionId);
+  if (leaseLive(st)) return true;
+  const active = st?.phase === 'starting' || st?.phase === 'running' || st?.phase === 'stopping';
+  if (!st?.lease || !active || !isLiveProcess(st.lease)) return false;
+  const deadline = Date.now() + LEASE_HEARTBEAT_MS + 1_000;
+  while (Date.now() < deadline) {
+    await Bun.sleep(50);
+    const cur = readActorState(sessionId);
+    if (leaseLive(cur)) return true;
+    if (!cur?.lease || !isLiveProcess(cur.lease)) return false;
+  }
+  return false;
+}
+
+/**
+ * Kill every provider that may outlive a dead actor (caller holds the actor lock and no
+ * actor is live): state.provider plus journaled provider.spawned with no provider.exited.
+ */
+async function terminateStaleProviders(sessionId: string, st: ActorStateFile): Promise<void> {
+  for (const id of staleProviders(st, TurnLedger.from(readJournal(sessionId)))) {
+    await terminateGroup(id, 1_000);
+  }
+  if (st.provider && !isLiveProcess(st.provider)) delete st.provider;
+}
+
 /** The launched actor died before journaling actor.started: release its lease. */
 async function markStartFailed(sessionId: string, actor: ProcessIdentity): Promise<void> {
   await withActorLock(sessionId, async () => {
@@ -115,6 +165,8 @@ async function markStartFailed(sessionId: string, actor: ProcessIdentity): Promi
     if (!st || st.phase === 'stopped' || st.lease?.pid !== actor.pid || isLiveProcess(actor)) return;
     st.phase = 'suspended';
     st.stopReason = 'start-failed';
+    st.startFailures = (st.startFailures ?? 0) + 1;
+    st.lastStartError = 'actor exited before starting';
     delete st.lease;
     st.updatedAt = new Date().toISOString();
     writeActorState(st, { fsync: true });
@@ -122,18 +174,57 @@ async function markStartFailed(sessionId: string, actor: ProcessIdentity): Promi
 }
 
 /** Wait until `actor` journals actor.started; fail fast (with the log tail) if it dies. */
-async function waitForActorStarted(sessionId: string, actor: ProcessIdentity, timeoutMs: number): Promise<void> {
+/**
+ * Wait for a freshly spawned actor: first its actor.started (throws — with the actor.log
+ * tail — if it dies or times out before that), then the start outcome: provider.ready →
+ * ok; actor.stopped (error / provider exit) or the actor dying → `sessionError` (fail
+ * fast, never a silent `queued`). Still starting at the deadline → ok (the actor is up).
+ */
+async function waitForActorStart(
+  sessionId: string,
+  actor: ProcessIdentity,
+  timeoutMs: number,
+): Promise<{ sessionError?: string }> {
   const cursor = JournalCursor.forSession(sessionId);
-  const started = () => cursor.readNew().some((e) => e.type === 'actor.started' && e.pid === actor.pid);
   const deadline = Date.now() + timeoutMs;
+  let started = false;
+  const scan = (): { sessionError?: string } | undefined => {
+    for (const e of cursor.readNew()) {
+      if (!started) {
+        started = e.type === 'actor.started' && e.pid === actor.pid;
+        continue;
+      }
+      if (e.type === 'provider.ready') return {};
+      if (e.type === 'actor.stopped') {
+        if (e.reason === 'stop') return {};
+        return {
+          sessionError: `actor stopped during start (${e.reason}${e.error ? `: ${e.error}` : ''})${logTail(sessionId)}`,
+        };
+      }
+    }
+    return undefined;
+  };
+  // A failed start is journaled just before the actor's final state write (startFailures,
+  // lease release): return only once that is visible, so callers act on settled state.
+  const settled = async (o: { sessionError?: string }) => {
+    if (o.sessionError) {
+      const until = Date.now() + 5_000;
+      while (Date.now() < until && isLiveProcess(actor) && leaseLive(readActorState(sessionId))) await Bun.sleep(20);
+    }
+    return o;
+  };
   while (true) {
-    if (started()) return;
+    const outcome = scan();
+    if (outcome) return settled(outcome);
     if (!isLiveProcess(actor)) {
-      if (started()) return;
+      const last = scan();
+      if (last) return settled(last);
+      if (started) return { sessionError: `actor ${actor.pid} exited during start${logTail(sessionId)}` };
       await markStartFailed(sessionId, actor);
       throw new Error(`actor ${actor.pid} for session ${sessionId} exited before starting${logTail(sessionId)}`);
     }
     if (Date.now() >= deadline) {
+      if (started) return {};
       throw new Error(
         `timed out after ${timeoutMs}ms waiting for actor ${actor.pid} of session ${sessionId}${logTail(sessionId)}`,
       );
@@ -172,11 +263,19 @@ export async function createSession(
     writeSpawnSpec(spec);
     return spawnActorLocked(sid, initialActorState(sid));
   });
-  await waitForActorStarted(sid, actor, opts.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS);
+  const { sessionError } = await waitForActorStart(sid, actor, opts.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS);
+  if (sessionError) {
+    throw new SessionStartError(sid, `session ${sid} failed to start: ${sessionError}`, 1, sessionError);
+  }
   return { actor };
 }
 
 export interface EnsureAwakeOptions {
+  /**
+   * Wake even after MAX_CONSECUTIVE_START_FAILURES failed starts (an explicit resume).
+   * Without it such a session throws SessionStartError instead of being woken again.
+   */
+  force?: boolean;
   /** Policy hook run under the actor lock just before a spawn (never when already live). */
   beforeSpawn?: () => Promise<void>;
   startTimeoutMs?: number;
@@ -184,7 +283,8 @@ export interface EnsureAwakeOptions {
 
 export type EnsureAwakeResult =
   | { status: 'live'; actor: ProcessIdentity }
-  | { status: 'started'; actor: ProcessIdentity }
+  /** `sessionError`: the actor started but its provider failed before `ready` (it has exited). */
+  | { status: 'started'; actor: ProcessIdentity; sessionError?: string }
   | { status: 'stopped' };
 
 /**
@@ -195,6 +295,7 @@ export type EnsureAwakeResult =
  */
 export async function ensureAwake(sessionId: string, opts: EnsureAwakeOptions = {}): Promise<EnsureAwakeResult> {
   assertValidSessionId(sessionId);
+  await awaitLeaseRenewal(sessionId);
   const r = await withActorLock(sessionId, async (): Promise<EnsureAwakeResult> => {
     requireSpec(sessionId);
     const st = readActorState(sessionId) ?? initialActorState(sessionId, 'suspended');
@@ -202,18 +303,31 @@ export async function ensureAwake(sessionId: string, opts: EnsureAwakeOptions = 
       return { status: 'live', actor: { pid: st.lease.pid, startTime: st.lease.startTime } };
     }
     if (st.phase === 'stopped') return { status: 'stopped' };
+    const failures = st.startFailures ?? 0;
+    if (failures >= MAX_CONSECUTIVE_START_FAILURES && !opts.force) {
+      throw new SessionStartError(
+        sessionId,
+        `session ${sessionId} failed to start ${failures} times in a row (last: ${st.lastStartError ?? 'unknown'}); ` +
+          'not auto-waking — resume explicitly with ensureAwake(sid, { force: true })',
+        failures,
+        st.lastStartError,
+      );
+    }
     await opts.beforeSpawn?.();
     // Alive but lease expired = wedged actor: it must not keep writing.
     if (st.lease && isLiveProcess(st.lease)) await terminateGroup(st.lease, 1_000);
-    // Orphaned provider from a crashed actor: kill before a new one can start.
-    if (st.provider) {
-      await terminateGroup(st.provider, 1_000);
-      if (!isLiveProcess(st.provider)) delete st.provider;
-    }
+    // Orphaned providers from crashed actors (state.json + unexited provider.spawned):
+    // kill before a new one can start.
+    await terminateStaleProviders(sessionId, st);
     return { status: 'started', actor: spawnActorLocked(sessionId, st) };
   });
   if (r.status === 'started') {
-    await waitForActorStarted(sessionId, r.actor, opts.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS);
+    const { sessionError } = await waitForActorStart(
+      sessionId,
+      r.actor,
+      opts.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS,
+    );
+    if (sessionError) return { ...r, sessionError };
   }
   return r;
 }
@@ -252,6 +366,11 @@ export interface SendResult {
   duplicate: boolean;
   /** This call spawned the actor. */
   woke: boolean;
+  /**
+   * The wake failed: the provider did not start (or auto-wake is refused after repeated
+   * failed starts). The message stays durably queued for an explicit resume.
+   */
+  sessionError?: string;
 }
 
 /** Coarse send verdict; `acked` = a turn.started exists for the message. */
@@ -275,7 +394,7 @@ async function waitForDelivery(
   sessionId: string,
   messageId: string,
   timeoutMs: number,
-): Promise<{ delivery: DeliveryVerdict; acked: boolean }> {
+): Promise<{ delivery: DeliveryVerdict; acked: boolean; dropped: boolean }> {
   const cursor = JournalCursor.forSession(sessionId);
   const ledger = new TurnLedger();
   const deadline = Date.now() + Math.max(0, timeoutMs);
@@ -285,12 +404,14 @@ async function waitForDelivery(
     for (const e of cursor.readNew()) ledger.apply(e);
     const turn = ledger.byMessageId.get(messageId);
     const acked = turn?.startedSeq !== undefined;
+    const dropped = !turn && ledger.dropped.has(messageId);
+    if (dropped) return { delivery: 'failed', acked: false, dropped: true };
     const v = verdictFor(turn, true, live);
-    if (v !== 'queued') return { delivery: v, acked };
+    if (v !== 'queued') return { delivery: v, acked, dropped: false };
     if (!live || Date.now() >= deadline) {
-      if (turn) return { delivery: v, acked };
+      if (turn) return { delivery: v, acked, dropped: false };
       const inInbox = listPending(sessionId).some((i) => i.kind === 'message' && i.messageId === messageId);
-      return { delivery: inInbox ? 'queued' : verdictFor(undefined, false, live), acked: false };
+      return { delivery: inInbox ? 'queued' : verdictFor(undefined, false, live), acked: false, dropped: false };
     }
     await Bun.sleep(25);
     if (Date.now() - liveCheckedAt >= 200) {
@@ -304,7 +425,9 @@ async function waitForDelivery(
  * Durably enqueue a message, wake the session (unless `wake: false`) and wait (bounded)
  * for its turn.started. Idempotent per messageId: if an inbox item or a journal intent
  * for it already exists nothing is enqueued and its current status is returned.
- * Throws SessionStoppedError for a stopped session (nothing is enqueued).
+ * Throws SessionStoppedError for a stopped or stopping session — also when the stop lands
+ * while the message waits (it is then dropped with an inbox.dropped fact, never left
+ * queued in a session that will not wake).
  */
 export async function send(
   sessionId: string,
@@ -336,7 +459,7 @@ export async function send(
       knownAcked = turn.startedSeq !== undefined;
       return;
     }
-    if (readActorState(sessionId)?.phase === 'stopped') throw new SessionStoppedError(sessionId);
+    if (isStopPhase(readActorState(sessionId)?.phase)) throw new SessionStoppedError(sessionId);
     ulid = enqueue(sessionId, { kind: 'message', messageId: msg.messageId, text: msg.text }).ulid;
   });
   if (known !== undefined && known !== 'queued') {
@@ -344,20 +467,71 @@ export async function send(
   }
 
   let woke = false;
+  let sessionError: string | undefined;
   if (opts.wake !== false) {
-    const r = await ensureAwake(sessionId, {
-      ...(opts.beforeWake ? { beforeSpawn: opts.beforeWake } : {}),
-      ...(opts.startTimeoutMs !== undefined ? { startTimeoutMs: opts.startTimeoutMs } : {}),
-    });
-    if (r.status === 'stopped') throw new SessionStoppedError(sessionId);
+    let r: EnsureAwakeResult;
+    try {
+      r = await ensureAwake(sessionId, {
+        ...(opts.beforeWake ? { beforeSpawn: opts.beforeWake } : {}),
+        ...(opts.startTimeoutMs !== undefined ? { startTimeoutMs: opts.startTimeoutMs } : {}),
+      });
+    } catch (e) {
+      if (!(e instanceof SessionStartError)) throw e;
+      return { ulid, verdict: 'queued', delivery: 'queued', duplicate, woke: false, sessionError: e.message };
+    }
+    if (r.status === 'started' && r.sessionError) sessionError = r.sessionError;
+    if (r.status === 'stopped') {
+      // stop() landed between our phase check and the wake: never leave it queued.
+      await dropIfUndelivered(sessionId, ulid);
+      throw new SessionStoppedError(sessionId);
+    }
     woke = r.status === 'started';
   }
-  const { delivery, acked } = await waitForDelivery(
+  const { delivery, acked, dropped } = await waitForDelivery(
     sessionId,
     msg.messageId,
     opts.ackTimeoutMs ?? DEFAULT_ACK_TIMEOUT_MS,
   );
-  return { ulid, verdict: coarseVerdict(delivery, acked), delivery, duplicate, woke };
+  if (!acked && (delivery === 'queued' || dropped) && isStopPhase(readActorState(sessionId)?.phase)) {
+    // Stopped (or stopping) while we waited: the message can never be delivered.
+    await dropIfUndelivered(sessionId, ulid);
+    throw new SessionStoppedError(sessionId);
+  }
+  return {
+    ulid,
+    verdict: coarseVerdict(delivery, acked),
+    delivery,
+    duplicate,
+    woke,
+    ...(sessionError ? { sessionError } : {}),
+  };
+}
+
+function isStopPhase(phase: ActorStateFile['phase'] | undefined): boolean {
+  return phase === 'stopped' || phase === 'stopping';
+}
+
+/**
+ * A message queued into a session that is (being) stopped: once no actor is live, remove
+ * it with an inbox.dropped fact (unless it already became an intent or was dropped). A
+ * live stopping actor drops queued messages itself, so wait for it first.
+ */
+async function dropIfUndelivered(sessionId: string, ulid: string): Promise<void> {
+  const deadline = Date.now() + DEFAULT_STOP_GRACE_MS + 10_000;
+  while (leaseLive(readActorState(sessionId)) && Date.now() < deadline) await Bun.sleep(25);
+  await withActorLock(sessionId, async () => {
+    if (leaseLive(readActorState(sessionId))) return;
+    const item = listPending(sessionId).find((i) => i.ulid === ulid);
+    if (!item || item.kind !== 'message') return;
+    if (TurnLedger.from(readJournal(sessionId)).intentUlids.has(ulid)) return;
+    const j = JournalWriter.forSession(sessionId);
+    try {
+      j.append({ type: 'inbox.dropped', ulid, messageId: item.messageId, reason: 'stopped' });
+    } finally {
+      j.close();
+    }
+    removeInboxItem(sessionId, ulid);
+  });
 }
 
 /**
@@ -399,8 +573,9 @@ export async function stop(
 
   let asked = false;
   for (let attempt = 0; attempt < 3; attempt++) {
-    const st = readActorState(sessionId);
+    let st = readActorState(sessionId);
     if (st?.phase === 'stopped') return { status: 'stopped' };
+    if (!leaseLive(st) && (await awaitLeaseRenewal(sessionId))) st = readActorState(sessionId);
     if (leaseLive(st) && !asked) {
       asked = true;
       enqueue(sessionId, { kind: 'stop', graceMs, ...(opts.reason ? { reason: opts.reason } : {}) });
@@ -418,13 +593,19 @@ export async function stop(
       // Someone woke it meanwhile: ask it to stop first (once).
       if (leaseLive(cur) && !asked) return 'retry';
       if (cur.lease && isLiveProcess(cur.lease)) await terminateGroup(cur.lease, 1_000);
-      if (cur.provider) await terminateGroup(cur.provider, 1_000);
+      await terminateStaleProviders(sessionId, cur);
       // No live actor and we hold the lock: we are the only journal writer.
       const j = JournalWriter.forSession(sessionId);
       try {
-        for (const t of TurnLedger.from(readJournal(sessionId)).openTurns()) {
+        const ledger = TurnLedger.from(readJournal(sessionId));
+        for (const t of ledger.openTurns()) {
           j.append({ type: 'turn.interrupted', messageId: t.messageId, reason: 'recovered' });
           removeInboxItem(sessionId, t.ulid);
+        }
+        for (const it of listPending(sessionId)) {
+          if (it.kind !== 'message' || ledger.intentUlids.has(it.ulid)) continue;
+          j.append({ type: 'inbox.dropped', ulid: it.ulid, messageId: it.messageId, reason: 'stopped' });
+          removeInboxItem(sessionId, it.ulid);
         }
         j.append({ type: 'actor.stopped', reason: 'stop', ...(opts.reason ? { error: opts.reason } : {}) });
         cur.lastSeq = Math.max(cur.lastSeq, j.lastSeq);
@@ -485,8 +666,13 @@ export function inspect(sessionId: string, opts: { tail?: number } = {}): Sessio
 export function deliveryVerdict(sessionId: string, messageId: string): DeliveryVerdict {
   assertValidSessionId(sessionId);
   const inInbox = listPending(sessionId).some((i) => i.kind === 'message' && i.messageId === messageId);
-  const turn = TurnLedger.from(readJournal(sessionId)).byMessageId.get(messageId);
-  return verdictFor(turn, inInbox, leaseLive(readActorState(sessionId)));
+  const ledger = TurnLedger.from(readJournal(sessionId));
+  return verdictFor(
+    ledger.byMessageId.get(messageId),
+    inInbox,
+    leaseLive(readActorState(sessionId)),
+    ledger.dropped.has(messageId),
+  );
 }
 
 /** spawn.json exists for this session. */

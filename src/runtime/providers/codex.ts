@@ -940,6 +940,7 @@ export function createCodexRuntime(options: CodexRuntimeOptions = {}): ProviderR
       } finally {
         fs.closeSync(errFd);
       }
+      launch.onSpawn?.({ pid: proc.pid, startTime: processStartTime(proc.pid) });
 
       const rt = new CodexProcessRuntime(proc, rawFd, {
         handshakeTimeoutMs: options.handshakeTimeoutMs ?? CODEX_HANDSHAKE_TIMEOUT_MS,

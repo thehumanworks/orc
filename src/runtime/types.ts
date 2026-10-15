@@ -74,6 +74,12 @@ export interface ProviderLaunch {
   env: Record<string, string>;
   /** Where the runtime must append verbatim provider protocol lines (debug stream). */
   rawLogPath: string;
+  /**
+   * Called by the factory synchronously, IMMEDIATELY after the child is spawned (before
+   * any handshake), so the kernel can record the pid before a long start can be cut by an
+   * actor crash. Must not throw.
+   */
+  onSpawn?: (id: ProcessIdentity) => void;
 }
 
 export interface TurnUsage {
@@ -176,6 +182,8 @@ export type JournalEvent =
       info?: Record<string, unknown>;
     }
   | { type: 'inbox.accepted'; ulid: string; kind: InboxItem['kind']; messageId?: string }
+  /** A queued message removed undelivered (the session was stopped). Its verdict is `failed`. */
+  | { type: 'inbox.dropped'; ulid: string; messageId: string; reason: 'stopped' }
   /** Effect-sandwich intent: committed (fsync) BEFORE the message is written to the provider. */
   | { type: 'turn.intent'; messageId: string; ulid: string; text: string }
   | { type: 'turn.started'; messageId: string }
@@ -186,6 +194,8 @@ export type JournalEvent =
   | { type: 'turn.failed'; messageId: string; error: string }
   | { type: 'turn.interrupted'; messageId: string; reason: TurnInterruptReason }
   | { type: 'permission.requested'; messageId?: string; detail: unknown }
+  /** Provider child spawned (journaled synchronously from ProviderLaunch.onSpawn, fsync'd). */
+  | { type: 'provider.spawned'; pid: number; startTime: string | null }
   | { type: 'provider.exited'; code: number | null; signal: string | null }
   | {
       type: 'actor.stopped';
@@ -242,11 +252,20 @@ export interface ActorStateFile {
   /** Number of turns that reached turn.completed (resume needs >= 1 for codex). */
   completedTurns: number;
   stopReason?: string;
+  /**
+   * Consecutive actor starts that ended before the provider became ready (reset on
+   * `ready`). After MAX_CONSECUTIVE_START_FAILURES the session is not auto-woken.
+   */
+  startFailures?: number;
+  /** Why the last failed start failed. */
+  lastStartError?: string;
   updatedAt: string;
 }
 
 /** Lease timing (design §4.2). */
 export const LEASE_HEARTBEAT_MS = 5_000;
 export const LEASE_TTL_MS = 30_000;
+/** Consecutive failed starts after which a session is no longer auto-woken. */
+export const MAX_CONSECUTIVE_START_FAILURES = 3;
 /** Inbox poll interval — the correctness path; fs.watch is only a latency hint. */
 export const INBOX_POLL_MS = 250;
