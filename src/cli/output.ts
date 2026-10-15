@@ -364,7 +364,10 @@ daemon + remote (drive agents on other orc hosts over tailscale):
                         invalid credentials → 401; authenticated but missing scope → 403.
                         Scopes: sessions:read|write, workflows:read|write, admin (implies all).
                         Kill/cancel/cleanup require admin; read/list require *:read;
-                        spawn/send/wait/run/resume/retry require *:write.
+                        spawn/send/wait/run/resume/retry require *:write. Other errors:
+                        400 bad request, 403 policy violation, 404 unknown session/run,
+                        409 stopped session / idempotency conflict / legacy session / run
+                        state, 502 provider failed to start, 500 anything else.
   orc remote add <h>    Trust peer <h> (also the host list for --host / --all-hosts).
   orc --host <h> <cmd>  Run <cmd> against the daemon on <h> (host or host:port) over HTTP
                         instead of locally — list/spawn/send/read/wait/state/kill/workflow.
@@ -377,20 +380,23 @@ codex provider (orc's built-in harness; no codex CLI needed):
   Talks to the OpenAI Responses API directly. Credentials, first match wins: \`orc login
   chatgpt\` (~/.orc/auth/chatgpt.json), pi's ChatGPT login (~/.pi/agent/auth.json, or
   $PI_CODING_AGENT_DIR), then OPENAI_API_KEY. Without --model a session uses the first model
-  your account lists (printed by spawn). Tools: read, write, edit, bash, ls. \`orc takeover\`
-  prints \`pi --session <file>\` (the harness writes pi's session format).
+  your ChatGPT account lists (API key: the newest chat model pi-ai knows); spawn prints it.
+  Tools: read, write, edit, bash, ls. No context compaction yet: a turn that overflows the
+  model's context window fails — start a new session. \`orc takeover\` prints
+  \`pi --session <file>\` (pi's session format; pi needs its own OpenAI login).
 
 Global:
   --host <h>            Run the command against the daemon on host <h> (see above)
   --json                machine-readable output; non-zero exit + {error} on failure
 
 Sessions run as detached per-session actors that drive each provider over a structured
-protocol (no terminal). Status: running (actor live) | suspended (actor gone
-without a stop — crash/reboot; the next send or \`orc resume\` wakes it) | spawning
-(being created right now) | dead (killed, taken over, or pre-actor legacy). \`orc list\` shows running + suspended; --dead/--all
-include dead. \`orc prune\` never removes suspended sessions unless --suspended, nor
-sessions taken over by \`orc takeover\` unless --taken-over (their dir holds the system
-prompt the printed provider resume command uses; hand back with \`orc resume <id>\`).
+protocol (no terminal). Status: running (actor live) | suspended (actor gone without a
+stop — crash/reboot; the next send or \`orc resume\` wakes it) | spawning (being created
+right now) | dead (killed, taken over, pre-actor legacy, or a codex app-server session).
+\`orc list\` shows running + suspended + spawning; --dead/--all include dead. \`orc prune\`
+never removes suspended sessions unless --suspended, nor sessions taken over by
+\`orc takeover\` unless --taken-over (their dir holds the system prompt the printed provider
+resume command uses; hand back with \`orc resume <id>\`).
 
 read defaults to the latest parsed conversation turn. --full emits the full parsed
 transcript, --index N emits zero-based parsed turn N, and --raw emits the session journal
