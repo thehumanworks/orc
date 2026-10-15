@@ -4,7 +4,8 @@ Status: **implemented (2026-10-15)**; proposed and judge-reviewed 2026-10-14. Su
 driver decision in `RESEARCH.md` §F.16c and the old `Driver` section of `ARCHITECTURE.md`.
 §1–6 are the decision record as reviewed; §7 lists where the build differs and what it added.
 **codex changed since (S9, §7.3):** the `codex app-server` runtime in §4.1 was replaced by orc's
-built-in codex harness; read the codex column of §4.1 as history.
+built-in codex harness; read the codex column of §4.1, the codex notes in §4.1/§5 and the S3 row
+of §6 as history.
 
 ## 1. Goal and constraints
 
@@ -197,12 +198,14 @@ use `spawnDetached`.
 |---|---|---|---|
 | S1 | **Actor kernel**: spawn spec, state/lease, journal, inbox, `spawnDetached`, `orc __actor`, scripted fake provider | — | tests: survives launcher exit; idempotent inbox; torn tail; crash → `turn.interrupted`; stale-provider kill; two senders → one actor; stop kills the group |
 | S2 | **claude runtime** | S1 | live: multi-line prompt, 2 turns, interrupt, SIGKILL actor mid-turn → resume → exactly one provider process → next turn |
-| S3 | **codex runtime** | S1 | contract test vs real `codex app-server` here; **live run on an authenticated host** |
+| S3 | **codex runtime** _(historical: the app-server runtime was replaced by S9)_ | S1 | contract test vs real `codex app-server` here; **live run on an authenticated host** |
 | S4 | **pi runtime** | S1 | contract test vs real `pi --mode rpc` here; **live run on an authenticated host** |
 | S6a | **Runners on `spawnDetached`**: runner schema, lease/reconcile, CLI + daemon spawn paths | S1 | workflow tests + live detached run |
 | S5 | **Cutover**: `agent()`, `Session`, registry, `deriveState`, send/wait/read/attach/kill/prune/resume/takeover, schema normalization, daemon raw views; delete `drivers/`, matchers, pane fixtures | S2, S3, S4, S6a | full suite + live claude end-to-end via CLI with **tmux absent from PATH** |
 | S6b | `StepDoneCtx.capture` from journal; live fan-out workflow | S5 | workflow tests + live run |
 | S7 | Docs, skill, dogfood, package metadata | S5, S6b | `grep -ri tmux` clean outside history docs |
+| S8 | One-command live verification (`scripts/verify-runtime/all.ts`, added during the build) | S5 | offline regression test; runs on an authenticated host |
+| S9 | **codex harness** replacing `codex app-server` (added during the build, §7.3) | S5 | offline fake-OpenAI tests through runtime + kernel + CLI; `check:compile`; live gate on the owner's login |
 
 S2, S3, S4 and S6a run in parallel in separate worktrees after S1. Each slice: Haiku context
 gatherer → Opus implementor → Fable judge; the orchestrator integrates. A
@@ -215,7 +218,7 @@ re-run on any authenticated macOS or Linux host.
 
 | # | Design says | Built | Where |
 |---|---|---|---|
-| 1 | Status "proposed" | Implemented; slices S1–S6b and S7 merged, plus S8 (one-command live verification) | git history of `feat/actor-runtime` |
+| 1 | Status "proposed" | Implemented; slices S1–S7 merged, plus S8 (one-command live verification), the S5 cutover fixes (§7.2) and S9 (codex harness, §7.3) | git history of `feat/actor-runtime` |
 | 2 | Journal vocabulary includes `provider.raw` (§4.3) | No `provider.raw` event: verbatim protocol lines go to `provider.jsonl` (debug only). Added events: `provider.spawned`, `provider.ready`, `inbox.dropped`, `actor.reopened` | `runtime/types.ts` `JournalEvent`; `runtime/layout.ts` |
 | 3 | Lease `{pid, pidStartTime, expiresAt}` (§4.2) | `ActorLease {pid, startTime, token, expiresAt}`; the token identifies the actor incarnation | `runtime/types.ts` |
 | 4 | `classifyState(pane)` → `deriveState(journalTail, liveness)` (§4.4) | `deriveState(view)` over a folded journal summary + inbox + `state.json`; `classifyState` / `reduceWait` deleted. An interrupted last turn is `done` (only a failed one is `failed`) | `runtime/derive.ts` |
@@ -224,7 +227,7 @@ re-run on any authenticated macOS or Linux host.
 | 7 | Daemon raw views return `journal` (§4.8; "server.ts ~392–453, client.ts ~35–40") | Daemon `api: 2` on `GET /health`; `read?raw` → `{kind:'raw', journal}`, logs `--raw` → `{step, provider, journal}`. v1 `pane` shapes stay in the client's types so a v2 client can read an old daemon | `daemon/server.ts` (`sessions.read`, `workflows.runs.logs`), `daemon/client.ts` |
 | 8 | One `scripts/verify-runtime.ts` (§6) | `scripts/verify-runtime/{claude,codex,pi}.ts` (runtime gates) + `all.ts` (gates, CLI end-to-end, detached workflow, tmux shim); `bun run verify:live` | `scripts/verify-runtime/README.md` |
 | 9 | Two-poll debounce goes away (§4.4) | Done: `waitFor` returns on the first matching observation (250 ms journal poll) | `session.ts` |
-| 10 | TUI-only slash commands unavailable (§5) | Verified live (claude 2.1.300, haiku, through `orc send`): `/compact` works over stream-json (`compact_boundary`, the turn completes with an empty result, context survives as a summary) and `/goal <condition>` installs a session Stop hook and the turn runs until the condition holds. Pickers / `/login` remain unavailable. codex/pi slash commands unverified | `skills/orc/SKILL.md` |
+| 10 | TUI-only slash commands unavailable (§5) | Verified live (claude 2.1.300, haiku, through `orc send`): `/compact` works over stream-json (`compact_boundary`, the turn completes with an empty result, context survives as a summary) and `/goal <condition>` installs a session Stop hook and the turn runs until the condition holds. Pickers / `/login` remain unavailable. pi slash commands unverified; the codex harness (S9) has none | `skills/orc/SKILL.md` |
 | 11 | Takeover = stop, then native resume (§4.5) | As designed: sticky stop → wait (≤ 15 s) for the provider group to exit → `cd <cwd> && <native resume>`; handback `orc resume` | `session.ts` `takeover` / `resume`, `provider-cli.ts` |
 | 12 | S7 gate: `grep -ri tmux` clean outside history docs | Remaining mentions are intentional: legacy-record / legacy-run normalisation and errors, tests that shadow `tmux` on PATH, the `verify:live` tmux shim, upgrade notes, and history (`RESEARCH.md`, this design) | — |
 | 13 | `spawn.json` holds an "argv template" (§4.3) | It holds the inputs (provider, cwd, env additions, model, agent, system prompt file, provider session id, transcript path); each runtime builds argv per launch | `runtime/spec.ts`, `runtime/types.ts` `SpawnSpec` |
@@ -245,9 +248,10 @@ re-run on any authenticated macOS or Linux host.
   human runs the native resume command.
 - **Abandoned stops.** An actor that dies mid-stop leaves phase `stopping` with a dead lease; it is
   reported as stopped and the next lock holder finalises it (never woken).
-- **Status is three-valued + spawn-pending.** `running | suspended | dead`; a young record without
-  `spawn.json` is a spawn in progress (listed, counted against `maxConcurrentSessions`, never
-  pruned).
+- **Status is four-valued.** `running | suspended | spawning | dead`; `spawning` is a record younger
+  than 10 min without `spawn.json` (a spawn in progress: listed, counted against
+  `maxConcurrentSessions`, never pruned; `state` reads `starting`). A codex session from the
+  app-server runtime is `dead`.
 - **Timeouts.** Send ack wait 10 s; `agent()` readiness 60 s (`readyTimeoutMs`); the actor's
   provider-ready bound 120 s (`ORC_ACTOR_READY_TIMEOUT_MS`); claude initialize 60 s
   (`ORC_CLAUDE_READY_TIMEOUT_MS`); actor stop grace 5 s.
@@ -257,6 +261,23 @@ re-run on any authenticated macOS or Linux host.
 - **Privacy.** Beyond §4.3's 0700/0600 session dirs, every file orc writes under `ORC_HOME`
   (registry, peers, run records, instruction drops, locks, artifacts) is owner-only, with explicit
   chmod; older state is tightened on its next write (`src/private-fs.ts`).
+- **Prune vs resume.** `pruneSessions` re-judges each candidate under its `actor-<sid>` lock and
+  removes record + dir while holding it; `--suspended` finalises the stop in that same section, so a
+  racing `orc resume` either wins or finds nothing (never an orphan record). Sessions a human took
+  over are kept unless `--taken-over`: their dir holds the system prompt the printed resume command
+  uses; `orc list` marks them.
+- **Taken-over workflow steps.** Resume never relaunches a step around a taken-over session: the
+  attempt fails `taken_over`; hand it back, then `retry --step`.
+- **Wake hygiene.** A wake refused by the execution policy drops its message (no later double
+  delivery); a waker's own `ORC_*` lineage never leaks into the session it wakes; spawn.json is
+  written before `provider.ready` is journaled.
+- **Forward-only attempt events.** Each attempt transition is emitted once, strictly forward
+  (persisted semantics unchanged).
+- **Daemon errors.** `httpStatusFor`: 400 invalid, 403 policy, 404 `ORC_SESSION_UNKNOWN`, 409
+  `ORC_SESSION_STOPPED` / `ORC_MESSAGE_CONFLICT` / `ORC_SESSION_LEGACY` / run state, 502
+  `ORC_SESSION_START_FAILED`, else 500. `--host` tolerates v1 daemons (`submitted`, `pane`).
+- **Locks.** Owners are recorded as `{pid, startTime, host, token}`; a lock whose owner is provably
+  gone (dead, zombie, recycled pid) is reclaimed on the next poll instead of after 5 min.
 
 ### 7.3 S9: the codex harness replaces `codex app-server` (2026-10-15)
 
@@ -272,10 +293,14 @@ Owner decision: embed pi's libraries instead of driving the codex CLI.
 | Yolo / prompts | no approvals exist; system prompt = harness prompt + file (append) or the file (replace); codex TOML agents still resolve into it |
 | Persistence | pi session JSONL v3 at `~/.orc/sessions/<sid>/codex-session.jsonl` (every finalised message appended); resume replays the active branch; `orc read` uses the pi parser |
 | Takeover | `cd <cwd> && pi --session <file>` (verified: pi 1.2.0 opens a harness file with its messages, model and thinking level, from any cwd); pi needs its own OpenAI login |
+| Limits | no context compaction yet: a context-window overflow fails the turn ("…start a new session"); no slash commands (a `/…` message is plain text) |
 | Legacy | sessions from the app-server runtime (provider session id = codex thread id) are `dead`, have no transcript, and refuse resume |
 | Verification | offline: a fake Responses/models/token server drives the real harness through the runtime and the kernel; `bun run check:compile` runs the compiled binary's `--self-test`. Live: `scripts/verify-runtime/codex.ts` (needs the owner's login) |
 
 Not verified live yet (no OpenAI account in the build environment): a real SIWC token against
 `/v1/responses` and `/v1/models` (and whether orc's `dynamic_agent_client` registration is
-accepted — SIWC is an OpenAI partner program), refresh-token rotation against the real token
-endpoint, and the compiled binary's end-to-end login.
+accepted), refresh-token rotation against the real token endpoint, and the compiled binary's
+end-to-end login. Eligibility: per OpenAI's
+[Sign in with ChatGPT guide](https://developers.openai.com/cookbook/articles/sign-in-with-chatgpt),
+plan usage is offered to open-source projects and personal projects that run locally (paid or
+remotely hosted apps must request access); otherwise `OPENAI_API_KEY` applies.

@@ -52,7 +52,14 @@ GET  /health , GET /whoami               → daemon identity + version + `api` (
 ```
 
 `GET /health` reports `api: 2` since the actor runtime: raw reads and `logs?raw` return the
-session `journal` (v1 daemons returned a tmux `pane`; the client still understands both).
+session `journal` (v1 daemons returned a tmux `pane`; the client still understands both, and
+treats a v1 `submitted` send phase as success).
+
+Errors are `{"error"}` with a status (`server.ts` `httpStatusFor`): 400 invalid request; 401 / 403
+authentication / scope; 403 execution-policy violation (spawn, wake); 404 unknown session
+(`ORC_SESSION_UNKNOWN`) or run; 409 stopped session (`ORC_SESSION_STOPPED`), idempotency-key
+conflict (`ORC_MESSAGE_CONFLICT`), legacy session (`ORC_SESSION_LEGACY`) or run state (cancelled,
+live owner); 502 provider failed to start (`ORC_SESSION_START_FAILED`); 500 anything else.
 
 ## Backgrounding ties to F2
 A detached workflow (F2b) running on a host's daemon is exactly what a remote peer queries via
