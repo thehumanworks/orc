@@ -33,8 +33,9 @@
  *                                     process group — incl. codex's `git` helpers — is gone)
  *
  * Raw log: every protocol line in both directions is appended to `launch.rawLogPath` as
- * `{"ts","dir":"in"|"out","line"}` (in = codex→orc stdout, out = orc→codex stdin); runtime
- * notes (stray lines, auto-replies to unknown requests) use `dir:"note"`.
+ * `{"ts","dir":"send"|"recv","line"}` (send = orc→codex stdin, recv = codex→orc stdout;
+ * the orc-wide raw-log format); runtime notes (stray lines, orphan interrupts, auto-replies
+ * to unknown requests) use `dir:"info"`.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -68,6 +69,7 @@ import {
   type ThreadStartParams,
   type ThreadTokenUsageUpdatedNotification,
   type TurnNotification,
+  type Turn,
   type TurnInterruptParams,
   type TurnInterruptResponse,
   type TurnStartParams,
@@ -127,6 +129,15 @@ export interface CodexProtocolOptions {
   requestTimeoutMs?: number;
 }
 
+interface EarlyNotification {
+  method: string;
+  params: unknown;
+  turnId: string;
+}
+
+/** Cap on buffered early notifications per turn (deltas are not buffered). */
+const EARLY_BUFFER_MAX = 1_000;
+
 interface OpenTurn {
   messageId: string;
   /** Known once the turn/start response arrived. */
@@ -134,8 +145,13 @@ interface OpenTurn {
   startedEmitted: boolean;
   /** codex announced the turn (`turn/started`): only now does turn/interrupt take effect. */
   activeSeen: boolean;
-  /** turn/started ids seen before the turn/start response (defensive; not observed). */
-  earlyStartedIds: Set<string>;
+  /**
+   * Turn-scoped notifications that arrived while the turn/start response (which names our
+   * turn id) was still in flight. Not observed with 0.162.1 (the response always came
+   * first), but if it happens they are replayed in order right after `turn.started`, so a
+   * fast turn/completed can never be dropped and leave the turn open forever.
+   */
+  early: EarlyNotification[];
   /** Resolves when the turn is active in codex, or ended / the connection closed. */
   active: Promise<void>;
   resolveActive: () => void;
@@ -248,7 +264,7 @@ export class CodexProtocol {
       turnId: null,
       startedEmitted: false,
       activeSeen: false,
-      earlyStartedIds: new Set(),
+      early: [],
       active,
       resolveActive,
       usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
@@ -274,6 +290,11 @@ export class CodexProtocol {
               if (o.error instanceof RpcClosedError) return; // `exited` follows
               this.turn = null;
               turn.resolveActive();
+              // A timed-out turn/start may still have started a turn in codex (its turn/started
+              // was buffered): interrupt it so nothing keeps running behind the kernel's back.
+              for (const id of new Set(turn.early.filter((e) => e.method === NOTIFY.turnStarted).map((e) => e.turnId))) {
+                this.interruptOrphan(id);
+              }
               this.emit({ type: 'turn.failed', messageId, error: `codex turn/start failed: ${o.error.message}` });
             } finally {
               resolve();
@@ -347,10 +368,57 @@ export class CodexProtocol {
 
   private markStarted(turn: OpenTurn, turnId: string): void {
     if (!turn.turnId) turn.turnId = turnId;
-    if (turn.earlyStartedIds.has(turn.turnId)) this.markActive(turn);
     if (!turn.startedEmitted) {
       turn.startedEmitted = true;
       this.emit({ type: 'turn.started', messageId: turn.messageId });
+    }
+    // Replay what arrived before we knew our turn id (in arrival order, so an early
+    // turn/completed lands last and closes the turn exactly once).
+    const early = turn.early.splice(0);
+    for (const e of early) {
+      if (e.turnId === turn.turnId) {
+        if (this.turn === turn) this.onNotification(e.method, e.params);
+      } else if (e.method === NOTIFY.turnStarted) {
+        this.interruptOrphan(e.turnId);
+      }
+    }
+  }
+
+  /**
+   * Buffer a turn-scoped notification while the open turn's id is still unknown (the
+   * turn/start response is in flight). Returns true when buffered.
+   */
+  private bufferIfEarly(method: string, params: unknown, turnId: unknown): boolean {
+    const t = this.turn;
+    if (!t || t.turnId !== null || typeof turnId !== 'string' || turnId.length === 0) return false;
+    if (t.early.length < EARLY_BUFFER_MAX) t.early.push({ method, params, turnId });
+    return true;
+  }
+
+  /** Best-effort interrupt of a codex turn orc does not own. */
+  private interruptOrphan(turnId: string): void {
+    const threadId = this.threadIdValue;
+    if (!threadId || this.closedReason) return;
+    this.note(`interrupting orphan codex turn ${turnId}`);
+    const params: TurnInterruptParams = { threadId, turnId };
+    this.rpc.request<TurnInterruptResponse>('turn/interrupt', params, { timeoutMs: this.requestTimeoutMs }).catch(() => {});
+  }
+
+  /** Emit the single outcome for `t` from codex's final turn object and close it. */
+  private finishTurn(t: OpenTurn, turn: Turn): void {
+    this.turn = null;
+    t.resolveActive();
+    if (turn.status === 'completed') {
+      const result = t.finalAnswerText ?? t.lastText ?? lastAgentText(turn.items);
+      const ev: ProviderEvent = { type: 'turn.completed', messageId: t.messageId };
+      if (result !== undefined) ev.result = result;
+      if (t.sawUsage) ev.usage = { ...t.usage };
+      this.emit(ev);
+    } else if (turn.status === 'failed') {
+      const error = turn.error?.message ?? t.lastError ?? 'codex turn failed';
+      this.emit({ type: 'turn.failed', messageId: t.messageId, error });
+    } else {
+      this.emit({ type: 'turn.interrupted', messageId: t.messageId });
     }
   }
 
@@ -376,16 +444,10 @@ export class CodexProtocol {
           this.markActive(t);
           return;
         }
-        if (t && t.turnId === null) {
-          t.earlyStartedIds.add(id); // ours if the ack (still in flight) names it
-          return;
-        }
+        if (this.bufferIfEarly(method, params, id)) return; // ours if the in-flight ack names it
         // A turn orc does not own (e.g. a turn/start whose response timed out) must not
         // keep running behind the kernel's back.
-        this.note(`interrupting orphan codex turn ${id}`);
-        this.rpc
-          .request('turn/interrupt', { threadId: n.threadId, turnId: id }, { timeoutMs: this.requestTimeoutMs })
-          .catch(() => {});
+        this.interruptOrphan(id);
         return;
       }
       case NOTIFY.itemStarted:
@@ -404,6 +466,7 @@ export class CodexProtocol {
           return;
         }
         if (method !== NOTIFY.itemCompleted || item.type !== 'agentMessage') return;
+        if (this.bufferIfEarly(method, params, n.turnId)) return;
         const t = this.currentTurnFor(n.turnId);
         if (!t) return;
         const am = item as AgentMessageItem;
@@ -415,9 +478,13 @@ export class CodexProtocol {
       }
       case NOTIFY.tokenUsageUpdated: {
         const n = p as unknown as ThreadTokenUsageUpdatedNotification;
+        if (this.bufferIfEarly(method, params, n.turnId)) return;
         const t = this.currentTurnFor(n.turnId);
         const last = n.tokenUsage?.last;
         if (!t || !last) return;
+        // Summed `last` (one update per model call). NOTE: unlike claude, codex/OpenAI
+        // `inputTokens` INCLUDES the cached input tokens (`cachedInputTokens` is a subset of
+        // it, reported again here as cacheReadTokens); do not add the two together.
         t.sawUsage = true;
         t.usage.inputTokens += num(last.inputTokens);
         t.usage.outputTokens += num(last.outputTokens);
@@ -427,6 +494,7 @@ export class CodexProtocol {
       }
       case NOTIFY.error: {
         const n = p as unknown as ErrorNotification;
+        if (this.bufferIfEarly(method, params, n.turnId)) return;
         const t = this.currentTurnFor(n.turnId);
         if (t && !n.willRetry && typeof n.error?.message === 'string') t.lastError = n.error.message;
         return;
@@ -434,23 +502,11 @@ export class CodexProtocol {
       case NOTIFY.turnCompleted: {
         const n = p as unknown as TurnNotification;
         const turn = n.turn;
-        const t = this.currentTurnFor(turn?.id);
-        if (!t || !turn) return;
-        if (turn.status === 'inProgress') return;
-        this.turn = null;
-        t.resolveActive();
-        if (turn.status === 'completed') {
-          const result = t.finalAnswerText ?? t.lastText ?? lastAgentText(turn.items);
-          const ev: ProviderEvent = { type: 'turn.completed', messageId: t.messageId };
-          if (result !== undefined) ev.result = result;
-          if (t.sawUsage) ev.usage = { ...t.usage };
-          this.emit(ev);
-        } else if (turn.status === 'failed') {
-          const error = turn.error?.message ?? t.lastError ?? 'codex turn failed';
-          this.emit({ type: 'turn.failed', messageId: t.messageId, error });
-        } else {
-          this.emit({ type: 'turn.interrupted', messageId: t.messageId });
-        }
+        if (!turn) return;
+        if (this.bufferIfEarly(method, params, turn.id)) return;
+        const t = this.currentTurnFor(turn.id);
+        if (!t || turn.status === 'inProgress') return;
+        this.finishTurn(t, turn);
         return;
       }
       default:
@@ -593,7 +649,7 @@ class CodexProcessRuntime implements ProviderRuntime {
     this.proto = new CodexProtocol({
       write: (line) => this.writeLine(line),
       emit: (ev) => this.queue.push(ev),
-      note: (msg) => this.raw('note', msg),
+      note: (msg) => this.raw('info', msg),
       handshakeTimeoutMs: opts.handshakeTimeoutMs,
       requestTimeoutMs: opts.requestTimeoutMs,
     });
@@ -665,7 +721,7 @@ class CodexProcessRuntime implements ProviderRuntime {
 
   private writeLine(line: string): void {
     if (this.stdinClosed) throw new Error('stdin closed');
-    this.raw('out', line);
+    this.raw('send', line);
     this.proc.stdin.write(`${line}\n`);
     const r = this.proc.stdin.flush();
     if (r instanceof Promise) r.catch(() => {});
@@ -676,7 +732,7 @@ class CodexProcessRuntime implements ProviderRuntime {
     let buf = '';
     const onLine = (line: string): void => {
       if (line.trim().length === 0) return;
-      this.raw('in', line);
+      this.raw('recv', line);
       try {
         this.proto.handleLine(line);
       } catch {
@@ -699,7 +755,7 @@ class CodexProcessRuntime implements ProviderRuntime {
     if (buf.length > 0) onLine(buf);
   }
 
-  private raw(dir: 'in' | 'out' | 'note', line: string): void {
+  private raw(dir: 'send' | 'recv' | 'info', line: string): void {
     if (this.rawFd === null) return;
     try {
       fs.writeSync(this.rawFd, `${JSON.stringify({ ts: new Date().toISOString(), dir, line })}\n`);
@@ -728,9 +784,14 @@ function sweepGroup(pgid: number): void {
   }
 }
 
+/** Poll interval while waiting for SIGKILLed group members to disappear. */
+const GROUP_POLL_MS = 50;
+
 /**
- * Live (non-zombie) members of process group `pgid`; null when unknown (no `ps`). A
- * zombie only waits for its parent/init to reap it and holds no locks or files.
+ * Live (non-zombie) members of process group `pgid`; null when unknown. A zombie only
+ * waits for its parent/init to reap it and holds no locks or files. Fast path: ESRCH from
+ * kill(-pgid, 0) means the group is empty. Linux reads /proc/<pid>/stat (no subprocess);
+ * elsewhere (macOS) one `ps` call.
  */
 function liveGroupMemberCount(pgid: number): number | null {
   try {
@@ -738,6 +799,37 @@ function liveGroupMemberCount(pgid: number): number | null {
   } catch (e) {
     if ((e as { code?: string }).code === 'ESRCH') return 0;
   }
+  return procGroupMemberCount(pgid) ?? psGroupMemberCount(pgid);
+}
+
+function procGroupMemberCount(pgid: number): number | null {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync('/proc');
+  } catch {
+    return null; // no procfs
+  }
+  const want = String(pgid);
+  let n = 0;
+  let readAny = false;
+  for (const e of entries) {
+    if (e.charCodeAt(0) < 48 || e.charCodeAt(0) > 57) continue; // not a pid dir
+    let stat: string;
+    try {
+      stat = fs.readFileSync(`/proc/${e}/stat`, 'utf8');
+    } catch {
+      continue; // exited meanwhile
+    }
+    readAny = true;
+    // comm (field 2) may contain spaces/parens: parse after the LAST ')'.
+    // rest[0] = state (field 3), rest[2] = pgrp (field 5).
+    const rest = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    if (rest[2] === want && rest[0] !== 'Z' && rest[0] !== 'X') n++;
+  }
+  return readAny ? n : null;
+}
+
+function psGroupMemberCount(pgid: number): number | null {
   try {
     const r = Bun.spawnSync(['ps', '-A', '-o', 'pgid=,stat='], {
       stdout: 'pipe',
@@ -762,7 +854,7 @@ async function waitGroupGone(pgid: number, ms: number): Promise<void> {
   for (;;) {
     const n = liveGroupMemberCount(pgid);
     if (n === null || n === 0 || Date.now() >= end) return;
-    await Bun.sleep(15);
+    await Bun.sleep(GROUP_POLL_MS);
   }
 }
 

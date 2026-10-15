@@ -7,7 +7,8 @@
  *    are replayed into CodexProtocol and the emitted ProviderEvents / written replies asserted.
  * 3. REAL-process contract tests against `codex app-server` with a per-test temp CODEX_HOME
  *    that routes the model to an in-process stub Responses API (never touches ~/.codex).
- *    Binary: ORC_TEST_CODEX_BIN, else the probe install below; skipped when absent.
+ *    Binary: ORC_TEST_CODEX_BIN, else `codex` on PATH, else the probe install below; the
+ *    suite is skipped (visibly) when none exists. The pin test fails on another version.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
 import fs from 'node:fs';
@@ -26,10 +27,11 @@ import type { ProviderEvent, ProviderRuntime, SpawnSpec } from '../src/runtime/t
 import { makeStubCodexHome, startCodexStub, type CodexStub } from './fixtures/codex-stub.ts';
 
 const FIXTURES = path.join(import.meta.dir, 'fixtures', 'codex');
-const DEFAULT_TEST_CODEX_BIN =
+const PROBE_CODEX_BIN =
   '/tmp/claude-0/-home-claude/b00ce3a9-453c-561e-a590-e55f008719e0/scratchpad/cx/node_modules/.bin/codex';
-const CODEX_BIN = process.env.ORC_TEST_CODEX_BIN ?? DEFAULT_TEST_CODEX_BIN;
-const HAVE_CODEX = fs.existsSync(CODEX_BIN);
+const CODEX_BIN: string | null =
+  process.env.ORC_TEST_CODEX_BIN ?? Bun.which('codex') ?? (fs.existsSync(PROBE_CODEX_BIN) ? PROBE_CODEX_BIN : null);
+const HAVE_CODEX = CODEX_BIN !== null && fs.existsSync(CODEX_BIN);
 
 /** Resolves with the rejection reason of `p`; fails the test if `p` resolves. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -464,6 +466,87 @@ describe('codex protocol state machine (synthetic lines)', () => {
     expect(s.events.at(-1)).toEqual({ type: 'turn.failed', messageId: 'm1', error: 'final boom' });
   });
 
+  test('turn/completed BEFORE the turn/start response is buffered: exactly [turn.started, turn.failed]', async () => {
+    const s = synthetic();
+    await s.openThread();
+    const sendP = s.proto.send('m1', 'hi');
+    const startId = s.lastId();
+    s.feed({ method: 'turn/started', params: { threadId: 'T', turn: { id: 'U', status: 'inProgress', items: [] } } });
+    s.feed({
+      method: 'turn/completed',
+      params: { threadId: 'T', turn: { id: 'U', status: 'failed', items: [], error: { message: 'early boom' } } },
+    });
+    expect(s.events).toEqual([]);
+    s.feed({ id: startId, result: { turn: { id: 'U', status: 'inProgress', items: [] } } });
+    await sendP;
+    expect(s.events).toEqual([
+      { type: 'turn.started', messageId: 'm1' },
+      { type: 'turn.failed', messageId: 'm1', error: 'early boom' },
+    ]);
+    expect(s.proto.openTurnMessageId).toBeNull();
+    expect(s.written.some((w) => w.method === 'turn/interrupt')).toBe(false);
+    // the runtime accepts the next turn
+    await s.openTurn('m2', 'V');
+    expect(s.events.at(-1)).toEqual({ type: 'turn.started', messageId: 'm2' });
+  });
+
+  test('early text, usage and completion are replayed in order after turn.started', async () => {
+    const s = synthetic();
+    await s.openThread();
+    const sendP = s.proto.send('m1', 'hi');
+    const startId = s.lastId();
+    s.feed({ method: 'turn/started', params: { threadId: 'T', turn: { id: 'U', status: 'inProgress', items: [] } } });
+    s.feed({ method: 'item/completed', params: { threadId: 'T', turnId: 'U', item: { type: 'agentMessage', id: 'a', text: 'early answer', phase: null } } });
+    s.feed({
+      method: 'thread/tokenUsage/updated',
+      params: {
+        threadId: 'T',
+        turnId: 'U',
+        tokenUsage: {
+          last: { totalTokens: 9, inputTokens: 7, cachedInputTokens: 2, cacheWriteInputTokens: 0, outputTokens: 2, reasoningOutputTokens: 0 },
+        },
+      },
+    });
+    s.feed({ method: 'turn/completed', params: { threadId: 'T', turn: { id: 'U', status: 'completed', items: [], error: null } } });
+    s.feed({ id: startId, result: { turn: { id: 'U', status: 'inProgress', items: [] } } });
+    await sendP;
+    expect(s.events).toEqual([
+      { type: 'turn.started', messageId: 'm1' },
+      { type: 'assistant.text', messageId: 'm1', text: 'early answer' },
+      {
+        type: 'turn.completed',
+        messageId: 'm1',
+        result: 'early answer',
+        usage: { inputTokens: 7, outputTokens: 2, cacheReadTokens: 2, cacheWriteTokens: 0 },
+      },
+    ]);
+  });
+
+  test('an early turn/started for a different turn than the ack names is interrupted as an orphan', async () => {
+    const s = synthetic();
+    await s.openThread();
+    const sendP = s.proto.send('m1', 'hi');
+    const startId = s.lastId();
+    s.feed({ method: 'turn/started', params: { threadId: 'T', turn: { id: 'STRAY', status: 'inProgress', items: [] } } });
+    s.feed({ id: startId, result: { turn: { id: 'U', status: 'inProgress', items: [] } } });
+    await sendP;
+    expect(s.written.at(-1)).toMatchObject({ method: 'turn/interrupt', params: { threadId: 'T', turnId: 'STRAY' } });
+    expect(s.events).toEqual([{ type: 'turn.started', messageId: 'm1' }]);
+    expect(s.proto.openTurnMessageId).toBe('m1');
+  });
+
+  test('turn/start timeout after codex already started the turn → that turn is interrupted, then turn.failed', async () => {
+    const s = synthetic({ requestTimeoutMs: 40 });
+    await s.openThread();
+    const sendP = s.proto.send('m1', 'hi');
+    s.feed({ method: 'turn/started', params: { threadId: 'T', turn: { id: 'LATE', status: 'inProgress', items: [] } } });
+    await sendP;
+    expect(s.written.at(-1)).toMatchObject({ method: 'turn/interrupt', params: { threadId: 'T', turnId: 'LATE' } });
+    expect(s.events).toEqual([
+      { type: 'turn.failed', messageId: 'm1', error: 'codex turn/start failed: codex turn/start timed out after 40ms' },
+    ]);
+  });
+
   test('turn/start timeout → turn.failed (send resolves; the turn closes)', async () => {
     const s = synthetic({ requestTimeoutMs: 40 });
     await s.openThread();
@@ -675,7 +758,7 @@ describe.skipIf(!HAVE_CODEX)('codex app-server contract (real process, stub Resp
     const cwd = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'orc-codex-cwd-')));
     const state = fs.mkdtempSync(path.join(os.tmpdir(), 'orc-codex-state-'));
     tmpDirs.push(home, cwd, state);
-    const env = { ...(process.env as Record<string, string>), CODEX_HOME: home, ORC_CODEX_BIN: CODEX_BIN };
+    const env = { ...(process.env as Record<string, string>), CODEX_HOME: home, ORC_CODEX_BIN: CODEX_BIN! };
     const spec: SpawnSpec = {
       version: 1,
       sessionId: crypto.randomUUID(),
@@ -758,8 +841,9 @@ describe.skipIf(!HAVE_CODEX)('codex app-server contract (real process, stub Resp
 
       await closeAndCheck(rt, c);
       const raw = fs.readFileSync(e.rawLogPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
-      expect(raw.some((r) => r.dir === 'out' && JSON.parse(r.line).method === 'turn/start')).toBe(true);
-      expect(raw.some((r) => r.dir === 'in' && JSON.parse(r.line).method === 'turn/completed')).toBe(true);
+      expect(raw.some((r) => r.dir === 'send' && JSON.parse(r.line).method === 'turn/start')).toBe(true);
+      expect(raw.some((r) => r.dir === 'recv' && JSON.parse(r.line).method === 'turn/completed')).toBe(true);
+      expect(raw.every((r) => ['send', 'recv', 'info'].includes(r.dir) && typeof r.ts === 'string')).toBe(true);
       expect(fs.existsSync(codexStderrLogPath(e.rawLogPath))).toBe(true);
       expect(fs.statSync(e.rawLogPath).mode & 0o777).toBe(0o600);
     },
@@ -978,5 +1062,7 @@ describe.skipIf(!HAVE_CODEX)('codex app-server contract (real process, stub Resp
 });
 
 if (!HAVE_CODEX) {
-  test.skip(`codex contract tests skipped: no codex binary at ${CODEX_BIN} (set ORC_TEST_CODEX_BIN to a codex ${CODEX_PROTOCOL_VERIFIED_VERSION} binary)`, () => {});
+  const why = `codex contract tests SKIPPED: no codex binary (${CODEX_BIN ?? 'none on PATH'}); set ORC_TEST_CODEX_BIN to a codex ${CODEX_PROTOCOL_VERIFIED_VERSION} binary`;
+  console.warn(`[runtime-codex] ${why}`);
+  test.skip(why, () => {});
 }
