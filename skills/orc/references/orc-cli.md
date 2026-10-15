@@ -30,9 +30,9 @@ Conventions:
 | `orc kill <sel>` | `--worktree`, `--purge` | 0 / 1 | `{ok, id, purged}` |
 | `orc resume <sel>` | — | 0 / 1 | same as `state --json` |
 | `orc takeover <sel>` | — | 0 / 1 | `{id, cwd, command, note?}` |
-| `orc prune` | `--worktree`, `--suspended` | 0 / 1 | `{ok, pruned: [ids]}` |
+| `orc prune` | `--worktree`, `--suspended`, `--taken-over` | 0 / 1 | `{ok, pruned: [ids]}` |
 | `orc login chatgpt` | `--import-pi`, `--no-browser` | 0 / 1 | — (Sign in with ChatGPT for codex; stored in `~/.orc/auth/chatgpt.json`) |
-| `orc login status` | — | 0 | `{active: orc\|pi\|env\|none, orc, pi, openaiApiKey}` (no secrets) |
+| `orc login status` | — | 0; 1 if a credential file is unreadable (`active: error`) | `{active: orc\|pi\|env\|none\|error, error?, orc: {path, credential, error?}, pi: {…}, openaiApiKey}` (no secrets) |
 | `orc logout chatgpt` | — | 0 | — (orc's credential only; pi's login is untouched) |
 
 ### spawn options
@@ -74,8 +74,9 @@ queued) · `done` (yielded; ready for input — not "succeeded") · `waiting` (p
 denies it) · `failed` (last turn failed, or not live). An interrupted last turn is `done`.
 
 `status` (is there an actor): `running` (live lease) · `suspended` (actor gone without a stop;
-resumable; the next send wakes it) · `dead` (killed, taken over, legacy tmux record, or no runtime
-state; sticky).
+resumable; the next send wakes it) · `spawning` (just reserved by a spawn; `state` reads
+`starting`) · `dead` (killed, taken over, legacy tmux record, codex app-server session, or no
+runtime state; sticky). Taken-over sessions are `dead` with `stoppedBy: "takeover"` on the record.
 
 | `state --json` | means |
 | --- | --- |
@@ -102,10 +103,13 @@ last state and exits 1. After 3 consecutive failed starts a session is no longer
   OpenAI login.
 - `kill`: sticky stop; drops queued messages; keeps the record and journal (`read` still works).
   `--purge` removes the record and session dir; `--worktree` removes the worktree (not the branch).
-- `prune`: removes `dead` records and their session dirs. Keeps `running`; keeps `suspended` unless
-  `--suspended` (which stops them first); keeps a spawn in progress (< 10 min).
-- `list`: default = current workspace, `running` + `suspended`. `--all` = every workspace incl.
-  dead; `--dead` adds dead; `--run ID` = sessions of a run tree (implies `--all`).
+- `prune`: removes `dead` records and their session dirs. Keeps `running` and `spawning` (< 10
+  min); keeps `suspended` unless `--suspended` (stopped first, under the session lock, so a racing
+  `orc resume` either wins or finds nothing); keeps taken-over sessions unless `--taken-over` (the
+  human's resume command uses their system prompt file).
+- `list`: default = current workspace, `running` + `suspended` + `spawning`. `--all` = every
+  workspace incl. dead; `--dead` adds dead; `--run ID` = sessions of a run tree (implies `--all`).
+  Text output marks taken-over sessions `taken-over(hand back: orc resume <id>)`.
 
 ## Workflows
 
@@ -131,6 +135,9 @@ last state and exits 1. After 3 consecutive failed starts a session is no longer
 - `ExecutionPolicy`: `maxDepth`, `maxSessions`, `maxConcurrentSessions` (live actors), `deadlineMs`,
   `canDelegate`; fail-closed. Token/cost budgets are not enforced.
 - Step sessions stay alive after the run; `cleanup --sessions --worktrees` when done.
+- A step whose session a human took over is never relaunched by `resume`: the attempt fails as
+  `taken_over`; `orc resume <id>`, then `orc workflow retry <runId> --step <id>`.
+- Each attempt transition is emitted once, forward only.
 
 ## Named agents
 
@@ -146,10 +153,14 @@ last state and exits 1. After 3 consecutive failed starts a session is no longer
 All sessions run in yolo mode: claude `--permission-mode bypassPermissions`; pi `-a`; codex is
 orc's built-in harness (pi-ai + pi-agent-core → OpenAI Responses API) with no approvals and the
 tools `read`/`write`/`edit`/`bash`/`ls`. codex credentials, first match wins: `orc login chatgpt`,
-pi's ChatGPT login (`~/.pi/agent/auth.json`), `OPENAI_API_KEY`. System prompts go through an
-orc-owned file, never argv or the worktree. Slash commands: claude `/compact` and `/goal <condition>`
-work through `orc send` (verified, claude 2.1.300); pickers and `/login` don't; pi unverified;
-codex has none (sent as text).
+pi's ChatGPT login (`~/.pi/agent/auth.json`), `OPENAI_API_KEY`; `orc login status` shows which.
+codex model without `--model`: the first model the ChatGPT account lists (API key: the newest chat
+model pi-ai knows), recorded on the session. **codex has no context compaction yet**: a turn that
+overflows the context window fails with "…start a new session" — spawn a fresh session with a
+summary. System prompts go through an orc-owned file, never argv or the worktree. Slash commands:
+claude `/compact` and `/goal <condition>` work through `orc send` (verified, claude 2.1.300);
+pickers and `/login` don't; pi unverified; codex has none (sent as text). codex sessions from the
+removed `codex app-server` runtime are `dead` with no transcript.
 
 ## Daemon & remote hosts
 
@@ -164,6 +175,11 @@ Auth is fail-closed: allowlisted tailnet identity (all scopes), `Authorization: 
 `ORC_DAEMON_TOKEN`; server `ORC_DAEMON_TOKENS` JSON token→scopes), or legacy `x-orc-secret` =
 `ORC_DAEMON_SECRET`. 401 = no/invalid credentials; 403 = missing scope (`sessions:read|write`,
 `workflows:read|write`, `admin`). `GET /health` → `{ok, version, host, api: 2}`.
+
+Other daemon errors (`{"error"}`): 400 invalid request · 403 execution policy forbids a spawn/wake
+· 404 unknown session or run · 409 stopped session (`orc resume` first), idempotency-key conflict,
+legacy session, or run state (cancelled / live owner) · 502 provider failed to start · 500 other.
+`--host` also works against a v1 (pre-actor) daemon (`submitted` send = success; `pane` reads).
 
 ## SDK (TypeScript)
 
@@ -181,7 +197,8 @@ await s.kill({ removeWorktree: true });
 
 `waitForResult()` adds `settled`; `send()` throws `SessionNotControllableError` (`code`
 `ORC_SESSION_STOPPED` | `ORC_MESSAGE_CONFLICT` | `ORC_SESSION_LEGACY` | `ORC_SESSION_UNKNOWN`).
-Also: `interrupt()`, `takeover()`, `resume()`, `attach({signal})`, `pruneSessions({suspended})`.
+Also: `interrupt()`, `takeover()`, `resume()`, `attach({signal})`,
+`pruneSessions({suspended, takenOver})`. `SessionStatus` = `running|suspended|spawning|dead`.
 Use the SDK when orchestration logic is non-trivial or reused (loops, fan-out, branching); use the
 CLI for quick steering.
 
@@ -192,3 +209,5 @@ CLI for quick steering.
 - `~/.orc/sessions/<sid>/journal.jsonl` is the source of truth for state (`read --raw`, `attach`);
   the provider transcript (what `read` parses) persists after `kill`.
 - `~/.orc/runs/<runId>.json` holds the run record, including step prompts.
+- codex: login in `~/.orc/auth/chatgpt.json` (`ORC_AUTH_DIR`), transcript
+  `~/.orc/sessions/<sid>/codex-session.jsonl` (pi session format).

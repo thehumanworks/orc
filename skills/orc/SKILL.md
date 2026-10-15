@@ -46,7 +46,7 @@ orc state <id|@alias> --json         # starting|running|done|waiting|failed (+ s
 orc wait  <id|@alias> [--for done|settled] [--timeout SEC]  # BLOCK until it settles
 orc read  <id|@alias> [--full|--index N|--raw]  # latest parsed turn; --full transcript; --raw journal
 orc list  [--all] --json             # running + suspended here; --all adds dead + other workspaces
-orc kill  <id|@alias> [--worktree] [--purge]; orc prune [--worktree] [--suspended]
+orc kill  <id|@alias> [--worktree] [--purge]; orc prune [--worktree] [--suspended] [--taken-over]
 orc resume <id|@alias>; orc takeover <id|@alias>   # hand back / hand to a human
 orc workflow run <file.ts> [--detach] [--max-concurrency N]; orc workflow logs <runId> [--step id]
 ```
@@ -88,7 +88,8 @@ transcript to confirm.
 | `state: done` | turn yielded | read it; verify; send the next instruction |
 | `state: running` | turn open or message queued | `orc wait` |
 | `state: waiting` | provider asked for a permission (rare in yolo; orc denies it) | read it; re-instruct |
-| `state: failed`, `stopped: false`, `suspended: false` | the last turn failed | read the error (`orc state --json` → `lastTurn.error`); resend or respawn |
+| `state: starting`, status `spawning`/`running` | provider still booting | `orc wait` |
+| `state: failed`, `stopped: false`, `suspended: false` | the last turn failed | read the error (`orc state --json` → `lastTurn.error`); resend or respawn. codex error "…exceeds the model's context window; start a new session": codex has no compaction yet — spawn a fresh session with a summary |
 | `state: failed`, `suspended: true` | actor gone (crash/reboot); status `suspended` | just `orc send` — it wakes and resumes the same conversation |
 | `state: failed`, `stopped: true` | killed or taken over; status `dead` | `orc resume <id>` if you still need it |
 
@@ -128,8 +129,9 @@ coincidence. Concretely:
 - Rotate which provider does what across a session so you're not over-relying on one model's habits.
 
 All three (`claude`, `codex`, `pi`) drive the same lifecycle; pick by strength and for diversity, not
-convenience. But only **one** provider is required to be installed — don't assume all three are on
-`PATH` (a spawn fails if that CLI is missing). If only one is available, diversify *within* it: use a
+convenience. But only **one** provider is required — don't assume all three are available: claude
+and pi need their CLI on `PATH`; codex needs an OpenAI credential (`orc login status` shows it; no
+codex CLI is involved). A spawn fails if its provider is unavailable. If only one is available, diversify *within* it: use a
 different model (`-m`) or a different persona (`--agent`) for the implement vs. review roles, so a
 *different agent* still checks the work.
 
@@ -206,7 +208,8 @@ So, as a standing discipline:
 - **Kill what you're done with:** `orc kill <id>` (keeps the record and journal so you can still
   read it), or `orc kill <id> --purge` to drop the record and session dir entirely.
 - **Remove worktrees and branches:** `orc kill <id> --worktree` per session, or `orc prune --worktree`
-  to sweep all dead ones. `orc prune` never removes `suspended` sessions unless `--suspended`. Removing
+  to sweep all dead ones. `orc prune` never removes `suspended` sessions unless `--suspended`, nor
+  sessions a human took over unless `--taken-over` (they may still be working in it). Removing
   a worktree leaves the *branch* — delete merged/abandoned branches yourself with
   `git worktree prune && git branch -D <branch>`.
 - **End state:** when the task is delivered, `orc list --all` should show nothing you left running by
