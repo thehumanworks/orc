@@ -59,7 +59,7 @@ describe('runWorkflow with the default executor', () => {
             id: 'two',
             provider: 'codex',
             cwd: work,
-            prompt: 'step two after {{one.sessionId}}',
+            prompt: 'step two after ${one.sessionId}',
             needs: ['one'],
             allowUnverified: true,
           },
@@ -72,6 +72,12 @@ describe('runWorkflow with the default executor', () => {
       expect(ctx.capture).toContain('--- final turn ---');
       expect(ctx.capture).toContain('> step one');
       expect(ctx.capture).toContain('· turn completed');
+      const recs0 = await readRegistry();
+      const one = recs0.find((r) => r.stepId === 'one')!;
+      const twoSid = recs0.find((r) => r.stepId === 'two')!.sessionId;
+      const { readJournal } = await import('../src/runtime/journal.ts');
+      const twoIntent = readJournal(twoSid).find((e) => e.type === 'turn.intent');
+      expect(twoIntent && twoIntent.type === 'turn.intent' && twoIntent.text).toBe(`step two after ${one.id}`);
       const att = run.attempts!.find((a) => a.stepId === 'one')!;
       expect(att.messageId).toBe(`wf-wfa1-one-${att.attemptId}-t0`);
       expect(att.deliveryPhase).toBe('acknowledged');
