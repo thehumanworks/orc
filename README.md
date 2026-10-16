@@ -433,7 +433,8 @@ pi     = "openai/gpt-5"
   is still an error.
 - `spawn` resolves provider and model on the client and sends them explicitly, locally or remote.
 - **Safety.** A `host` from a **local** (project) file is honoured only for a trusted peer
-  (`orc remote add`, matched by host and port like `--host`); otherwise the command is refused —
+  (`orc remote add`, matched by host and port like `--host`) or your own global `host`; otherwise
+  the command is refused —
   `orc remote add <host>`, or pass `--local` / `--host`. `ORC_HOST`, `--host` and the global file
   are your own intent and are not restricted. Inside an orc session (the provider env carries
   `ORC_PARENT_SESSION_ID` / `ORC_DEPTH` ≥ 1) default hosts are ignored, so a nested `orc` stays on

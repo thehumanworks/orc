@@ -59,9 +59,9 @@ you can immediately `orc send` / `orc wait` by id.
 `wait`, … run on that host and each prints `orc: → <host> (from …)` on stderr. Pass `--local` to
 work here, or `--host <h>` to pick a host. Settings may also default `provider` and the model per
 provider (`[models]`), so `orc spawn` without `-p` can work. A project file's `host` must be a
-trusted peer (`orc remote add`) or commands fail — never "fix" that by adding a peer yourself; ask
-the user. Agents you spawn ignore default hosts (they run nested), so their own `orc` calls stay
-on their host unless told `--host`.
+trusted peer (`orc remote add`) or the user's global host, or commands fail — never "fix" that by
+adding a peer yourself; ask the user. Agents you spawn ignore default hosts (they run nested), so
+their own `orc` calls stay on their host unless told `--host`.
 
 ## The orchestration loop
 

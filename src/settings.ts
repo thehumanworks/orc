@@ -392,6 +392,13 @@ export function isTrustedPeer(spec: string, peers: readonly PeerEntry[]): boolea
   return peers.some((p) => normalizeHost(p.host) === key && (p.port ?? DEFAULT_DAEMON_PORT) === t.port);
 }
 
+/** Whether two host specs name the same target (normalised host + effective port). */
+export function sameHostTarget(a: string, b: string): boolean {
+  const ta = parseHostArg(a);
+  const tb = parseHostArg(b);
+  return normalizeHost(ta.host) === normalizeHost(tb.host) && ta.port === tb.port;
+}
+
 export type HostDecision =
   | { kind: 'local'; why: 'flag' | 'none' }
   | { kind: 'remote'; host: string; explicit: boolean; from: string }
@@ -400,13 +407,15 @@ export type HostDecision =
 /**
  * Where a remote-capable command runs: `--local` > `--host` > the settings' default host
  * (ORC_HOST > local file > global file, already resolved by loadSettings) > local. A host
- * from a LOCAL settings file must be a trusted peer (`peers`); otherwise the command is
- * refused — a checked-in project file must not be able to send your commands anywhere.
+ * from a LOCAL settings file must be a trusted peer (`peers`) or the user's own global
+ * settings host; otherwise the command is refused — a checked-in project file must not be
+ * able to send your commands anywhere. (ORC_HOST, the user's other own host, can never be
+ * outranked by a local file: when set it decides, invalid it refuses, "" means none.)
  */
 export function decideHost(input: {
   local?: boolean;
   host?: string;
-  settings?: Pick<Settings, 'host' | 'hostError'>;
+  settings?: Pick<Settings, 'host' | 'hostError'> & { global?: Pick<NonNullable<Settings['global']>, 'values'> };
   peers?: readonly PeerEntry[];
 }): HostDecision {
   if (input.local) return { kind: 'local', why: 'flag' };
@@ -415,7 +424,9 @@ export function decideHost(input: {
   if (input.settings?.hostError) return { kind: 'refused', message: input.settings.hostError };
   const h = input.settings?.host;
   if (!h) return { kind: 'local', why: 'none' };
-  if (h.source === 'local' && !isTrustedPeer(h.value, input.peers ?? [])) {
+  const globalHost = input.settings?.global?.values.host;
+  const own = globalHost !== undefined && sameHostTarget(h.value, globalHost);
+  if (h.source === 'local' && !own && !isTrustedPeer(h.value, input.peers ?? [])) {
     const name = parseHostArg(h.value).host;
     return {
       kind: 'refused',

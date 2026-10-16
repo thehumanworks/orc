@@ -396,8 +396,8 @@ settings (ORC_HOST + settings.toml):
   model:    --model > local [models] > global [models] > the provider's own default
   A default host applies to list/spawn/send/read/wait/state/kill/attach/workflow (not to
   list --all-hosts) and prints \`orc: → <host> (from <ORC_HOST|file>)\` on stderr. Host-local
-  commands ignore it. A host from a LOCAL file must be a trusted peer (orc remote add), else
-  the command is refused. Inside an orc session (ORC_PARENT_SESSION_ID / ORC_DEPTH>=1 set)
+  commands ignore it. A host from a LOCAL file must be a trusted peer (orc remote add) or your
+  global settings host, else the command is refused. Inside an orc session (ORC_PARENT_SESSION_ID / ORC_DEPTH>=1 set)
   default hosts are ignored; --host still works. ORC_HOST never reaches agent processes.
   spawn defaults resolve here and are sent explicitly (also over --host). A local workflow
   run fixes its [models] at start (run.defaultModels); resume/retry and detached runners use

@@ -299,6 +299,24 @@ describe('host precedence', () => {
     expect(decideHost({ local: true, settings: s(), peers: [] })).toEqual({ kind: 'local', why: 'flag' });
   });
 
+  test("a LOCAL host that is the user's own global host counts as trusted", () => {
+    const { home, dir, env } = sandbox();
+    const g = write(globalFile(home), 'host = "Studio"\n');
+    const l = write(localFile(dir), 'host = "studio:8787"\n');
+    expect(decideHost({ settings: loadSettings({ cwd: dir, env }), peers: [] })).toEqual({
+      kind: 'remote',
+      host: 'studio:8787',
+      explicit: false,
+      from: l,
+    });
+    // Another port, or another host, is not the user's own: still refused.
+    write(l, 'host = "studio:9000"\n');
+    expect(decideHost({ settings: loadSettings({ cwd: dir, env }), peers: [] }).kind).toBe('refused');
+    write(l, 'host = "evil"\n');
+    expect(decideHost({ settings: loadSettings({ cwd: dir, env }), peers: [] }).kind).toBe('refused');
+    void g;
+  });
+
   test('inside an orc session default hosts are ignored; provider/model defaults still apply', () => {
     const { home, dir, env } = sandbox();
     write(globalFile(home), 'host = "global-host"\nprovider = "codex"\n[models]\ncodex = "gpt-x"\n');

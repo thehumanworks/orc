@@ -197,6 +197,14 @@ describe('default host routing', () => {
       const trusted = await orc(c, ['list', '--json']);
       expect(trusted.code).toBe(0);
       expect(trusted.err).toBe(`orc: → ${daemonHost} (from ${l})\n`);
+
+      // The same host in the user's own GLOBAL settings also makes it trusted (no peer needed).
+      const own = client();
+      write(path.join(own.home, 'settings.toml'), `host = "${daemonHost}"\n`);
+      const ownLocal = write(path.join(own.cwd, '.orc', 'settings.toml'), `host = "${daemonHost}"\n`);
+      const ownRun = await orc(own, ['list', '--json']);
+      expect(ownRun.code).toBe(0);
+      expect(ownRun.err).toBe(`orc: → ${daemonHost} (from ${ownLocal})\n`);
     },
     T,
   );

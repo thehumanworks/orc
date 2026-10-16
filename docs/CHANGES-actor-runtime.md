@@ -39,7 +39,7 @@ Current behaviour: [`../README.md`](../README.md), [`ARCHITECTURE.md`](ARCHITECT
   host `--local` > `--host` > `ORC_HOST` (`""` = none) > local > global; provider `--provider` >
   local > global; model `--model` > local > global > provider default. A command sent remote by a
   default host prints `orc: → <host> (from …)` on stderr. Safety: a local file's `host` must be a
-  trusted peer; default hosts are ignored inside an orc session (`ORC_PARENT_SESSION_ID` /
+  trusted peer (or the global settings `host`); default hosts are ignored inside an orc session (`ORC_PARENT_SESSION_ID` /
   `ORC_DEPTH` ≥ 1); `ORC_HOST` never reaches agent processes.
 - Global **`--local`** (run here, ignoring `--host`, `ORC_HOST` and settings `host`) and the
   host-local **`orc settings [--json]`** (effective values with their source, files considered,

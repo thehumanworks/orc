@@ -220,7 +220,8 @@ claude = "haiku"
   `logout`, `settings`, `help`) ignore it and never error because of it; explicit `--host` on them
   stays an error. `--local` may appear anywhere in argv.
 - **Safety rules.** (1) A `host` from a LOCAL file must be a trusted peer (`orc remote add`; host +
-  port, default 8787) or the command fails: `orc remote add <host>`, `--local` or `--host`.
+  port, default 8787) or your own global settings `host`, or the command fails: `orc remote add
+  <host>`, `--local` or `--host`.
   `ORC_HOST`, `--host` and the global file are not restricted. (2) Inside an orc session (env has
   `ORC_PARENT_SESSION_ID`, or `ORC_DEPTH` ≥ 1 — every agent orc spawns does) `ORC_HOST` and
   settings `host` are ignored: a subagent's `orc` runs on its own host unless it passes `--host`.
