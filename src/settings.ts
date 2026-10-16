@@ -170,7 +170,8 @@ export function hasOrcLineage(env: NodeJS.ProcessEnv = process.env): boolean {
   return Number.isFinite(depth) && depth >= 1;
 }
 
-const HOST_NAME_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
+/** A host name, IPv4 literal or MagicDNS name; one trailing dot (FQDN) allowed, as peers.json normalises it. */
+const HOST_NAME_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?\.?$/;
 
 /** Why `raw` is not a valid host spec (`host` or `host:port`), or undefined when it is. */
 export function invalidHostReason(raw: string): string | undefined {

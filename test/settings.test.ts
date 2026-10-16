@@ -97,8 +97,15 @@ describe('parse + validate', () => {
   });
 
   test('host syntax', () => {
-    for (const ok of ['studio', 'mini.taila038d5.ts.net', '100.64.0.1', 'h:8787', 'a']) expect(invalidHostReason(ok)).toBeUndefined();
-    for (const bad of ['', ' ', 'a b', 'h:', 'h:x', ':80', '-h', 'h/x', 'user@h']) expect(invalidHostReason(bad)).toBeDefined();
+    for (const ok of ['studio', 'mini.taila038d5.ts.net', '100.64.0.1', 'h:8787', 'a', 'studio.', 'mini.ts.net.:9000']) {
+      expect(invalidHostReason(ok)).toBeUndefined();
+    }
+    for (const bad of ['', ' ', 'a b', 'h:', 'h:x', ':80', '-h', 'h/x', 'user@h', '.', 'studio..', '::1']) {
+      expect(invalidHostReason(bad)).toBeDefined();
+    }
+    // A trailing dot is the same peer / the same target, as --host and peers.json treat it.
+    expect(isTrustedPeer('studio.', [{ host: 'studio' }])).toBe(true);
+    expect(parseSettingsToml('host = "Studio."\n', '/f').values.host).toBe('Studio.');
   });
 });
 
