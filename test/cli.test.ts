@@ -17,6 +17,7 @@ describe('resolveCommand routing', () => {
     expect(resolveCommand('read')).toBe('read');
     expect(resolveCommand('attach')).toBe('attach');
     expect(resolveCommand('kill')).toBe('kill');
+    expect(resolveCommand('settings')).toBe('settings');
   });
   test('help fallbacks', () => {
     expect(resolveCommand(undefined)).toBe('help');
@@ -42,6 +43,16 @@ describe('readSelectionFromFlags', () => {
     expect(() => readSelectionFromFlags({ index: '1.2' })).toThrow(/invalid --index/);
     expect(() => readSelectionFromFlags({ full: true, index: '0' })).toThrow(/mutually exclusive/);
     expect(() => readSelectionFromFlags({ raw: true, full: true })).toThrow(/--raw cannot/);
+  });
+});
+
+describe('settings CLI surface', () => {
+  test('help documents orc settings, --local, ORC_HOST and the precedence', () => {
+    expect(HELP_TEXT).toMatch(/orc settings \[--json\]/);
+    expect(HELP_TEXT).toContain('--local');
+    expect(HELP_TEXT).toContain('host:     --local > --host > ORC_HOST');
+    expect(HELP_TEXT).toContain('.orc/settings.toml');
+    expect(HELP_TEXT).toContain('trusted peer');
   });
 });
 

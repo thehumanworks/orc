@@ -282,11 +282,12 @@ Usage:
   orc login  chatgpt [--import-pi] [--no-browser]     Sign in with ChatGPT for the codex provider
   orc login  status [--json]                          Which OpenAI credential codex sessions use
   orc logout chatgpt                                  Remove orc's ChatGPT credential
+  orc settings [--json]                               Effective settings (ORC_HOST, settings.toml) and their sources
   orc help                                            This help
 
 spawn options:
-  --provider, -p <p>     claude | codex | pi (required)
-  --model, -m <model>    model name
+  --provider, -p <p>     claude | codex | pi (required unless settings.toml sets \`provider\`)
+  --model, -m <model>    model name (default: settings.toml [models].<provider>, unless --agent)
   --agent <name>         named agent definition (codex TOML matched by name; mutually exclusive with --system-prompt)
   --alias <name>         workspace-scoped session alias; later use @name or @workspace:name
   --system-prompt <txt>  system prompt text
@@ -380,6 +381,28 @@ daemon + remote (drive agents on other orc hosts over tailscale):
                         print a \`tailscale ssh <host> orc …\` command instead of following.
   orc list --all-hosts  Fleet view: aggregate local + every trusted peer, with a host column.
 
+settings (ORC_HOST + settings.toml):
+  host = "studio"       default remote target (host or host:port, as --host)
+  provider = "claude"   default spawn --provider
+  [models]              default --model per provider (spawn, and workflow steps)
+  claude = "haiku"
+  Files: global \$ORC_HOME/settings.toml (~/.orc/settings.toml); local: the NEAREST
+  <dir>/.orc/settings.toml from the cwd up to its git toplevel (outside a repo: the cwd only).
+  Local overrides global per key ([models] per provider). Unknown keys warn on stderr; a bad
+  value or file is an error naming the file and key.
+  host:     --local > --host > ORC_HOST (set; "" = no default host) > local > global > this host
+  provider: --provider > local > global (else spawn errors)
+  model:    --model > local [models] > global [models] > the provider's own default
+  A default host applies to list/spawn/send/read/wait/state/kill/attach/workflow (not to
+  list --all-hosts) and prints \`orc: → <host> (from <ORC_HOST|file>)\` on stderr. Host-local
+  commands ignore it. A host from a LOCAL file must be a trusted peer (orc remote add), else
+  the command is refused. Inside an orc session (ORC_PARENT_SESSION_ID / ORC_DEPTH>=1 set)
+  default hosts are ignored; --host still works. ORC_HOST never reaches agent processes.
+  spawn defaults resolve here and are sent explicitly (also over --host). A local workflow
+  run records its [models] (run.defaultModels) and resume/retry reuse that map (a run that
+  recorded none uses the current settings); over --host the daemon applies no [models]. A
+  detached runner always runs with --local. The SDK reads no settings files (loadSettings()).
+
 codex provider (orc's built-in harness; no codex CLI needed):
   Talks to the OpenAI Responses API directly. Credentials, first match wins: \`orc login
   chatgpt\` (~/.orc/auth/chatgpt.json), pi's ChatGPT login (~/.pi/agent/auth.json, or
@@ -391,6 +414,7 @@ codex provider (orc's built-in harness; no codex CLI needed):
 
 Global:
   --host <h>            Run the command against the daemon on host <h> (see above)
+  --local               Run here, ignoring --host, ORC_HOST and settings.toml \`host\`
   --json                machine-readable output; non-zero exit + {error} on failure
 
 Sessions run as detached per-session actors that drive each provider over a structured

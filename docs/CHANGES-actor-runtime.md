@@ -33,6 +33,17 @@ Current behaviour: [`../README.md`](../README.md), [`ARCHITECTURE.md`](ARCHITECT
   (spawn in progress).
 - `orc attach` follows the session journal live (read-only).
 - `bun run verify:live` (`scripts/verify-runtime/all.ts`) and `bun run check:compile`.
+- **`ORC_HOST` and `settings.toml`** (README → Settings): a default remote host plus `provider` and
+  per-provider `[models]` defaults, from `$ORC_HOME/settings.toml` (global) and the nearest
+  `.orc/settings.toml` up to the git toplevel (local; overrides global per key). Precedence:
+  host `--local` > `--host` > `ORC_HOST` (`""` = none) > local > global; provider `--provider` >
+  local > global; model `--model` > local > global > provider default. A command sent remote by a
+  default host prints `orc: → <host> (from …)` on stderr. Safety: a local file's `host` must be a
+  trusted peer; default hosts are ignored inside an orc session (`ORC_PARENT_SESSION_ID` /
+  `ORC_DEPTH` ≥ 1); `ORC_HOST` never reaches agent processes.
+- Global **`--local`** (run here, ignoring `--host`, `ORC_HOST` and settings `host`) and the
+  host-local **`orc settings [--json]`** (effective values with their source, files considered,
+  warnings).
 
 ### Changed
 
@@ -57,7 +68,10 @@ Current behaviour: [`../README.md`](../README.md), [`ARCHITECTURE.md`](ARCHITECT
   `--dangerously-skip-permissions`); `/compact` and `/goal` work through `orc send` (verified).
 - **pi** runs `--mode rpc -a`.
 - **Detached workflow runners** are plain processes logging to `~/.orc/runs/<runId>/runner.log`;
-  `orc workflow attach` follows that log.
+  `orc workflow attach` follows that log. They are launched with `--local`, so a default host never
+  redirects them.
+- **Workflow step models**: CLI runs give each step session settings `[models].<provider>`; the run
+  records the map (`defaultModels`) and `resume`/`retry` reuse it.
 - **Workflows**: a step whose session a human took over is never relaunched by `resume` (attempt
   fails `taken_over`); attempt transition events are emitted once, forward only;
   `StepDoneCtx.capture` is journal text (last reply + final turn), not a pane.
@@ -90,6 +104,8 @@ Current behaviour: [`../README.md`](../README.md), [`ARCHITECTURE.md`](ARCHITECT
 | `workflow logs --raw --json` | `{step, provider, pane}[]` | `{step, provider, journal}[]` |
 | `workflow attach` | printed a tmux command | follows `runner.log` until the run ends |
 | `resume`, `takeover`, `prune`, `daemon`, `remote` | — | host-local: error under `--host` |
+| any remote-capable command | always local without `--host` | follows `ORC_HOST` / settings `host` when set (stderr notice); `--local` restores local |
+| `spawn` without `--provider` | error | uses settings `provider` when set |
 
 ## Breaking changes for SDK users (`src/index.ts`)
 
@@ -114,6 +130,12 @@ Current behaviour: [`../README.md`](../README.md), [`ARCHITECTURE.md`](ARCHITECT
   `renderJournalEntry`, `renderCapture`, `lastAssistantText`); `nativeResumeCommand`;
   `sessionStatusOf`, `countLiveSessions`, `LivenessProbe`; detached-runner helpers
   (`launchDetachedRun`, `launchDetachedRecovery`, `followRunnerLog`, `runnerLogPath`, …).
+- **Added (settings)**: `loadSettings({cwd, env, fs})`, `decideHost`, `resolveSpawnDefaults`,
+  `defaultModelsOf`, `hasOrcLineage`, `isTrustedPeer`, `parseSettingsToml`, `SettingsError`,
+  `ORC_HOST_ENV` and their types. The SDK itself reads no settings files: `agent()` and
+  `runWorkflow()` take explicit options — `RunWorkflowOptions.defaultModels` /
+  `ResumeOptions.defaultModels` (step models), recorded as `WorkflowRun.defaultModels`;
+  `StepExecutor` receives `model`.
 
 ## Schema and on-disk migrations
 
@@ -130,7 +152,9 @@ All migrations happen on read; nothing needs to be run.
   `journal.jsonl`, `inbox/`, `provider.jsonl`, `actor.log`, `system-prompt.md`, codex
   `codex-session.jsonl`). codex sessions from the app-server runtime (provider session id ≠ orc
   session id) are `dead`, show no transcript and refuse resume.
-- **New**: `~/.orc/auth/` (codex login; `ORC_AUTH_DIR`), `~/.orc/cache/codex-models.json`.
+- **New**: `~/.orc/auth/` (codex login; `ORC_AUTH_DIR`), `~/.orc/cache/codex-models.json`,
+  optional `~/.orc/settings.toml` and `<project>/.orc/settings.toml` (read-only to orc).
+- **Workflow runs** may carry `defaultModels` (provider → model; optional, additive).
 - **Permissions**: files and dirs under `~/.orc` are tightened to 0600/0700 the next time orc writes
   them.
 

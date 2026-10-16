@@ -217,6 +217,14 @@ describe('extractHostFlag — peeling the global --host', () => {
   test('no --host → host undefined, argv intact', () => {
     expect(extractHostFlag(['list', '--all'])).toEqual({ rest: ['list', '--all'] });
   });
+  test('--local is peeled anywhere and reported', () => {
+    expect(extractHostFlag(['--local', 'list', '--json'])).toEqual({ local: true, rest: ['list', '--json'] });
+    expect(extractHostFlag(['spawn', '-p', 'claude', '--local', '--host', 'mini'])).toEqual({
+      host: 'mini',
+      local: true,
+      rest: ['spawn', '-p', 'claude'],
+    });
+  });
 });
 
 describe('parseHostArg — host or host:port', () => {

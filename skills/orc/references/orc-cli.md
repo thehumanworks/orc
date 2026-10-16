@@ -42,11 +42,13 @@ Conventions:
 | `orc login chatgpt` | `--import-pi`, `--no-browser` | 0 / 1 | — (Sign in with ChatGPT for codex; stored in `~/.orc/auth/chatgpt.json`) |
 | `orc login status` | — | 0; 1 if a credential file is unreadable (`active: error`) | `{active: orc\|pi\|env\|none\|error, error?, orc: {path, credential, error?}, pi: {…}, openaiApiKey}` (no secrets) |
 | `orc logout chatgpt` | — | 0 | — (orc's credential only; pi's login is untouched) |
+| `orc settings` | — | 0 / 1 (bad settings file or `ORC_HOST`) | `{cwd, root, nested, host, provider, models: {claude, codex, pi}, files, warnings}`; each value `{value, source: flag\|env\|local\|global\|default, from?, note?}` |
 
 ### spawn options
 
-- `--provider, -p claude|codex|pi` (required); `--model, -m <name>` (codex without it: the first
-  model the account lists — `spawn` prints/records it)
+- `--provider, -p claude|codex|pi` (required unless settings set `provider`); `--model, -m <name>`
+  (default: settings `[models].<provider>` unless `--agent`; else the provider's own — codex: the
+  first model the account lists — `spawn` prints/records it)
 - `--agent <name>` — named agent definition (exclusive with `--system-prompt`)
 - `--alias <name>` — workspace-scoped handle; never changes agent behaviour
 - `--system-prompt <txt>`, `--system-prompt-mode append|replace` (default append)
@@ -176,7 +178,7 @@ removed `codex app-server` runtime are `dead` with no transcript.
 | --- | --- |
 | `orc daemon [--port 8787] [--bind <ip>] [--insecure]` | HTTP API on the host's tailscale IP; refuses `0.0.0.0` without `--insecure` |
 | `orc remote add\|list\|rm <host> [--port P]` | trusted peers (`~/.orc/peers.json`) |
-| `orc --host <h> <command>` | `list`/`spawn`/`send`/`read`/`wait`/`state`/`kill`/`workflow` against a peer, with local output and `--json` except: `state --json` is only `{id, state, status, suspended, stopped}`; `list` takes only `--workspace`/`--all`/`--dead` and its rows have no `lineage`; `workflow resume`/`retry` take no `--detach`. `attach` / `workflow attach` print `tailscale ssh <h> orc attach <id>` / `… orc workflow attach <runId>`. `resume`/`takeover`/`prune`/`daemon`/`remote` are host-local (error) |
+| `orc --host <h> <command>` | `list`/`spawn`/`send`/`read`/`wait`/`state`/`kill`/`workflow` against a peer, with local output and `--json` except: `state --json` is only `{id, state, status, suspended, stopped}`; `list` takes only `--workspace`/`--all`/`--dead` and its rows have no `lineage`; `workflow resume`/`retry` take no `--detach`. `attach` / `workflow attach` print `tailscale ssh <h> orc attach <id>` / `… orc workflow attach <runId>`. `resume`/`takeover`/`prune`/`daemon`/`remote`/`login`/`logout`/`settings` are host-local (error). A default host (`ORC_HOST`, settings `host`) routes the same commands — see Settings |
 | `orc list --all-hosts` | local + every peer, with a `host` column; an unreachable peer is a stderr warning |
 
 Auth is fail-closed: allowlisted tailnet identity (all scopes), `Authorization: Bearer` (client
@@ -188,6 +190,46 @@ Other daemon errors (`{"error"}`): 400 invalid request · 403 execution policy f
 · 404 unknown session or run · 409 stopped session (`orc resume` first), idempotency-key conflict,
 legacy session, or run state (cancelled / live owner) · 502 provider failed to start · 500 other.
 `--host` also works against a v1 (pre-actor) daemon (`submitted` send = success; `pane` reads).
+
+## Settings: `ORC_HOST`, `settings.toml`, `--local`
+
+```toml
+host = "studio"        # default remote target: host or host:port (as --host)
+provider = "claude"    # default spawn --provider
+[models]               # default --model per provider (spawn + workflow steps)
+claude = "haiku"
+```
+
+- Global `$ORC_HOME/settings.toml`; local = the **nearest** `<dir>/.orc/settings.toml` from the
+  current directory's realpath (not `--cwd`) up to the git toplevel (nearest dir holding `.git`);
+  outside a repo the cwd only. One local file; a local candidate that is the global file is
+  skipped. Local beats global per key (`[models]` per provider).
+- Unknown keys/tables: one stderr warning per file (`orc: warning: <file>: unknown setting(s)
+  ignored: …`). Bad types/values or bad TOML: exit 1 naming the file and key.
+
+| key | precedence (first wins) |
+| --- | --- |
+| host | `--local` > `--host` > `ORC_HOST` (set, non-empty; `""` = no default host) > local > global > run here |
+| provider | `--provider` > local > global > error |
+| model | `--model` > local `[models].<p>` > global `[models].<p>` > provider default (a named `--agent` keeps its own model) |
+
+- A default host applies to `list`/`spawn`/`send`/`read`/`wait`/`state`/`kill`/`attach`/`workflow`
+  (not `list --all-hosts`) and prints `orc: → <host> (from ORC_HOST|<file>)` on **stderr** (also
+  with `--json`). Host-local commands (`daemon`, `remote`, `resume`, `takeover`, `prune`, `login`,
+  `logout`, `settings`, `help`) ignore it and never error because of it; explicit `--host` on them
+  stays an error. `--local` may appear anywhere in argv.
+- **Safety rules.** (1) A `host` from a LOCAL file must be a trusted peer (`orc remote add`; host +
+  port, default 8787) or the command fails: `orc remote add <host>`, `--local` or `--host`.
+  `ORC_HOST`, `--host` and the global file are not restricted. (2) Inside an orc session (env has
+  `ORC_PARENT_SESSION_ID`, or `ORC_DEPTH` ≥ 1 — every agent orc spawns does) `ORC_HOST` and
+  settings `host` are ignored: a subagent's `orc` runs on its own host unless it passes `--host`.
+  provider/model defaults still apply. (3) `ORC_HOST` is stripped from actor and provider env.
+  (4) Detached workflow runners always run with `--local`.
+- spawn defaults resolve client-side and are sent explicitly (also over `--host`). Local workflow
+  runs record `defaultModels` on the run; `resume`/`retry` reuse it (none recorded → current
+  settings). Over `--host` the daemon applies no `[models]`.
+- SDK: `loadSettings({cwd, env, fs})` → effective values + sources; `agent()`/`runWorkflow()` read
+  no settings (pass `model` / `defaultModels` explicitly).
 
 ## SDK (TypeScript)
 
@@ -212,7 +254,8 @@ CLI for quick steering.
 
 ## State & files
 
-- Everything lives under `~/.orc` (`ORC_HOME` overrides — use a temp dir for throwaway experiments).
+- Everything lives under `~/.orc` (`ORC_HOME` overrides — use a temp dir for throwaway experiments;
+  its `settings.toml` comes with it).
   Owner-only: dirs 0700, files 0600.
 - `~/.orc/sessions/<sid>/journal.jsonl` is the source of truth for state (`read --raw`, `attach`);
   the provider transcript (what `read` parses) persists after `kill`.

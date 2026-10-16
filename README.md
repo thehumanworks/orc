@@ -108,7 +108,9 @@ orc remote <add|list|rm> <host> [--port P]          Manage trusted peers
 orc login  chatgpt [--import-pi] [--no-browser]     Sign in with ChatGPT (codex)
 orc login  status [--json]                          Which OpenAI credential codex uses
 orc logout chatgpt                                  Remove orc's ChatGPT credential
+orc settings [--json]                               Effective settings and where each value comes from
 orc --host <h> <command>                            Run a command against a peer's daemon
+orc --local <command>                               Run here, ignoring ORC_HOST / settings `host`
 ```
 
 `orc help` prints the full reference. A session is addressed by short id, full session id,
@@ -118,8 +120,8 @@ orc --host <h> <command>                            Run a command against a peer
 
 | flag | meaning |
 | --- | --- |
-| `--provider, -p` | `claude` \| `codex` \| `pi` (required) |
-| `--model, -m` | model name (codex without it: the first model your account lists, recorded on the session) |
+| `--provider, -p` | `claude` \| `codex` \| `pi` (required unless [settings](#settings-orc_host-and-settingstoml) set `provider`) |
+| `--model, -m` | model name; default: settings `[models].<provider>` (not with `--agent`), else the provider's own (codex: the first model your account lists, recorded on the session) |
 | `--agent <name>` | named agent definition (exclusive with `--system-prompt`) |
 | `--alias <name>` | workspace-scoped handle (`@name`); does not change agent behaviour |
 | `--system-prompt <txt>`, `--system-prompt-mode` | system prompt; `append` (default) \| `replace` |
@@ -312,6 +314,11 @@ orc workflow cleanup <runId> [--sessions] [--worktrees] [--json]
   session back (`orc resume <id>`), then `orc workflow retry <runId> --step <id>`.
 - **Events**: each attempt transition is emitted once and only forward
   (`queued → spawning → dispatched → running → verifying → succeeded|failed|…`).
+- **Models.** Steps have no model of their own: each step session gets settings
+  `[models].<provider>` (else the provider's default). The run records that map
+  (`defaultModels`) and `resume`/`retry` reuse it, so a later settings change never switches
+  models mid-run (a run that recorded none uses the current settings). Over `--host` the daemon
+  applies no `[models]`.
 - **Policy.** Optional `ExecutionPolicy` (`maxDepth`, `maxSessions`, `maxConcurrentSessions` (live
   actors), `deadlineMs`, `canDelegate`) is enforced fail-closed. Token/cost budgets are not
   enforced. Lineage flows through `ORC_*` env vars; `orc list --run <id>` filters by run tree.
@@ -384,6 +391,55 @@ orc list --all-hosts               # fleet view with a host column
   `admin` (implies all; needed for kill/cancel/cleanup). Tokens are never logged or returned.
 - Daemon workflow file imports are confined to `ORC_WORKFLOW_ROOTS` (default: the daemon's cwd).
 
+## Settings (`ORC_HOST` and `settings.toml`)
+
+Set a default remote host and spawn defaults once instead of on every command:
+
+```toml
+# ~/.orc/settings.toml (global) or <project>/.orc/settings.toml (local)
+host = "studio"        # default remote target: host or host:port, as for --host
+provider = "claude"    # default `orc spawn --provider`
+[models]               # default --model per provider (spawn and workflow steps)
+claude = "haiku"
+codex  = "gpt-5.5"
+pi     = "openai/gpt-5"
+```
+
+- **Files.** Global: `$ORC_HOME/settings.toml`. Local: the **nearest** `<dir>/.orc/settings.toml`
+  from the current directory (its realpath; never `--cwd`) up to the git toplevel (the nearest
+  directory holding `.git`, so a linked worktree stops at itself); outside a repo only the current
+  directory. One local file at most (no cascading); a local file that is the
+  global file itself (running from `~`) is ignored as local. Local overrides global per key,
+  `[models]` per provider.
+- **Validation.** Unknown keys or tables warn once on stderr (forward compatible). A wrong type or
+  value (provider not `claude|codex|pi`, empty strings, bad host syntax) or unparsable TOML is an
+  error that names the file and key.
+- **`orc settings [--json]`** prints each effective value with its source (flag / env / local
+  file / global file / default), the files considered and any warnings.
+
+| key | precedence (first wins) |
+| --- | --- |
+| host | `--local` > `--host` > `ORC_HOST` (set and non-empty; `ORC_HOST=""` = no default host) > local `host` > global `host` > this host |
+| provider | `--provider` > local > global > error ("provider is required") |
+| model | `--model` > local `[models].<p>` > global `[models].<p>` > the provider's own default; a named `--agent` keeps its own model |
+
+- A default host applies to `list`, `spawn`, `send`, `read`, `wait`, `state`, `kill`, `attach` and
+  `workflow`, and prints one line on stderr — `orc: → studio (from ORC_HOST)` or
+  `(from /path/settings.toml)` — even with `--json` (stdout stays machine-clean).
+  `list --all-hosts` is unaffected. Host-local commands (`daemon`, `remote`, `resume`, `takeover`,
+  `prune`, `login`, `logout`, `settings`, `help`) ignore default hosts; an explicit `--host` on them
+  is still an error.
+- `spawn` resolves provider and model on the client and sends them explicitly, locally or remote.
+- **Safety.** A `host` from a **local** (project) file is honoured only for a trusted peer
+  (`orc remote add`, matched by host and port like `--host`); otherwise the command is refused —
+  `orc remote add <host>`, or pass `--local` / `--host`. `ORC_HOST`, `--host` and the global file
+  are your own intent and are not restricted. Inside an orc session (the provider env carries
+  `ORC_PARENT_SESSION_ID` / `ORC_DEPTH` ≥ 1) default hosts are ignored, so a nested `orc` stays on
+  its host; `--host` still works and provider/model defaults still apply. `ORC_HOST` is never
+  passed to agent processes, and detached workflow runners always run with `--local`.
+- The SDK reads no settings files; `loadSettings({cwd, env})` returns the same resolution (values
+  with their sources) for callers who want it.
+
 ## Workspaces & aliases
 
 - A session's workspace is `--workspace W` (realpath when it is a path), else the git toplevel of
@@ -405,6 +461,7 @@ All state lives under `~/.orc` (override: `ORC_HOME`):
 ```
 registry.json              session records
 peers.json                 trusted daemon peers
+settings.toml              global settings (optional; see Settings)
 locks/                     cross-process locks (a lock whose owner process is gone is reclaimed
                            at once; one with no recorded owner after 5 min)
 auth/                      codex login: chatgpt.json, device-id (ORC_AUTH_DIR overrides)
@@ -424,6 +481,7 @@ delete a session's dir.
 | env | effect |
 | --- | --- |
 | `ORC_HOME` | state root (default `~/.orc`) |
+| `ORC_HOST` | default remote host for remote-capable commands (`""` = none; see Settings) |
 | `ORC_CLAUDE_BIN` | claude executable |
 | `ORC_AUTH_DIR` | codex login dir (default `$ORC_HOME/auth`) |
 | `OPENAI_API_KEY` | codex fallback credential (API-key Responses API) |

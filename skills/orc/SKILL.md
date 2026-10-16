@@ -54,6 +54,15 @@ orc workflow run <file.ts> [--detach] [--max-concurrency N]; orc workflow logs <
 Prefer `--json` everywhere (you're a machine consumer). `orc spawn --json` returns the record so
 you can immediately `orc send` / `orc wait` by id.
 
+**Check where commands go: `orc settings`.** The user may have a default host (`ORC_HOST`, or
+`host` in `~/.orc/settings.toml` / the project's `.orc/settings.toml`) — then `spawn`, `list`,
+`wait`, … run on that host and each prints `orc: → <host> (from …)` on stderr. Pass `--local` to
+work here, or `--host <h>` to pick a host. Settings may also default `provider` and the model per
+provider (`[models]`), so `orc spawn` without `-p` can work. A project file's `host` must be a
+trusted peer (`orc remote add`) or commands fail — never "fix" that by adding a peer yourself; ask
+the user. Agents you spawn ignore default hosts (they run nested), so their own `orc` calls stay
+on their host unless told `--host`.
+
 ## The orchestration loop
 
 1. **Decompose.** Break the task into units that can run independently (different files/modules/questions)
