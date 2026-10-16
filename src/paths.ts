@@ -5,10 +5,15 @@ import os from 'node:os';
 import path from 'node:path';
 
 /** The orc home dir: $ORC_HOME or ~/.orc. */
-export function orcHome(): string {
-  const override = process.env.ORC_HOME;
+export function orcHome(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.ORC_HOME;
   if (override && override.length > 0) return path.resolve(override);
   return path.join(os.homedir(), '.orc');
+}
+
+/** The global settings file, `$ORC_HOME/settings.toml` (see settings.ts). */
+export function globalSettingsPath(env: NodeJS.ProcessEnv = process.env): string {
+  return path.join(orcHome(env), 'settings.toml');
 }
 
 export function registryPath(): string {

@@ -27,7 +27,8 @@ interface PeersFile {
   peers: PeerEntry[];
 }
 
-function normalizeHost(h: string): string {
+/** Peer host key: trimmed, lower-cased, no trailing dot (`Mini.` ≡ `mini`). */
+export function normalizeHost(h: string): string {
   return h.trim().replace(/\.$/, '').toLowerCase();
 }
 
