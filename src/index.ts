@@ -27,6 +27,29 @@ export type {
   AttachOptions,
 } from './session.ts';
 export { isSettled, resolveUntil } from './state.ts';
+// Settings (ORC_HOST + settings.toml): the SDK never reads them on its own; callers who want
+// the CLI's resolution call loadSettings() and pass the values explicitly.
+export {
+  loadSettings,
+  decideHost,
+  resolveSpawnDefaults,
+  defaultModelsOf,
+  hasOrcLineage,
+  isTrustedPeer,
+  parseSettingsToml,
+  SettingsError,
+  ORC_HOST_ENV,
+} from './settings.ts';
+export type {
+  Settings,
+  Setting,
+  SettingSource,
+  SettingsFileValues,
+  SettingsFs,
+  LoadSettingsOptions,
+  ConsideredFile,
+  HostDecision,
+} from './settings.ts';
 export { sessionStatusOf, countLiveSessions } from './session-status.ts';
 export type { LivenessProbe } from './session-status.ts';
 export { renderJournal, renderJournalEntry, renderCapture, lastAssistantText } from './journal-render.ts';

@@ -576,6 +576,14 @@ export async function runSelfTest(): Promise<number> {
     check('session-file', loaded.messages.length === agent.state.messages.length, `${loaded.messages.length}/${agent.state.messages.length}`);
     const turns = parsePi(fs.readFileSync(sessionFile, 'utf8'));
     check('transcript', turns.some((t) => t.role === 'user') && turns.some((t) => t.role === 'tool' && t.text.startsWith('bash')));
+    // Not codex: the compiled orc must also parse settings.toml (Bun's built-in TOML parser).
+    const { loadSettings } = await import('../settings.ts');
+    fs.writeFileSync(path.join(tmp, 'settings.toml'), 'host = "studio:9000"\nprovider = "codex"\n[models]\ncodex = "gpt-5.5"\n');
+    const settings = loadSettings({ cwd: tmp, env: { ORC_HOME: tmp } });
+    check(
+      'settings-toml',
+      settings.host?.value === 'studio:9000' && settings.provider?.value === 'codex' && settings.models.codex?.value === 'gpt-5.5',
+    );
   } catch (e) {
     check('exception', false, errText(e));
   } finally {

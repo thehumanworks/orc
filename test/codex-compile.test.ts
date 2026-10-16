@@ -45,7 +45,27 @@ describe('compiled orc binary', () => {
       expect(out.checks.filter((c) => !c.ok)).toEqual([]);
       expect(out.ok).toBe(true);
       expect(out.checks.map((c) => c.check)).toContain('oauth-loader');
+      expect(out.checks.map((c) => c.check)).toContain('settings-toml');
       expect(r.exitCode).toBe(0);
+    },
+    60_000,
+  );
+
+  test(
+    'the compiled orc reads settings.toml (orc settings --json)',
+    () => {
+      expect(built).toBe(true);
+      const orcHome = path.join(root, 'settings-home');
+      fs.mkdirSync(orcHome, { recursive: true });
+      fs.writeFileSync(path.join(orcHome, 'settings.toml'), 'provider = "pi"\n[models]\npi = "openai/gpt-5"\nfuture = "x"\n');
+      const env: Record<string, string> = {};
+      for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !k.startsWith('ORC_')) env[k] = v;
+      const r = Bun.spawnSync([bin, 'settings', '--json'], { cwd: root, env: { ...env, ORC_HOME: orcHome }, stdout: 'pipe', stderr: 'pipe' });
+      expect(r.exitCode).toBe(0);
+      const view = JSON.parse(r.stdout.toString()) as Record<string, any>;
+      expect(view.provider).toEqual({ value: 'pi', source: 'global', from: path.join(orcHome, 'settings.toml') });
+      expect(view.models.pi.value).toBe('openai/gpt-5');
+      expect(view.warnings).toEqual([`${path.join(orcHome, 'settings.toml')}: unknown setting(s) ignored: models.future`]);
     },
     60_000,
   );
