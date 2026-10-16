@@ -11,6 +11,8 @@ import path from 'node:path';
 import { serveDaemon } from '../src/daemon/server.ts';
 import { FAKE_PROVIDER_ENV } from '../src/agent.ts';
 import { readRegistry } from '../src/registry.ts';
+import { readRun } from '../src/runs.ts';
+import { WORKFLOW_ROOTS_ENV } from '../src/workflow.ts';
 import { killSessionProcesses, mkTmp } from './runtime-helpers.ts';
 
 const CLI = path.join(import.meta.dir, '..', 'src', 'cli', 'index.ts');
@@ -21,6 +23,7 @@ const work = path.join(root, 'work');
 const sids: string[] = [];
 const prevHome = process.env.ORC_HOME;
 const prevFake = process.env[FAKE_PROVIDER_ENV];
+const prevRoots = process.env[WORKFLOW_ROOTS_ENV];
 let server: Bun.Server<undefined>;
 let daemonHost = '';
 
@@ -28,7 +31,11 @@ beforeAll(() => {
   // The daemon is in-process: it serves daemonHome; every CLI below uses its OWN ORC_HOME.
   process.env.ORC_HOME = daemonHome;
   process.env[FAKE_PROVIDER_ENV] = '1';
+  process.env[WORKFLOW_ROOTS_ENV] = root;
   fs.mkdirSync(work, { recursive: true });
+  // The daemon HOST's own settings: never applied to work started over --host.
+  fs.mkdirSync(daemonHome, { recursive: true });
+  fs.writeFileSync(path.join(daemonHome, 'settings.toml'), '[models]\nclaude = "DAEMON-HOST-MODEL"\n');
   server = serveDaemon({
     hostname: '127.0.0.1',
     port: 0,
@@ -49,6 +56,8 @@ afterAll(async () => {
   else process.env.ORC_HOME = prevHome;
   if (prevFake === undefined) delete process.env[FAKE_PROVIDER_ENV];
   else process.env[FAKE_PROVIDER_ENV] = prevFake;
+  if (prevRoots === undefined) delete process.env[WORKFLOW_ROOTS_ENV];
+  else process.env[WORKFLOW_ROOTS_ENV] = prevRoots;
   fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -265,6 +274,43 @@ describe('default host routing', () => {
   );
 });
 
+describe('workflows over --host', () => {
+  test(
+    'the daemon applies no [models] (neither the client\'s nor its own): foreground and --detach alike',
+    async () => {
+      const c = client();
+      write(path.join(c.home, 'settings.toml'), '[models]\nclaude = "CLIENT-MODEL"\n');
+      const file = write(
+        path.join(root, 'daemon-wf', 'det.workflow.ts'),
+        `export default { name: 'det', steps: [{ id: 'a', provider: 'claude', prompt: 'hi', allowUnverified: true }] };\n`,
+      );
+      const daemonModel = async (sid: string) => {
+        const rec = (await readRegistry()).find((x) => x.id === sid || x.sessionId === sid)!;
+        sids.push(rec.sessionId);
+        return rec.model;
+      };
+      const fg = await orc(c, ['--host', daemonHost, 'workflow', 'run', file, '--json']);
+      expect(fg.code).toBe(0);
+      const fgRun = JSON.parse(fg.out) as { defaultModels?: unknown; steps: { sessionId: string }[] };
+      expect(fgRun.defaultModels).toBeUndefined();
+      expect(await daemonModel(fgRun.steps[0]!.sessionId)).toBeUndefined();
+
+      const d = await orc(c, ['--host', daemonHost, 'workflow', 'run', file, '--detach', '--json']);
+      expect(d.code).toBe(0);
+      const { runId } = JSON.parse(d.out) as { runId: string };
+      let run = await readRun(runId);
+      for (let i = 0; i < 300 && run?.status !== 'done' && run?.status !== 'failed'; i++) {
+        await Bun.sleep(50);
+        run = await readRun(runId);
+      }
+      expect(run!.status).toBe('done');
+      expect(run!.defaultModels).toBeUndefined();
+      expect(await daemonModel(run!.steps[0]!.sessionId!)).toBeUndefined();
+    },
+    T,
+  );
+});
+
 describe('provider/model defaults on this host', () => {
   test(
     'spawn: --provider > settings provider; --model > [models].<provider>; --agent owns its model',
@@ -343,6 +389,15 @@ describe('provider/model defaults on this host', () => {
       const fresh = JSON.parse((await orc(c, ['workflow', 'run', file, '--json'])).out) as RunJson;
       expect(fresh.defaultModels).toEqual({ claude: 'changed' });
       expect(await modelOf(fresh.steps[0]!.sessionId)).toBe('changed');
+
+      // A run that started with no [models] keeps none: retry never reads settings.
+      fs.rmSync(g);
+      const bare = JSON.parse((await orc(c, ['workflow', 'run', file, '--json'])).out) as RunJson;
+      expect(bare.defaultModels ?? {}).toEqual({});
+      write(g, '[models]\nclaude = "late"\n');
+      const bareRetry = JSON.parse((await orc(c, ['workflow', 'retry', bare.id, '--step', 'a', file, '--json'])).out) as RunJson;
+      expect(bareRetry.steps[0]!.sessionId).not.toBe(bare.steps[0]!.sessionId);
+      expect(await modelOf(bareRetry.steps[0]!.sessionId)).toBeUndefined();
     },
     T,
   );

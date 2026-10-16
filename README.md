@@ -315,10 +315,11 @@ orc workflow cleanup <runId> [--sessions] [--worktrees] [--json]
 - **Events**: each attempt transition is emitted once and only forward
   (`queued → spawning → dispatched → running → verifying → succeeded|failed|…`).
 - **Models.** Steps have no model of their own: each step session gets settings
-  `[models].<provider>` (else the provider's default). The run records that map
-  (`defaultModels`) and `resume`/`retry` reuse it, so a later settings change never switches
-  models mid-run (a run that recorded none uses the current settings). Over `--host` the daemon
-  applies no `[models]`.
+  `[models].<provider>` (else the provider's default), fixed when the run starts. The run records
+  that map (`defaultModels`); `resume`, `retry` and detached runners use the record and never read
+  settings, so a later settings change never switches models mid-run (a run that started without
+  `[models]` keeps none). Over `--host` the daemon applies no `[models]` (foreground or
+  `--detach`).
 - **Policy.** Optional `ExecutionPolicy` (`maxDepth`, `maxSessions`, `maxConcurrentSessions` (live
   actors), `deadlineMs`, `canDelegate`) is enforced fail-closed. Token/cost budgets are not
   enforced. Lineage flows through `ORC_*` env vars; `orc list --run <id>` filters by run tree.

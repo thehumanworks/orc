@@ -226,8 +226,8 @@ claude = "haiku"
   provider/model defaults still apply. (3) `ORC_HOST` is stripped from actor and provider env.
   (4) Detached workflow runners always run with `--local`.
 - spawn defaults resolve client-side and are sent explicitly (also over `--host`). Local workflow
-  runs record `defaultModels` on the run; `resume`/`retry` reuse it (none recorded → current
-  settings). Over `--host` the daemon applies no `[models]`.
+  runs fix `defaultModels` at start (recorded on the run); `resume`/`retry` and detached runners use
+  the record, never settings. Over `--host` the daemon applies no `[models]` (also `--detach`).
 - SDK: `loadSettings({cwd, env, fs})` → effective values + sources; `agent()`/`runWorkflow()` read
   no settings (pass `model` / `defaultModels` explicitly).
 

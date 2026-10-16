@@ -399,8 +399,8 @@ settings (ORC_HOST + settings.toml):
   the command is refused. Inside an orc session (ORC_PARENT_SESSION_ID / ORC_DEPTH>=1 set)
   default hosts are ignored; --host still works. ORC_HOST never reaches agent processes.
   spawn defaults resolve here and are sent explicitly (also over --host). A local workflow
-  run records its [models] (run.defaultModels) and resume/retry reuse that map (a run that
-  recorded none uses the current settings); over --host the daemon applies no [models]. A
+  run fixes its [models] at start (run.defaultModels); resume/retry and detached runners use
+  that record, never settings; over --host the daemon applies no [models] (also --detach). A
   detached runner always runs with --local. The SDK reads no settings files (loadSettings()).
 
 codex provider (orc's built-in harness; no codex CLI needed):

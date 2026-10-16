@@ -156,8 +156,8 @@ export async function launchDetachedRun(
     // Informational until the runner stamps its own identity (D4).
     lease: makeLease(),
     rootRunId: runId,
-    // The runner resolves the same settings (same cwd) and re-records them; this copy
-    // covers a runner that dies before its first write.
+    // Authoritative: the runner (`--run-id`) runs with exactly this map (absent = none) and
+    // never reads settings itself, so a detached run behaves like a foreground one.
     ...(opts.defaultModels ? { defaultModels: { ...opts.defaultModels } } : {}),
   };
   await writeRunOwned(run);

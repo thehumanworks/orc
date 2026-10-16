@@ -328,11 +328,11 @@ export interface RunWorkflowOptions {
    */
   maxConcurrency?: number;
   /**
-   * Default model per provider for steps (the CLI passes settings.toml `[models]`; the SDK
-   * never reads settings files). Recorded on the run when it starts; resume/retry reuse the
-   * recorded map, so a later settings change cannot switch models mid-run. Steps have no
-   * model of their own, so each step's session gets `defaultModels[step.provider]` (else the
-   * provider's own default).
+   * Default model per provider for steps (the CLI passes settings.toml `[models]` when a run
+   * starts; the SDK never reads settings files). Recorded on the run; on resume/retry the
+   * recorded map wins (the CLI passes none there), so a later settings change cannot switch
+   * models mid-run. Steps have no model of their own, so each step's session gets
+   * `defaultModels[step.provider]` (else the provider's own default).
    */
   defaultModels?: Partial<Record<Provider, string>>;
 }
@@ -2192,7 +2192,7 @@ export interface ResumeOptions {
   leaseMs?: number;
   ownerId?: string;
   allowUnknownDeliveryRetry?: boolean;
-  /** Step default models when the run recorded none (see RunWorkflowOptions.defaultModels). */
+  /** Step default models when the run recorded none (SDK only; see RunWorkflowOptions.defaultModels). */
   defaultModels?: Partial<Record<Provider, string>>;
 }
 

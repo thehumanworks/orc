@@ -812,7 +812,8 @@ async function cmdWait(args: string[]): Promise<number> {
 async function cmdWorkflow(args: string[], settings?: Settings): Promise<number> {
   const sub = args[0];
   const rest = args.slice(1);
-  // settings.toml `[models]`: the default model of steps (fixed per run when it starts).
+  // settings.toml `[models]`: the steps' default models, fixed when a run STARTS (recorded
+  // on the run). resume/retry — and a detached runner — use the record, never settings.
   const defaultModels = settings ? defaultModelsOf(settings) : undefined;
   switch (sub) {
     case 'run':
@@ -826,9 +827,9 @@ async function cmdWorkflow(args: string[], settings?: Settings): Promise<number>
     case 'logs':
       return cmdWorkflowLogs(rest);
     case 'resume':
-      return cmdWorkflowResume(rest, defaultModels);
+      return cmdWorkflowResume(rest);
     case 'retry':
-      return cmdWorkflowRetry(rest, defaultModels);
+      return cmdWorkflowRetry(rest);
     case 'cancel':
       return cmdWorkflowCancel(rest);
     case 'cleanup':
@@ -904,6 +905,10 @@ async function cmdWorkflowRun(args: string[], defaultModels?: DefaultModels): Pr
   // re-persists the record from scratch, stamping its own identity on the lease).
   const runId = values['run-id'] as string | undefined;
   const runner = runId ? await startDetachedRunner(runId, 'run') : undefined;
+  // A detached runner runs with what its LAUNCHER recorded (absent = none) — never this
+  // host's settings: a daemon launch (over --host) applies no [models], exactly like a
+  // foreground daemon run, and a CLI launch already recorded its settings.
+  const models = runId ? (await readRun(runId))?.defaultModels : defaultModels;
   const term = trapRunnerTermination();
   try {
     // Stream step events to stdout in human mode; --json prints only the final record.
@@ -913,7 +918,7 @@ async function cmdWorkflowRun(args: string[], defaultModels?: DefaultModels): Pr
       signal: term.signal,
       sourcePath: absFile,
       maxConcurrency: conc.value,
-      defaultModels,
+      defaultModels: models,
       onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
     });
   } catch (e) {
@@ -1220,7 +1225,7 @@ async function assertNoLiveOwner(
   return live;
 }
 
-async function cmdWorkflowResume(args: string[], defaultModels?: DefaultModels): Promise<number> {
+async function cmdWorkflowResume(args: string[]): Promise<number> {
   const { values, positionals } = parse(args, {
     json: { type: 'boolean' },
     detach: { type: 'boolean' },
@@ -1252,7 +1257,6 @@ async function cmdWorkflowResume(args: string[], defaultModels?: DefaultModels):
     try {
       const run = await resumeWorkflow(runId, def, {
         sourcePath: absPath,
-        defaultModels,
         runner,
         signal: term.signal,
         onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
@@ -1270,7 +1274,7 @@ async function cmdWorkflowResume(args: string[], defaultModels?: DefaultModels):
 }
 
 /** `orc workflow retry <runId> [--step <id>] [workflowFile] [--detach]` */
-async function cmdWorkflowRetry(args: string[], defaultModels?: DefaultModels): Promise<number> {
+async function cmdWorkflowRetry(args: string[]): Promise<number> {
   const { values, positionals } = parse(args, {
     json: { type: 'boolean' },
     detach: { type: 'boolean' },
@@ -1304,7 +1308,6 @@ async function cmdWorkflowRetry(args: string[], defaultModels?: DefaultModels): 
     try {
       const run = await retryWorkflow(runId, def, {
         sourcePath: absPath,
-        defaultModels,
         stepId,
         runner,
         signal: term.signal,
