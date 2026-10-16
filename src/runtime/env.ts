@@ -5,14 +5,15 @@
  * its own environment. Lineage and policy variables (ORC_RUN_ID, ORC_RESULT_PATH,
  * ORC_ATTEMPT_ID, ORC_DEPTH, ORC_POLICY_*, …) describe the WAKER, not the session: the
  * session's own lineage is `spec.env`, written at spawn. Inherited lineage keys are
- * therefore dropped before `spec.env` is applied. Everything else (ORC_HOME, PATH, auth,
- * provider binaries…) is kept.
+ * therefore dropped before `spec.env` is applied. So is ORC_HOST (the user's default remote
+ * target, settings.ts): an agent's nested `orc` must never be sent elsewhere by it.
+ * Everything else (ORC_HOME, PATH, auth, provider binaries…) is kept.
  */
 import { ORC_ENV } from '../types.ts';
 
-const LINEAGE_KEYS: ReadonlySet<string> = new Set(Object.values(ORC_ENV));
+const LINEAGE_KEYS: ReadonlySet<string> = new Set([...Object.values(ORC_ENV), 'ORC_HOST']);
 
-/** An ORC_* lineage/policy key that must never be inherited from a waker. */
+/** An ORC_* lineage/policy key (or ORC_HOST) that must never be inherited from a waker. */
 export function isLineageEnvKey(key: string): boolean {
   return LINEAGE_KEYS.has(key) || key.startsWith('ORC_POLICY_');
 }

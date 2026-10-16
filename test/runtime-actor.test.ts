@@ -208,7 +208,7 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
   );
 
   test(
-    "a waker never hands its ORC_* lineage to the session it wakes (spec.env is the authority)",
+    "a waker never hands its ORC_* lineage (or ORC_HOST) to the session it wakes (spec.env is the authority)",
     async () => {
       const reported = [
         'ORC_RESULT_PATH',
@@ -218,6 +218,7 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
         'ORC_DEPTH',
         'ORC_PARENT_SESSION_ID',
         'ORC_POLICY_MAX_DEPTH',
+        'ORC_HOST',
         'ORC_HOME',
         'ORC_TEST_INHERITED',
       ];
@@ -235,6 +236,8 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
         ORC_STEP_ID: 'step-a',
         ORC_DEPTH: '7',
         ORC_POLICY_MAX_DEPTH: '9',
+        // The user's default remote target never reaches the provider (S10 safety rule 3).
+        ORC_HOST: 'studio',
         ORC_TEST_INHERITED: 'kept',
       };
       const saved = Object.fromEntries(Object.keys(waker).map((k) => [k, process.env[k]]));
@@ -256,7 +259,7 @@ describe('actor kernel (real __actor subprocess + fake provider)', () => {
       });
       if (fs.existsSync('/proc/self/environ')) {
         const environ = fs.readFileSync(`/proc/${actorPid(spec.sessionId)}/environ`, 'utf8').split('\0');
-        expect(environ.filter((l) => /^ORC_(RESULT_PATH|ATTEMPT_ID|RUN_ID|STEP_ID|DEPTH|POLICY_)/.test(l))).toEqual([]);
+        expect(environ.filter((l) => /^ORC_(RESULT_PATH|ATTEMPT_ID|RUN_ID|STEP_ID|DEPTH|POLICY_|HOST=)/.test(l))).toEqual([]);
         expect(environ).toContain(`ORC_HOME=${home}`);
       }
     },
