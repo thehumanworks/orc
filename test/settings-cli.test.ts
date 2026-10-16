@@ -268,7 +268,14 @@ describe('default host routing', () => {
       expect(warned.code).toBe(0);
       expect(warned.err).toBe(`orc: warning: ${g}: unknown setting(s) ignored: colour, models.gemini\n`);
       const badEnv = await orc(c, ['list'], { ORC_HOST: 'a b' });
+      expect(badEnv.code).toBe(1);
       expect(badEnv.err).toContain("error: ORC_HOST: must be host or host:port, got 'a b'");
+      // Lazy: irrelevant under --local / --host, and only a note in `orc settings`.
+      expect((await orc(c, ['--local', 'list', '--json'], { ORC_HOST: 'a b' })).code).toBe(0);
+      expect((await orc(c, ['--host', daemonHost, 'list', '--json'], { ORC_HOST: 'a b' })).code).toBe(0);
+      const view = await orc(c, ['settings', '--json'], { ORC_HOST: 'a b' });
+      expect(view.code).toBe(0);
+      expect(JSON.parse(view.out).host).toMatchObject({ value: null, source: 'env', from: 'ORC_HOST' });
     },
     T,
   );

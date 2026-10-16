@@ -414,7 +414,8 @@ pi     = "openai/gpt-5"
   `[models]` per provider.
 - **Validation.** Unknown keys or tables warn once on stderr (forward compatible). A wrong type or
   value (provider not `claude|codex|pi`, empty strings, bad host syntax) or unparsable TOML is an
-  error that names the file and key.
+  error that names the file and key. An invalid `ORC_HOST` refuses only the commands it would
+  route (with `--local` or `--host` it is irrelevant; `orc settings` shows it as a note).
 - **`orc settings [--json]`** prints each effective value with its source (flag / env / local
   file / global file / default), the files considered and any warnings.
 

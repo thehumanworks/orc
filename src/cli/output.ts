@@ -389,7 +389,8 @@ settings (ORC_HOST + settings.toml):
   Files: global \$ORC_HOME/settings.toml (~/.orc/settings.toml); local: the NEAREST
   <dir>/.orc/settings.toml from the cwd up to its git toplevel (outside a repo: the cwd only).
   Local overrides global per key ([models] per provider). Unknown keys warn on stderr; a bad
-  value or file is an error naming the file and key.
+  value or file is an error naming the file and key. An invalid ORC_HOST refuses only the
+  commands it would route (not with --local / --host).
   host:     --local > --host > ORC_HOST (set; "" = no default host) > local > global > this host
   provider: --provider > local > global (else spawn errors)
   model:    --model > local [models] > global [models] > the provider's own default

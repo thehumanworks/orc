@@ -261,9 +261,19 @@ describe('host precedence', () => {
     expect(s({ ORC_HOST: '  ' }).host).toBeUndefined();
   });
 
-  test('an invalid ORC_HOST is an error naming it', () => {
+  test('an invalid ORC_HOST refuses only when it would decide the host (lazy)', () => {
     const { s } = withFiles();
-    expect(() => s({ ORC_HOST: 'a b' })).toThrow(/^ORC_HOST: must be host or host:port/);
+    const bad = s({ ORC_HOST: 'a b' });
+    expect(bad.host).toBeUndefined();
+    expect(bad.hostError).toMatch(/^ORC_HOST: must be host or host:port, got 'a b'/);
+    // It outranks the files: no silent fall-through to the local/global host.
+    expect(decideHost({ settings: bad, peers: studio })).toEqual({ kind: 'refused', message: bad.hostError! });
+    expect(decideHost({ local: true, settings: bad })).toEqual({ kind: 'local', why: 'flag' });
+    expect(decideHost({ host: 'x', settings: bad })).toMatchObject({ kind: 'remote', host: 'x', explicit: true });
+    expect(settingsView(bad).host).toMatchObject({ value: null, source: 'env', from: 'ORC_HOST' });
+    expect(settingsView(bad).host.note).toContain("got 'a b'");
+    // Inside a session ORC_HOST is ignored entirely, invalid or not.
+    expect(s({ ORC_HOST: 'a b', ORC_DEPTH: '1' }).hostError).toBeUndefined();
   });
 
   test('a LOCAL host must be a trusted peer (host and host:port matched like peers.json)', () => {

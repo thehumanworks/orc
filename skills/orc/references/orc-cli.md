@@ -42,7 +42,7 @@ Conventions:
 | `orc login chatgpt` | `--import-pi`, `--no-browser` | 0 / 1 | — (Sign in with ChatGPT for codex; stored in `~/.orc/auth/chatgpt.json`) |
 | `orc login status` | — | 0; 1 if a credential file is unreadable (`active: error`) | `{active: orc\|pi\|env\|none\|error, error?, orc: {path, credential, error?}, pi: {…}, openaiApiKey}` (no secrets) |
 | `orc logout chatgpt` | — | 0 | — (orc's credential only; pi's login is untouched) |
-| `orc settings` | — | 0 / 1 (bad settings file or `ORC_HOST`) | `{cwd, root, nested, host, provider, models: {claude, codex, pi}, files, warnings}`; each value `{value, source: flag\|env\|local\|global\|default, from?, note?}` |
+| `orc settings` | — | 0 / 1 (bad settings file; an invalid `ORC_HOST` is a `host.note`) | `{cwd, root, nested, host, provider, models: {claude, codex, pi}, files, warnings}`; each value `{value, source: flag\|env\|local\|global\|default, from?, note?}` |
 
 ### spawn options
 
@@ -205,7 +205,8 @@ claude = "haiku"
   outside a repo the cwd only. One local file; a local candidate that is the global file is
   skipped. Local beats global per key (`[models]` per provider).
 - Unknown keys/tables: one stderr warning per file (`orc: warning: <file>: unknown setting(s)
-  ignored: …`). Bad types/values or bad TOML: exit 1 naming the file and key.
+  ignored: …`). Bad types/values or bad TOML: exit 1 naming the file and key. An invalid
+  `ORC_HOST` refuses only commands it would route (not with `--local`/`--host`).
 
 | key | precedence (first wins) |
 | --- | --- |

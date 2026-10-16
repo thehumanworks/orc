@@ -96,6 +96,11 @@ export interface Settings {
   host?: Setting<string>;
   /** Why no default host applies although one may be configured (nested / ORC_HOST=""). */
   hostNote?: string;
+  /**
+   * ORC_HOST is set but not a valid host: it would decide the host, so decideHost refuses —
+   * unless `--local`/`--host` make it irrelevant (validated lazily, never thrown here).
+   */
+  hostError?: string;
   provider?: Setting<Provider>;
   models: Partial<Record<Provider, Setting<string>>>;
   local?: { path: string; values: SettingsFileValues };
@@ -287,7 +292,8 @@ function unknownWarning(file: string, keys: string[]): string {
 
 /**
  * Discover, parse and merge the settings files, then layer ORC_HOST and the lineage rule.
- * Throws SettingsError (naming the file/var and key) on unreadable/invalid files or ORC_HOST.
+ * Throws SettingsError (naming the file and key) on unreadable/invalid files. An invalid
+ * ORC_HOST is not thrown: it is `hostError` (decideHost refuses when it would decide).
  */
 export function loadSettings(opts: LoadSettingsOptions = {}): Settings {
   const env = opts.env ?? process.env;
@@ -337,6 +343,7 @@ export function loadSettings(opts: LoadSettingsOptions = {}): Settings {
   const nested = hasOrcLineage(env);
   let host: Setting<string> | undefined;
   let hostNote: string | undefined;
+  let hostError: string | undefined;
   const envHost = env[ORC_HOST_ENV];
   if (nested) {
     if ((envHost !== undefined && envHost.trim().length > 0) || fromFile((v) => v.host)) {
@@ -348,10 +355,8 @@ export function loadSettings(opts: LoadSettingsOptions = {}): Settings {
       hostNote = `${ORC_HOST_ENV} is set to an empty string: no default host`;
     } else {
       const why = invalidHostReason(t);
-      if (why) {
-        throw new SettingsError(`${ORC_HOST_ENV}: must be host or host:port, got '${envHost}' (${why})`, undefined, ORC_HOST_ENV);
-      }
-      host = { value: t, source: 'env', from: ORC_HOST_ENV };
+      if (why) hostError = `${ORC_HOST_ENV}: must be host or host:port, got '${envHost}' (${why})`;
+      else host = { value: t, source: 'env', from: ORC_HOST_ENV };
     }
   } else {
     host = fromFile((v) => v.host);
@@ -372,6 +377,7 @@ export function loadSettings(opts: LoadSettingsOptions = {}): Settings {
     nested,
     ...(host ? { host } : {}),
     ...(hostNote ? { hostNote } : {}),
+    ...(hostError ? { hostError } : {}),
     ...(provider ? { provider } : {}),
     models,
     ...(local ? { local } : {}),
@@ -400,11 +406,13 @@ export type HostDecision =
 export function decideHost(input: {
   local?: boolean;
   host?: string;
-  settings?: Pick<Settings, 'host'>;
+  settings?: Pick<Settings, 'host' | 'hostError'>;
   peers?: readonly PeerEntry[];
 }): HostDecision {
   if (input.local) return { kind: 'local', why: 'flag' };
   if (input.host !== undefined) return { kind: 'remote', host: input.host, explicit: true, from: '--host' };
+  // An invalid ORC_HOST outranks the files: refuse rather than silently fall through to them.
+  if (input.settings?.hostError) return { kind: 'refused', message: input.settings.hostError };
   const h = input.settings?.host;
   if (!h) return { kind: 'local', why: 'none' };
   if (h.source === 'local' && !isTrustedPeer(h.value, input.peers ?? [])) {
@@ -486,6 +494,8 @@ export function settingsView(
   let host: SettingView;
   if (opts.local) {
     host = { value: null, source: 'flag', from: '--local', note: 'commands run on this host' };
+  } else if (settings.hostError) {
+    host = { value: null, source: 'env', from: ORC_HOST_ENV, note: `invalid — commands are refused without --local/--host: ${settings.hostError}` };
   } else if (settings.host) {
     host = { value: settings.host.value, source: settings.host.source, from: settings.host.from };
     const d = decideHost({ settings, peers: opts.peers ?? [] });
