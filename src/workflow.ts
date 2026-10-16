@@ -261,6 +261,8 @@ export type StepExecutor = (args: {
     patch?: Partial<StepAttempt>,
   ) => Promise<void> | void;
   attempt?: StepAttempt;
+  /** The run's default model for this step's provider (`defaultModels`), if any. */
+  model?: string;
 }) => Promise<StepResult>;
 
 /**
@@ -325,6 +327,14 @@ export interface RunWorkflowOptions {
    * on resume the persisted plan value wins so scheduling semantics cannot silently change.
    */
   maxConcurrency?: number;
+  /**
+   * Default model per provider for steps (the CLI passes settings.toml `[models]`; the SDK
+   * never reads settings files). Recorded on the run when it starts; resume/retry reuse the
+   * recorded map, so a later settings change cannot switch models mid-run. Steps have no
+   * model of their own, so each step's session gets `defaultModels[step.provider]` (else the
+   * provider's own default).
+   */
+  defaultModels?: Partial<Record<Provider, string>>;
 }
 
 export function assertValidStepId(stepId: string, label = 'step id'): void {
@@ -892,6 +902,7 @@ const defaultExecStep: StepExecutor = async ({
   transition,
   attempt,
   emit,
+  model,
 }) => {
   const depth = lineage?.depth ?? 0;
   const rootRunId = lineage?.rootRunId ?? runId;
@@ -927,6 +938,7 @@ const defaultExecStep: StepExecutor = async ({
   const session = await agent(
     applyInheritedContext({
       provider: step.provider,
+      ...(model ? { model } : {}),
       alias: step.alias,
       cwd: step.cwd,
       worktree: step.worktree ? true : undefined,
@@ -1374,6 +1386,8 @@ async function runWorkflowOwned(
   const effectivePlan = existing?.plan ?? plan;
   const effectiveDigest = existing?.definitionDigest ?? digest;
   const effectivePolicy = existing?.policy ?? policy;
+  // Recorded defaults win on resume/retry (predictable after a settings change).
+  const defaultModels = existing?.defaultModels ?? opts.defaultModels;
   // Ensure plan has normalized maxConcurrency for legacy records.
   if (effectivePlan.maxConcurrency === undefined) {
     effectivePlan.maxConcurrency = 1;
@@ -1406,6 +1420,7 @@ async function runWorkflowOwned(
         : [],
     lease: ownerLease(),
     ...(effectivePolicy ? { policy: effectivePolicy } : {}),
+    ...(defaultModels ? { defaultModels: { ...defaultModels } } : {}),
     rootRunId,
     ...(parentRunId ? { parentRunId } : {}),
     ...(deadlineAt ? { deadlineAt } : {}),
@@ -1715,6 +1730,7 @@ async function runWorkflowOwned(
         },
         transition,
         attempt,
+        ...(defaultModels?.[step.provider] ? { model: defaultModels[step.provider] } : {}),
       }),
     );
   };
@@ -2176,6 +2192,8 @@ export interface ResumeOptions {
   leaseMs?: number;
   ownerId?: string;
   allowUnknownDeliveryRetry?: boolean;
+  /** Step default models when the run recorded none (see RunWorkflowOptions.defaultModels). */
+  defaultModels?: Partial<Record<Provider, string>>;
 }
 
 export interface RetryOptions extends ResumeOptions {
@@ -2293,6 +2311,7 @@ export async function resumeWorkflow(
     signal: opts.signal,
     leaseMs: opts.leaseMs,
     ownerId,
+    defaultModels: opts.defaultModels,
     rootRunId: existing.rootRunId ?? existing.id,
     parentRunId: existing.parentRunId,
   });
@@ -2341,6 +2360,7 @@ export async function retryWorkflow(
     signal: opts.signal,
     leaseMs: opts.leaseMs,
     ownerId,
+    defaultModels: opts.defaultModels,
     rootRunId: existing.rootRunId ?? existing.id,
     parentRunId: existing.parentRunId,
   });

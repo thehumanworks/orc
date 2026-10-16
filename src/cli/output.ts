@@ -153,6 +153,7 @@ export function publicRunView(run: WorkflowRun): Record<string, unknown> {
     definitionDigest: run.definitionDigest,
     maxConcurrency,
     policy: run.policy,
+    ...(run.defaultModels ? { defaultModels: run.defaultModels } : {}),
     lease: run.lease
       ? {
           ownerId: run.lease.ownerId,

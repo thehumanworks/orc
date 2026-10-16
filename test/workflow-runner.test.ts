@@ -611,7 +611,7 @@ describe('launch helpers (injected spawner): spawn first, then stamp (D7)', () =
     const launch = await launchDetachedRun(oneStep, '/abs/wf.ts', { spawn: fakeSpawner(calls), maxConcurrency: 2 });
     expect(calls).toHaveLength(1);
     const { argv, opts } = calls[0]!;
-    expect(argv).toEqual([...selfArgv(), 'workflow', 'run', '/abs/wf.ts', '--run-id', launch.runId, '--max-concurrency', '2']);
+    expect(argv).toEqual([...selfArgv(), '--local', 'workflow', 'run', '/abs/wf.ts', '--run-id', launch.runId, '--max-concurrency', '2']);
     expect(opts.logPath).toBe(runnerLogPath(launch.runId));
     expect(opts.env?.ORC_HOME).toBe(process.env.ORC_HOME);
     expect(opts.env?.PATH).toBe(process.env.PATH); // full env (spawnDetached does not merge)
@@ -651,7 +651,7 @@ describe('launch helpers (injected spawner): spawn first, then stamp (D7)', () =
       spawn: fakeSpawner(calls),
       stepId: 'a',
     });
-    expect(calls[0]!.argv).toEqual([...selfArgv(), 'workflow', 'retry', 'rt1', '/abs/wf.ts', '--step', 'a', '--runner']);
+    expect(calls[0]!.argv).toEqual([...selfArgv(), '--local', 'workflow', 'retry', 'rt1', '/abs/wf.ts', '--step', 'a', '--runner']);
     expect(launch).toMatchObject({ runId: 'rt1', action: 'retry', logPath: runnerLogPath('rt1') });
     const rec = (await readRun('rt1'))!;
     expect(rec.status).toBe('running');
@@ -770,7 +770,7 @@ describe('daemon detached routes (injected spawner)', () => {
     const res = await call('/workflows/runs/ds1/resume', { detach: true, file: POLICY_FAIL_WF });
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ runId: 'ds1', logPath: runnerLogPath('ds1'), action: 'resume' });
-    expect(argvs[0]).toEqual([...selfArgv(), 'workflow', 'resume', 'ds1', POLICY_FAIL_WF, '--runner']);
+    expect(argvs[0]).toEqual([...selfArgv(), '--local', 'workflow', 'resume', 'ds1', POLICY_FAIL_WF, '--runner']);
     const view = (await (await call('/workflows/runs/ds1')).json()) as Record<string, unknown>;
     expect(view.runner).toMatchObject({ pid: DEAD_PID });
     expect(JSON.stringify(view)).not.toContain('runner.log');

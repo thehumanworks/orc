@@ -40,6 +40,16 @@ import type { Scope } from '../daemon/auth.ts';
 import { readPeers, addPeer, removePeer, peerHosts, DEFAULT_DAEMON_PORT } from '../daemon/peers.ts';
 import { DaemonClient, parseHostArg } from '../daemon/client.ts';
 import type { RemoteTarget, DetachedWorkflowLaunch } from '../daemon/client.ts';
+import {
+  decideHost,
+  defaultHostNotice,
+  defaultModelsOf,
+  loadSettings,
+  renderSettingsView,
+  resolveSpawnDefaults,
+  settingsView,
+} from '../settings.ts';
+import type { HostDecision, Settings } from '../settings.ts';
 import type { AgentOptions, Provider, SystemPromptMode } from '../types.ts';
 import type { Session, SessionStateDetail } from '../session.ts';
 import type { SendResult } from '../messages.ts';
@@ -204,7 +214,10 @@ export function readSelectionFromFlags(values: ReadFlagValues): TurnSelection {
   return { mode: 'latest' };
 }
 
-async function cmdSpawn(args: string[]): Promise<number> {
+/** No provider from --provider or settings.toml. */
+const PROVIDER_REQUIRED = '--provider is required (claude|codex|pi), or set `provider` in settings.toml';
+
+async function cmdSpawn(args: string[], settings?: Settings): Promise<number> {
   const { values } = parse(args, {
     provider: { type: 'string', short: 'p' },
     model: { type: 'string', short: 'm' },
@@ -222,9 +235,16 @@ async function cmdSpawn(args: string[]): Promise<number> {
   });
   const json = jsonFlag(values);
 
-  const provider = values.provider as Provider | undefined;
+  // --provider/--model, else the settings.toml defaults (orc settings shows them).
+  const defaults = resolveSpawnDefaults({
+    provider: values.provider as string | undefined,
+    model: values.model as string | undefined,
+    agent: values.agent as string | undefined,
+    settings,
+  });
+  const provider = defaults.provider as Provider | undefined;
   if (!provider) {
-    printError('--provider is required (claude|codex|pi)', json);
+    printError(PROVIDER_REQUIRED, json);
     return 1;
   }
 
@@ -248,7 +268,7 @@ async function cmdSpawn(args: string[]): Promise<number> {
 
   const opts: AgentOptions = {
     provider,
-    model: values.model as string | undefined,
+    model: defaults.model,
     agentName: values.agent as string | undefined,
     alias: values.alias as string | undefined,
     systemPrompt: values['system-prompt'] as string | undefined,
@@ -789,12 +809,14 @@ async function cmdWait(args: string[]): Promise<number> {
  * `orc workflow <sub>` — the only command with a sub-arg. argv[1] is the workflow
  * subcommand (run|list|status); the remainder is that sub's own args.
  */
-async function cmdWorkflow(args: string[]): Promise<number> {
+async function cmdWorkflow(args: string[], settings?: Settings): Promise<number> {
   const sub = args[0];
   const rest = args.slice(1);
+  // settings.toml `[models]`: the default model of steps (fixed per run when it starts).
+  const defaultModels = settings ? defaultModelsOf(settings) : undefined;
   switch (sub) {
     case 'run':
-      return cmdWorkflowRun(rest);
+      return cmdWorkflowRun(rest, defaultModels);
     case 'list':
       return cmdWorkflowList(rest);
     case 'status':
@@ -804,9 +826,9 @@ async function cmdWorkflow(args: string[]): Promise<number> {
     case 'logs':
       return cmdWorkflowLogs(rest);
     case 'resume':
-      return cmdWorkflowResume(rest);
+      return cmdWorkflowResume(rest, defaultModels);
     case 'retry':
-      return cmdWorkflowRetry(rest);
+      return cmdWorkflowRetry(rest, defaultModels);
     case 'cancel':
       return cmdWorkflowCancel(rest);
     case 'cleanup':
@@ -837,7 +859,9 @@ function parseMaxConcurrencyFlag(
   return { ok: true, value: n };
 }
 
-async function cmdWorkflowRun(args: string[]): Promise<number> {
+type DefaultModels = Partial<Record<Provider, string>>;
+
+async function cmdWorkflowRun(args: string[], defaultModels?: DefaultModels): Promise<number> {
   const { values, positionals } = parse(args, {
     json: { type: 'boolean' },
     detach: { type: 'boolean' },
@@ -871,7 +895,7 @@ async function cmdWorkflowRun(args: string[]): Promise<number> {
   }
 
   if (values.detach === true) {
-    return cmdWorkflowRunDetached(absFile, def, json, conc.value);
+    return cmdWorkflowRunDetached(absFile, def, json, conc.value, defaultModels);
   }
 
   let run: WorkflowRun;
@@ -889,6 +913,7 @@ async function cmdWorkflowRun(args: string[]): Promise<number> {
       signal: term.signal,
       sourcePath: absFile,
       maxConcurrency: conc.value,
+      defaultModels,
       onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
     });
   } catch (e) {
@@ -940,9 +965,10 @@ async function cmdWorkflowRunDetached(
   def: WorkflowDef,
   json: boolean,
   maxConcurrency?: number,
+  defaultModels?: DefaultModels,
 ): Promise<number> {
   try {
-    const launch = await launchDetachedRun(def, absFile, { maxConcurrency });
+    const launch = await launchDetachedRun(def, absFile, { maxConcurrency, defaultModels });
     if (json) printJson({ runId: launch.runId, logPath: launch.logPath });
     else process.stdout.write(`${launch.runId}\n`);
     return 0;
@@ -1194,7 +1220,7 @@ async function assertNoLiveOwner(
   return live;
 }
 
-async function cmdWorkflowResume(args: string[]): Promise<number> {
+async function cmdWorkflowResume(args: string[], defaultModels?: DefaultModels): Promise<number> {
   const { values, positionals } = parse(args, {
     json: { type: 'boolean' },
     detach: { type: 'boolean' },
@@ -1226,6 +1252,7 @@ async function cmdWorkflowResume(args: string[]): Promise<number> {
     try {
       const run = await resumeWorkflow(runId, def, {
         sourcePath: absPath,
+        defaultModels,
         runner,
         signal: term.signal,
         onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
@@ -1243,7 +1270,7 @@ async function cmdWorkflowResume(args: string[]): Promise<number> {
 }
 
 /** `orc workflow retry <runId> [--step <id>] [workflowFile] [--detach]` */
-async function cmdWorkflowRetry(args: string[]): Promise<number> {
+async function cmdWorkflowRetry(args: string[], defaultModels?: DefaultModels): Promise<number> {
   const { values, positionals } = parse(args, {
     json: { type: 'boolean' },
     detach: { type: 'boolean' },
@@ -1277,6 +1304,7 @@ async function cmdWorkflowRetry(args: string[]): Promise<number> {
     try {
       const run = await retryWorkflow(runId, def, {
         sourcePath: absPath,
+        defaultModels,
         stepId,
         runner,
         signal: term.signal,
@@ -1545,14 +1573,20 @@ async function cmdRemoteAdmin(args: string[]): Promise<number> {
 }
 
 /**
- * Strip a global `--host <h>` / `--host=<h>` flag from argv (it may appear before the
- * subcommand). Returns the host (if any) and the remaining argv. Pure + unit-testable.
+ * Strip the global `--host <h>` / `--host=<h>` and `--local` flags from argv (they may
+ * appear before the subcommand). Returns the host (if any), `local: true` when `--local`
+ * was given, and the remaining argv. Pure + unit-testable.
  */
-export function extractHostFlag(argv: string[]): { host?: string; rest: string[] } {
+export function extractHostFlag(argv: string[]): { host?: string; local?: true; rest: string[] } {
   const rest: string[] = [];
   let host: string | undefined;
+  let local = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
+    if (a === '--local') {
+      local = true;
+      continue;
+    }
     if (a === '--host') {
       host = argv[i + 1];
       i++;
@@ -1564,18 +1598,39 @@ export function extractHostFlag(argv: string[]): { host?: string; rest: string[]
     }
     rest.push(a);
   }
-  return { ...(host !== undefined ? { host } : {}), rest };
+  return { ...(host !== undefined ? { host } : {}), ...(local ? { local: true as const } : {}), rest };
+}
+
+/**
+ * `orc settings [--json]` — the effective settings per key with their source (flag / env /
+ * local file / global file / default), the files considered and any warnings. Host-local.
+ */
+async function cmdSettings(args: string[], opts: { local: boolean }): Promise<number> {
+  const { values } = parse(args, { json: { type: 'boolean' } });
+  const json = jsonFlag(values);
+  let settings: Settings;
+  try {
+    settings = loadSettings();
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
+  const peers = settings.host?.source === 'local' ? await readPeers() : [];
+  const view = settingsView(settings, { local: opts.local, peers });
+  if (json) printJson(view);
+  else process.stdout.write(`${renderSettingsView(view)}\n`);
+  return 0;
 }
 
 /** Dispatch a command to its remote (HTTP) implementation when `--host` is present. */
-async function cmdRemote(command: string, host: string, rest: string[]): Promise<number> {
+async function cmdRemote(command: string, host: string, rest: string[], settings?: Settings): Promise<number> {
   const target = parseHostArg(host);
   const client = new DaemonClient(target);
   switch (command) {
     case 'list':
       return remoteList(client, rest, target);
     case 'spawn':
-      return remoteSpawn(client, rest);
+      return remoteSpawn(client, rest, settings);
     case 'send':
       return remoteSend(client, rest);
     case 'read':
@@ -1620,7 +1675,7 @@ async function remoteList(client: DaemonClient, args: string[], target: RemoteTa
   }
 }
 
-async function remoteSpawn(client: DaemonClient, args: string[]): Promise<number> {
+async function remoteSpawn(client: DaemonClient, args: string[], settings?: Settings): Promise<number> {
   const { values } = parse(args, {
     provider: { type: 'string', short: 'p' },
     model: { type: 'string', short: 'm' },
@@ -1637,9 +1692,16 @@ async function remoteSpawn(client: DaemonClient, args: string[]): Promise<number
     json: { type: 'boolean' },
   });
   const json = jsonFlag(values);
-  const provider = values.provider as string | undefined;
+  // Defaults resolve on THIS (client) side and are sent explicitly.
+  const defaults = resolveSpawnDefaults({
+    provider: values.provider as string | undefined,
+    model: values.model as string | undefined,
+    agent: values.agent as string | undefined,
+    settings,
+  });
+  const provider = defaults.provider;
   if (!provider) {
-    printError('--provider is required (claude|codex|pi)', json);
+    printError(PROVIDER_REQUIRED, json);
     return 1;
   }
   let prompt: string | undefined;
@@ -1656,7 +1718,7 @@ async function remoteSpawn(client: DaemonClient, args: string[]): Promise<number
   }
   const body = {
     provider,
-    model: values.model,
+    model: defaults.model,
     agent: values.agent,
     alias: values.alias,
     systemPrompt: values['system-prompt'],
@@ -2252,6 +2314,8 @@ export function resolveCommand(raw: string | undefined): string {
       return 'login';
     case 'logout':
       return 'logout';
+    case 'settings':
+      return 'settings';
     case 'help':
     case '--help':
     case '-h':
@@ -2262,6 +2326,22 @@ export function resolveCommand(raw: string | undefined): string {
   }
 }
 
+/**
+ * Commands that run against a daemon over `--host` — and therefore follow a DEFAULT host
+ * (ORC_HOST / settings.toml). Everything else is host-local and ignores default hosts.
+ */
+const REMOTE_CAPABLE: ReadonlySet<string> = new Set([
+  'list',
+  'spawn',
+  'send',
+  'read',
+  'wait',
+  'state',
+  'kill',
+  'attach',
+  'workflow',
+]);
+
 async function main(): Promise<number> {
   // Hidden: the detached per-session actor (src/runtime/actor-main.ts). Not a user command.
   if (process.argv[2] === '__actor') return (await import('../runtime/actor-main.ts')).runActorMain(process.argv.slice(3));
@@ -2270,20 +2350,61 @@ async function main(): Promise<number> {
   if (process.argv[2] === '__codex-harness') {
     return (await import('../codex/harness.ts')).runCodexHarnessMain(process.argv.slice(3));
   }
-  // Peel a global `--host <h>` (it may precede the subcommand) BEFORE per-command parsing,
-  // which is strict on unknown options. When present, the command runs over HTTP.
-  const { host, rest: argv } = extractHostFlag(process.argv.slice(2));
+  // Peel the global `--host <h>` / `--local` (they may precede the subcommand) BEFORE
+  // per-command parsing, which is strict on unknown options.
+  const { host, local: localFlag, rest: argv } = extractHostFlag(process.argv.slice(2));
+  const local = localFlag === true;
   const sub = argv[0];
   const rest = argv.slice(1);
   const command = resolveCommand(sub);
 
-  if (host !== undefined) {
-    return cmdRemote(command, host, rest);
+  if (!REMOTE_CAPABLE.has(command)) {
+    // Host-local: default hosts never apply (nor error); an explicit --host keeps the
+    // "not supported over --host" error unless --local overrides it.
+    if (host !== undefined && !local) return cmdRemote(command, host, rest);
+    return runLocal(command, sub, rest, { local });
   }
 
+  // Remote-capable: settings give the default host and spawn/workflow defaults.
+  const json = rest.includes('--json');
+  let settings: Settings;
+  try {
+    settings = loadSettings();
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
+  for (const w of settings.warnings) process.stderr.write(`orc: warning: ${w}\n`);
+
+  // `list --all-hosts` is the fleet view from here: never redirected by a default host.
+  const allHosts = command === 'list' && host === undefined && rest.includes('--all-hosts');
+  const peerCheck = !local && host === undefined && !allHosts && settings.host?.source === 'local';
+  const decision: HostDecision = allHosts
+    ? { kind: 'local', why: 'none' }
+    : decideHost({ local, host, settings, peers: peerCheck ? await readPeers() : [] });
+  switch (decision.kind) {
+    case 'refused':
+      printError(decision.message, json);
+      return 1;
+    case 'remote':
+      // stderr even with --json: stdout stays machine-clean.
+      if (!decision.explicit) process.stderr.write(defaultHostNotice(decision.host, decision.from));
+      return cmdRemote(command, decision.host, rest, settings);
+    case 'local':
+      return runLocal(command, sub, rest, { local, settings });
+  }
+}
+
+/** Run a command on THIS host (`settings` is loaded for remote-capable commands). */
+async function runLocal(
+  command: string,
+  sub: string | undefined,
+  rest: string[],
+  ctx: { local: boolean; settings?: Settings },
+): Promise<number> {
   switch (command) {
     case 'spawn':
-      return cmdSpawn(rest);
+      return cmdSpawn(rest, ctx.settings);
     case 'send':
       return cmdSend(rest);
     case 'read':
@@ -2305,7 +2426,7 @@ async function main(): Promise<number> {
     case 'prune':
       return cmdPrune(rest);
     case 'workflow':
-      return cmdWorkflow(rest);
+      return cmdWorkflow(rest, ctx.settings);
     case 'daemon':
       return cmdDaemon(rest);
     case 'remote':
@@ -2314,6 +2435,8 @@ async function main(): Promise<number> {
       return cmdLogin(rest);
     case 'logout':
       return cmdLogout(rest);
+    case 'settings':
+      return cmdSettings(rest, { local: ctx.local });
     case 'help':
       process.stdout.write(HELP_TEXT);
       return 0;

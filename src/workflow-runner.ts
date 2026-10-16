@@ -68,6 +68,12 @@ export class RunnerSpawnError extends Error {
 /** Hidden CLI flag marking a detached resume/retry runner (the `run` runner uses `--run-id`). */
 export const RUNNER_FLAG = '--runner';
 
+/**
+ * A runner always executes on THIS host: `--local` keeps a default host (ORC_HOST or a
+ * settings.toml `host`, inherited by the runner) from sending its `workflow` command remote.
+ */
+const RUNNER_LOCAL_FLAG = '--local';
+
 /** The `runner` a detached runner process reports for itself. */
 export function currentRunnerInfo(runId: string): RunnerInfo {
   return {
@@ -125,7 +131,7 @@ async function stampOrStop(
 export async function launchDetachedRun(
   def: WorkflowDef,
   absFile: string,
-  opts: LaunchRunnerOptions & { maxConcurrency?: number } = {},
+  opts: LaunchRunnerOptions & { maxConcurrency?: number; defaultModels?: WorkflowRun['defaultModels'] } = {},
 ): Promise<DetachedLaunch> {
   const defForPlan: WorkflowDef =
     opts.maxConcurrency !== undefined ? { ...def, maxConcurrency: opts.maxConcurrency } : def;
@@ -150,10 +156,13 @@ export async function launchDetachedRun(
     // Informational until the runner stamps its own identity (D4).
     lease: makeLease(),
     rootRunId: runId,
+    // The runner resolves the same settings (same cwd) and re-records them; this copy
+    // covers a runner that dies before its first write.
+    ...(opts.defaultModels ? { defaultModels: { ...opts.defaultModels } } : {}),
   };
   await writeRunOwned(run);
 
-  const argv = [...selfArgv(), 'workflow', 'run', absFile, '--run-id', runId];
+  const argv = [...selfArgv(), RUNNER_LOCAL_FLAG, 'workflow', 'run', absFile, '--run-id', runId];
   if (opts.maxConcurrency !== undefined) argv.push('--max-concurrency', String(opts.maxConcurrency));
   let runner: RunnerInfo;
   try {
@@ -191,6 +200,7 @@ export async function launchDetachedRecovery(
 
   const argv = [
     ...selfArgv(),
+    RUNNER_LOCAL_FLAG,
     'workflow',
     action,
     runId,

@@ -290,4 +290,9 @@ export interface WorkflowRun {
   definitionDigest?: string;
   deadlineAt?: string;
   counters?: RunCounters;
+  /**
+   * Step default model per provider, fixed when the run started (the CLI's settings.toml
+   * `[models]`); resume/retry reuse it.
+   */
+  defaultModels?: Partial<Record<Provider, string>>;
 }
