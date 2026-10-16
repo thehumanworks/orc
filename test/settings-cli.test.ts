@@ -408,7 +408,7 @@ describe('provider/model defaults on this host', () => {
       // A run that started with no [models] keeps none: retry never reads settings.
       fs.rmSync(g);
       const bare = JSON.parse((await orc(c, ['workflow', 'run', file, '--json'])).out) as RunJson;
-      expect(bare.defaultModels ?? {}).toEqual({});
+      expect('defaultModels' in bare).toBe(false); // --json stays clean when no [models]
       write(g, '[models]\nclaude = "late"\n');
       const bareRetry = JSON.parse((await orc(c, ['workflow', 'retry', bare.id, '--step', 'a', file, '--json'])).out) as RunJson;
       expect(bareRetry.steps[0]!.sessionId).not.toBe(bare.steps[0]!.sessionId);

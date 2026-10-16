@@ -1420,7 +1420,8 @@ async function runWorkflowOwned(
         : [],
     lease: ownerLease(),
     ...(effectivePolicy ? { policy: effectivePolicy } : {}),
-    ...(defaultModels ? { defaultModels: { ...defaultModels } } : {}),
+    // Only a non-empty map is recorded (absent = none), keeping --json clean when unused.
+    ...(defaultModels && Object.keys(defaultModels).length > 0 ? { defaultModels: { ...defaultModels } } : {}),
     rootRunId,
     ...(parentRunId ? { parentRunId } : {}),
     ...(deadlineAt ? { deadlineAt } : {}),

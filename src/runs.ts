@@ -302,7 +302,7 @@ export function normalizeRun(raw: unknown): WorkflowRun | null {
     for (const [p, m] of Object.entries(o.defaultModels as Record<string, unknown>)) {
       if ((p === 'claude' || p === 'codex' || p === 'pi') && typeof m === 'string' && m.length > 0) dm[p] = m;
     }
-    run.defaultModels = dm;
+    if (Object.keys(dm).length > 0) run.defaultModels = dm;
   }
   if (o.plan && typeof o.plan === 'object') {
     const p = o.plan as Record<string, unknown>;

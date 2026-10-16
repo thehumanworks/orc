@@ -622,6 +622,14 @@ describe('launch helpers (injected spawner): spawn first, then stamp (D7)', () =
     expect(rec.lease?.pid).toBe(DEAD_PID);
   });
 
+  test('detached run: the launch record carries defaultModels only when non-empty (absent = none)', async () => {
+    const calls: Call[] = [];
+    const none = await launchDetachedRun(oneStep, '/abs/wf.ts', { spawn: fakeSpawner(calls), defaultModels: {} });
+    expect('defaultModels' in (await readRun(none.runId))!).toBe(false);
+    const some = await launchDetachedRun(oneStep, '/abs/wf.ts', { spawn: fakeSpawner(calls), defaultModels: { claude: 'm' } });
+    expect((await readRun(some.runId))!.defaultModels).toEqual({ claude: 'm' });
+  });
+
   test('detached run: spawn failure finalizes the pre-written record as failed', async () => {
     const calls: Call[] = [];
     await expect(launchDetachedRun(oneStep, '/abs/wf.ts', { spawn: failingSpawner(calls) })).rejects.toBeInstanceOf(

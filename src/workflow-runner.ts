@@ -157,8 +157,11 @@ export async function launchDetachedRun(
     lease: makeLease(),
     rootRunId: runId,
     // Authoritative: the runner (`--run-id`) runs with exactly this map (absent = none) and
-    // never reads settings itself, so a detached run behaves like a foreground one.
-    ...(opts.defaultModels ? { defaultModels: { ...opts.defaultModels } } : {}),
+    // never reads settings itself, so a detached run behaves like a foreground one. Only a
+    // non-empty map is recorded; absence already means "none", so no sentinel is needed.
+    ...(opts.defaultModels && Object.keys(opts.defaultModels).length > 0
+      ? { defaultModels: { ...opts.defaultModels } }
+      : {}),
   };
   await writeRunOwned(run);
 
