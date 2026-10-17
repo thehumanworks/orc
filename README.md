@@ -62,6 +62,9 @@ bun run install:cli                      # or: compile a standalone binary to ~/
 bun run src/cli/index.ts <command> ...   # or: run it directly
 ```
 
+**With Nix** (Linux, Apple-silicon macOS): `nix run github:thehumanworks/orc -- --version`, or
+`nix build` in a checkout; see [Nix](#nix).
+
 ## Quick start
 
 ```sh
@@ -543,6 +546,9 @@ bun run check:compile                      # compile orc; run the codex harness'
 bun run verify:live --claude-model haiku   # live end-to-end on an authenticated host
 ```
 
+With Nix, `nix develop` provides the toolchain and `nix flake check` builds, smoke-tests and
+typechecks orc in the sandbox: see [Nix](#nix).
+
 `verify:live` runs `scripts/verify-runtime/all.ts`: per-provider runtime gates; CLI end-to-end
 (spawn, idempotent send, SIGKILL the actor → `suspended` → wake, takeover/resume, kill/prune); a
 detached workflow; and a check that `tmux` is never invoked. A missing provider is SKIP; any FAIL
@@ -587,7 +593,8 @@ on Linux and macOS, and `build.yml`, which builds `orc-<os>-<arch>` natively on 
 (linux/darwin × x64/arm64) with `bun run compile:cli`, the same script as local builds, and the Bun
 pinned in `.bun-version` (1.4.2). It smoke-tests each binary on the runner that built it
 (`--version` matches `package.json`, `--help`, the codex harness self-test, no `.env` /
-`bunfig.toml` autoload from the cwd) and uploads it as a workflow artifact.
+`bunfig.toml` autoload from the cwd) and uploads it as a workflow artifact. `nix.yml` checks the
+[Nix](#nix) flake on the same events.
 
 To cut a release, bump `version` in `package.json`, merge to `main`, then tag that commit:
 
@@ -599,6 +606,38 @@ git tag v0.2.0 && git push origin v0.2.0   # must be v<package.json version>
 writes `SHA256SUMS`, attests build provenance and publishes the GitHub release with generated
 notes and every asset (a tag with a `-`, e.g. `v0.2.0-rc.1`, is marked pre-release). If the run
 fails before publishing, re-run it from the Actions tab or with `gh workflow run release.yml --ref v0.2.0`.
+
+## Nix
+
+Optional: `flake.nix` adds a dev shell and a pure build. Without Nix nothing changes: `bun install`,
+`compile:cli` and the release binaries never use it. Systems: `x86_64-linux`, `aarch64-linux`,
+`aarch64-darwin`. nixpkgs-unstable no longer supports `x86_64-darwin`, so on an Intel Mac use the
+`orc-darwin-x64` [release binary](#install) or the Bun build.
+
+```sh
+nix develop               # bun (nixpkgs; 1.4.2 at this lock), git, jq, bash, nixfmt; procps on Linux
+nix build                 # ./result/bin/orc, built by package.json's compile:cli
+nix run . -- --version    # or from anywhere: nix run github:thehumanworks/orc -- --version
+nix flake check           # orc, a smoke test (--version, --help, codex self-test), the typecheck
+nix fmt                   # nixfmt (RFC style) on the .nix files
+```
+
+`flake.lock` pins nixpkgs; the only network access is a fixed-output `bun install --frozen-lockfile`
+of `bun.lock` (the same `node_modules` as a plain `bun install`), whose hash is in
+`nix/hashes.json`. The binary embeds nixpkgs' bun (on x86_64-linux its baseline build), so it is
+not byte-identical to a release binary. `overlays.default` adds `pkgs.orc`.
+
+**When `bun.lock` changes** (or a `nix flake update` brings a bun that installs differently), Nix
+builds fail with `hash mismatch in fixed-output derivation` until the hash is refreshed. One hash
+covers every system:
+
+```sh
+nix run .#update-deps-hash   # builds the dependencies and writes nix/hashes.json; commit it
+```
+
+Without Nix, copy the `got: sha256-…` value from the failing `nix` workflow into
+`nix/hashes.json`. `.github/workflows/nix.yml` runs `nix flake check`, `nix build`, the binary and
+the dev shell on Linux x64/arm64 and macOS arm64.
 
 ## Upgrading from the tmux runtime
 
