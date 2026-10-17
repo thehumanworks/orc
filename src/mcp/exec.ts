@@ -4,7 +4,9 @@
  * caller's minus daemon credentials; an aborted call kills the child; output is bounded.
  * The CLI's documented `--json` output is the contract the tools shape their results from.
  */
+import fs from 'node:fs';
 import { selfArgv } from '../runtime/process.ts';
+import { MAX_CLI_CHILDREN } from './limits.ts';
 
 /**
  * Daemon credentials never handed to a CLI child: the server's token map / shared secret,
@@ -113,81 +115,164 @@ async function readCapped(stream: ReadableStream<Uint8Array>, max: number): Prom
 }
 
 /**
- * A CliRunner that executes `[...prefix, ...call.args]`. `prefix` defaults to `selfArgv()`:
- * this orc build (the compiled binary, or `bun <repo>/src/cli/index.ts` from source).
+ * A counting semaphore for CLI children: at most `max` run at once; further calls queue in
+ * order. A call whose signal aborts while queued leaves the queue without ever starting.
  */
-export function createCliRunner(prefix: readonly string[] = selfArgv()): CliRunner {
+export class ChildLimiter {
+  private active = 0;
+  private readonly waiting: Array<() => void> = [];
+
+  constructor(readonly max: number) {
+    if (!Number.isInteger(max) || max < 1) throw new Error(`ChildLimiter: max must be a positive integer, got ${max}`);
+  }
+
+  /** Children running now / calls waiting for a slot. */
+  get running(): number {
+    return this.active;
+  }
+  get queued(): number {
+    return this.waiting.length;
+  }
+
+  /** Take a slot: true once granted, false if `signal` aborted first (no slot taken). */
+  acquire(signal?: AbortSignal): Promise<boolean> {
+    if (signal?.aborted) return Promise.resolve(false);
+    if (this.active < this.max) {
+      this.active++;
+      return Promise.resolve(true);
+    }
+    return new Promise<boolean>((resolve) => {
+      const grant = (): void => {
+        signal?.removeEventListener('abort', onAbort);
+        this.active++;
+        resolve(true);
+      };
+      const onAbort = (): void => {
+        const i = this.waiting.indexOf(grant);
+        if (i >= 0) this.waiting.splice(i, 1);
+        resolve(false);
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      this.waiting.push(grant);
+    });
+  }
+
+  /** Give a slot back (to the next queued call, if any). */
+  release(): void {
+    this.active = Math.max(0, this.active - 1);
+    this.waiting.shift()?.();
+  }
+}
+
+/** The process-wide limit every runner shares by default (MAX_CLI_CHILDREN). */
+export const SHARED_CHILD_LIMITER = new ChildLimiter(MAX_CLI_CHILDREN);
+
+/**
+ * A CliRunner that executes `[...prefix, ...call.args]`. `prefix` defaults to `selfArgv()`:
+ * this orc build (the compiled binary, or `bun <repo>/src/cli/index.ts` from source). At most
+ * `limiter.max` children run at once across every runner sharing the limiter (default: the
+ * process-wide one); the rest wait, and an abort while waiting cancels the call.
+ */
+export function createCliRunner(
+  prefix: readonly string[] = selfArgv(),
+  opts: { limiter?: ChildLimiter } = {},
+): CliRunner {
+  const limiter = opts.limiter ?? SHARED_CHILD_LIMITER;
   return async (call: CliCall): Promise<CliResult> => {
-    const empty = { stdout: '', stderr: '', json: undefined, aborted: false, timedOut: false, overflow: false };
     const argv = [...prefix, ...call.args];
     if (argv.some((a) => a.includes('\0'))) {
-      return { ...empty, code: null, signal: null, spawnError: 'an argument contains a NUL byte' };
+      return { ...EMPTY_RESULT, spawnError: 'an argument contains a NUL byte' };
     }
-    if (call.signal?.aborted) return { ...empty, code: null, signal: null, aborted: true };
-    let proc: Bun.Subprocess<Blob | 'ignore', 'pipe', 'pipe'>;
+    if (!(await limiter.acquire(call.signal))) return { ...EMPTY_RESULT, aborted: true };
     try {
-      proc = Bun.spawn(argv, {
-        cwd: call.cwd,
-        env: call.env,
-        stdin: call.stdin !== undefined ? new Blob([call.stdin]) : 'ignore',
-        stdout: 'pipe',
-        stderr: 'pipe',
-      });
-    } catch (e) {
-      return { ...empty, code: null, signal: null, spawnError: (e as Error).message };
+      return await runChild(argv, call);
+    } finally {
+      limiter.release();
     }
+  };
+}
 
-    let aborted = false;
-    let timedOut = false;
-    let killTimer: ReturnType<typeof setTimeout> | undefined;
-    const kill = (): void => {
-      if (killTimer !== undefined || proc.exitCode !== null || proc.signalCode !== null) return;
+const EMPTY_RESULT: CliResult = {
+  code: null,
+  signal: null,
+  stdout: '',
+  stderr: '',
+  json: undefined,
+  aborted: false,
+  timedOut: false,
+  overflow: false,
+};
+
+/** Run one child to completion (abort / timeout → SIGTERM, then SIGKILL after a grace). */
+async function runChild(argv: string[], call: CliCall): Promise<CliResult> {
+  if (call.signal?.aborted) return { ...EMPTY_RESULT, aborted: true };
+  let proc: Bun.Subprocess<Blob | 'ignore', 'pipe', 'pipe'>;
+  try {
+    proc = Bun.spawn(argv, {
+      cwd: call.cwd,
+      env: call.env,
+      stdin: call.stdin !== undefined ? new Blob([call.stdin]) : 'ignore',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+  } catch (e) {
+    // A missing working directory surfaces as an ENOENT about posix_spawn of the binary:
+    // name the directory instead.
+    const missingCwd = call.cwd !== undefined && !fs.existsSync(call.cwd);
+    const spawnError = missingCwd ? `working directory '${call.cwd}' does not exist` : (e as Error).message;
+    return { ...EMPTY_RESULT, spawnError };
+  }
+
+  let aborted = false;
+  let timedOut = false;
+  let killTimer: ReturnType<typeof setTimeout> | undefined;
+  const kill = (): void => {
+    if (killTimer !== undefined || proc.exitCode !== null || proc.signalCode !== null) return;
+    try {
+      proc.kill('SIGTERM');
+    } catch {
+      /* gone */
+    }
+    killTimer = setTimeout(() => {
       try {
-        proc.kill('SIGTERM');
+        proc.kill('SIGKILL');
       } catch {
         /* gone */
       }
-      killTimer = setTimeout(() => {
-        try {
-          proc.kill('SIGKILL');
-        } catch {
-          /* gone */
-        }
-      }, KILL_GRACE_MS);
-    };
-    const onAbort = (): void => {
-      aborted = true;
-      kill();
-    };
-    call.signal?.addEventListener('abort', onAbort, { once: true });
-    const deadline =
-      call.timeoutMs !== undefined
-        ? setTimeout(() => {
-            timedOut = true;
-            kill();
-          }, call.timeoutMs)
-        : undefined;
-
-    try {
-      const [out, err] = await Promise.all([
-        readCapped(proc.stdout, MAX_CLI_STDOUT_BYTES),
-        readCapped(proc.stderr, MAX_CLI_STDERR_BYTES),
-      ]);
-      await proc.exited;
-      return {
-        code: proc.exitCode,
-        signal: proc.signalCode ?? null,
-        stdout: out.text,
-        stderr: err.text,
-        json: out.overflow ? undefined : parseCliJson(out.text),
-        aborted,
-        timedOut,
-        overflow: out.overflow,
-      };
-    } finally {
-      call.signal?.removeEventListener('abort', onAbort);
-      if (deadline !== undefined) clearTimeout(deadline);
-      if (killTimer !== undefined) clearTimeout(killTimer);
-    }
+    }, KILL_GRACE_MS);
   };
+  const onAbort = (): void => {
+    aborted = true;
+    kill();
+  };
+  call.signal?.addEventListener('abort', onAbort, { once: true });
+  const deadline =
+    call.timeoutMs !== undefined
+      ? setTimeout(() => {
+          timedOut = true;
+          kill();
+        }, call.timeoutMs)
+      : undefined;
+
+  try {
+    const [out, err] = await Promise.all([
+      readCapped(proc.stdout, MAX_CLI_STDOUT_BYTES),
+      readCapped(proc.stderr, MAX_CLI_STDERR_BYTES),
+    ]);
+    await proc.exited;
+    return {
+      code: proc.exitCode,
+      signal: proc.signalCode ?? null,
+      stdout: out.text,
+      stderr: err.text,
+      json: out.overflow ? undefined : parseCliJson(out.text),
+      aborted,
+      timedOut,
+      overflow: out.overflow,
+    };
+  } finally {
+    call.signal?.removeEventListener('abort', onAbort);
+    if (deadline !== undefined) clearTimeout(deadline);
+    if (killTimer !== undefined) clearTimeout(killTimer);
+  }
 }

@@ -164,7 +164,12 @@ describe('daemon /mcp: tools by scope', () => {
     expect(c.getInstructions()).toBe(orcInstructions('daemon'));
     const tools = (await c.listTools()).tools;
     for (const t of tools) expect(Object.keys((t.inputSchema as { properties?: object }).properties ?? {})).not.toContain('host');
-    expect((tools.find((t) => t.name === 'spawn')!.inputSchema as { required?: string[] }).required).toContain('cwd');
+    for (const name of ['spawn', 'workflow_run', 'workflow_resume', 'workflow_retry']) {
+      expect([name, (tools.find((t) => t.name === name)!.inputSchema as { required?: string[] }).required]).toEqual([
+        name,
+        expect.arrayContaining(['cwd']),
+      ]);
+    }
   }, T);
 
   test('an out-of-scope call is an error result naming the missing scope, not a crash', async () => {
@@ -197,6 +202,9 @@ describe('daemon /mcp: real calls on the daemon host', () => {
     const rel = await callTool(writer, 'spawn', { provider: 'claude', cwd: 'work', prompt: 'x' });
     expect(rel.isError).toBe(true);
     expect(text(rel)).toContain('absolute path on the daemon host');
+    const missing = await callTool(writer, 'spawn', { provider: 'claude', cwd: path.join(root, 'nope'), prompt: 'x' });
+    expect(missing.isError).toBe(true);
+    expect(text(missing)).toContain('does not exist on the daemon host');
 
     const sp = await callTool(writer, 'spawn', { provider: 'claude', cwd: work, prompt: 'hello daemon mcp' });
     expect(sp.isError).toBeFalsy();
@@ -209,8 +217,8 @@ describe('daemon /mcp: real calls on the daemon host', () => {
     const listed = await callTool(writer, 'list');
     expect((listed.structuredContent!.sessions as { id: string }[]).map((s) => s.id)).toContain(id);
 
-    const root = await connect('root');
-    const k = await callTool(root, 'kill', { id, purge: true });
+    const admin = await connect('root');
+    const k = await callTool(admin, 'kill', { id, purge: true });
     expect(k.structuredContent).toMatchObject({ ok: true, id, purged: true });
   }, T);
 

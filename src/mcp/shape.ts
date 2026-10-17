@@ -51,6 +51,9 @@ export function compactJson(value: unknown, max = MAX_JSON_TEXT_CHARS): string {
   return `${text.slice(0, max)}… [cut: ${text.length - max} more characters; structuredContent has all of it]`;
 }
 
+/** A remote daemon refused the caller's identity/credentials. */
+const UNAUTHORIZED = /unauthorized: (authentication required|invalid credentials)/;
+
 /** Known CLI error messages → what the lead should do next. */
 const HINTS: ReadonlyArray<[RegExp, string]> = [
   [
@@ -61,7 +64,7 @@ const HINTS: ReadonlyArray<[RegExp, string]> = [
   [/orc resume|is stopped|was stopped/, 'the session was killed or taken over: call resume first.'],
   [/different prompt/, 'that idempotency_key was already used with different text: use a new key.'],
   [
-    /unauthorized: (authentication required|invalid credentials)/,
+    UNAUTHORIZED,
     'the daemon on that host refused this caller: it must trust this machine (orc remote add on that host), or accept the bearer token in ORC_DAEMON_TOKEN. Never change trust settings yourself: report it.',
   ],
   [/lacks required scope/, 'that daemon accepts this caller but not this action; ask the user for a token with that scope.'],
@@ -74,7 +77,28 @@ const HINTS: ReadonlyArray<[RegExp, string]> = [
   [/not supported over --host/, 'call it without host (it runs on this machine only).'],
 ];
 
-export function hintFor(message: string): string | undefined {
+/** A call without `host` that orc routed to a default host (ORC_HOST / settings.toml `host`). */
+export interface DefaultHostRoute {
+  host: string;
+  /** ORC_HOST, or the settings file that set it. */
+  from: string;
+}
+
+/** The notice `orc: → <host> (from <source>)` the CLI prints on stderr when it follows a default host. */
+export function defaultHostRoute(stderr: string): DefaultHostRoute | undefined {
+  const m = /^orc: → (\S+) \(from (.+)\)$/m.exec(stderr);
+  return m ? { host: m[1]!, from: m[2]! } : undefined;
+}
+
+export function hintFor(message: string, ctx: { route?: DefaultHostRoute } = {}): string | undefined {
+  if (ctx.route && UNAUTHORIZED.test(message)) {
+    // Calls without host never carry daemon credentials (by design), so a peer that needs a
+    // token refuses them even when ORC_DAEMON_TOKEN is set.
+    return (
+      `this call had no host, so orc followed the default host ${ctx.route.host} (from ${ctx.route.from}), and a call without host carries no daemon credentials: ` +
+      `pass host: "${ctx.route.host}" explicitly so ORC_DAEMON_TOKEN / ORC_DAEMON_SECRET are sent, or have that peer trust this machine (orc remote add on it). Never change trust settings yourself: report it.`
+    );
+  }
   for (const [re, hint] of HINTS) if (re.test(message)) return hint;
   return undefined;
 }
@@ -100,11 +124,12 @@ export function cliFailure(r: CliResult, what: string): ToolResult {
   if (r.aborted) return errorResult(`${what} was cancelled`);
   if (r.timedOut) return errorResult(`${what} did not finish in time and was stopped`);
   if (r.overflow) return errorResult(`${what} produced more output than the MCP server keeps`, 'narrow the request (e.g. read one turn with index).');
+  const route = defaultHostRoute(r.stderr);
   const message = cliErrorMessage(r.json);
-  if (message !== undefined) return errorResult(message, hintFor(message));
+  if (message !== undefined) return errorResult(message, hintFor(message, { route }));
   const detail = tailLines(r.stderr) || tailLines(r.stdout);
   const how = r.code !== null ? `exit code ${r.code}` : `signal ${r.signal ?? 'unknown'}`;
-  return errorResult(`${what} failed (${how})${detail ? `: ${detail}` : ''}`, detail ? hintFor(detail) : undefined);
+  return errorResult(`${what} failed (${how})${detail ? `: ${detail}` : ''}`, detail ? hintFor(detail, { route }) : undefined);
 }
 
 export interface TailWindow<T> {

@@ -22,9 +22,11 @@ import type { McpMode, OrcTool, ToolEnv } from '../src/mcp/tools.ts';
 import { INSTRUCTIONS_MAX_CHARS, orcInstructions } from '../src/mcp/instructions.ts';
 import { GUIDE_SECTIONS, guideText, guideTopic } from '../src/mcp/guide.ts';
 import { toolAllowed, visibleTools } from '../src/mcp/server.ts';
-import { childEnv, createCliRunner, parseCliJson, STRIPPED_ENV_KEYS } from '../src/mcp/exec.ts';
+import { ChildLimiter, childEnv, createCliRunner, parseCliJson, SHARED_CHILD_LIMITER, STRIPPED_ENV_KEYS } from '../src/mcp/exec.ts';
+import { MAX_CLI_CHILDREN } from '../src/mcp/limits.ts';
+import { InFlightRequests } from '../src/mcp/stdio.ts';
 import type { CliCall, CliResult, CliRunner } from '../src/mcp/exec.ts';
-import { tailWindow } from '../src/mcp/shape.ts';
+import { cliFailure, defaultHostRoute, tailWindow } from '../src/mcp/shape.ts';
 import type { ToolResult } from '../src/mcp/shape.ts';
 import {
   hostRejection,
@@ -128,7 +130,11 @@ function recorder(respond: Respond = () => ({ json: {} })): { calls: CliCall[]; 
   };
 }
 
-const SERVER_CWD = '/srv/project';
+/** The server's directory: real, because directories a CLI child runs in must exist. */
+const SERVER_CWD = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'orc-mcp-tools-')));
+for (const d of ['sub', 'pkg', 'repo']) fs.mkdirSync(path.join(SERVER_CWD, d));
+fs.writeFileSync(path.join(SERVER_CWD, 'a-file'), 'x');
+afterAll(() => fs.rmSync(SERVER_CWD, { recursive: true, force: true }));
 const BASE_ENV = {
   PATH: '/usr/bin',
   HOME: '/home/u',
@@ -207,6 +213,33 @@ describe('the tool registry', () => {
         expect([t.name, json.type]).toEqual([t.name, 'object']);
         for (const k of ['anyOf', 'oneOf', 'allOf']) expect(json[k]).toBeUndefined();
         for (const prop of Object.keys((json.properties ?? {}) as object)) expect(prop).toMatch(/^[A-Za-z0-9_.-]{1,64}$/);
+      }
+    }
+  });
+
+  test('unknown arguments are rejected (strict schemas, additionalProperties: false), in both modes', () => {
+    for (const mode of ['stdio', 'daemon'] as const) {
+      const cfg = { mode, waitTimeoutSec: 45 };
+      for (const t of TOOLS) {
+        const json = z.toJSONSchema(t.schema(cfg), { io: 'input' }) as Record<string, unknown>;
+        expect([t.name, json.additionalProperties]).toEqual([t.name, false]);
+        // A key no tool has is a validation error, never silently dropped.
+        expect([t.name, t.schema(cfg).safeParse({ no_such_argument: 1 }).success]).toEqual([t.name, false]);
+      }
+      // camelCase spellings of real parameters: each would otherwise be ignored without a word.
+      const bad: Array<[string, Record<string, unknown>]> = [
+        ['send', { id: 'abc', prompt: 'x', idempotencyKey: 'k' }],
+        ['wait', { ids: ['abc'], timeout: 1 }],
+        ['wait', { ids: ['abc'], timeoutSeconds: 1 }],
+        ['read', { id: 'abc', maxChars: 2_000 }],
+        ['spawn', { provider: 'claude', cwd: '/x', systemPrompt: 'p' }],
+        ['workflow_logs', { run_id: 'r', maxChars: 2_000 }],
+        ['workflow_run', { file: '/w.ts', cwd: '/x', maxConcurrency: 2 }],
+      ];
+      for (const [name, args] of bad) {
+        const r = tool(name).schema(cfg).safeParse(args);
+        expect([name, Object.keys(args).join(','), r.success]).toEqual([name, Object.keys(args).join(','), false]);
+        expect(r.error?.issues[0]?.message).toMatch(/Unrecognized key/);
       }
     }
   });
@@ -343,17 +376,36 @@ describe('argv building (array argv, never a shell)', () => {
   });
 
   test('spawn in daemon mode: --local, absolute cwd required, the child runs in cwd', async () => {
-    const rec = recorder(() => ({ json: { id: 'abcd1234', provider: 'pi', cwd: '/abs/repo' } }));
-    const ok = await call('spawn', { provider: 'pi', cwd: '/abs/repo' }, { mode: 'daemon', run: rec.run });
+    const repo = path.join(SERVER_CWD, 'repo');
+    const rec = recorder(() => ({ json: { id: 'abcd1234', provider: 'pi', cwd: repo } }));
+    const ok = await call('spawn', { provider: 'pi', cwd: repo }, { mode: 'daemon', run: rec.run });
     expect(ok.isError).toBeUndefined();
-    expect(rec.calls[0]!.args).toEqual(['--local', '--no-color', 'spawn', '--provider=pi', '--cwd=/abs/repo', '--no-wait', '--json']);
-    expect(rec.calls[0]!.cwd).toBe('/abs/repo');
+    expect(rec.calls[0]!.args).toEqual(['--local', '--no-color', 'spawn', '--provider=pi', `--cwd=${repo}`, '--no-wait', '--json']);
+    expect(rec.calls[0]!.cwd).toBe(repo);
     const rel = await call('spawn', { provider: 'pi', cwd: 'repo' }, { mode: 'daemon', run: rec.run });
     expect(rel.isError).toBe(true);
     expect(text(rel)).toContain('absolute path');
-    const ws = await call('spawn', { provider: 'pi', cwd: '/abs', workspace: 'rel' }, { mode: 'daemon', run: rec.run });
+    const ws = await call('spawn', { provider: 'pi', cwd: SERVER_CWD, workspace: 'rel' }, { mode: 'daemon', run: rec.run });
     expect(ws.isError).toBe(true);
     expect(rec.calls).toHaveLength(1);
+  });
+
+  test('a cwd that does not exist (or is a file) is a clear error, before any child runs', async () => {
+    const rec = recorder();
+    const missing = path.join(SERVER_CWD, 'nope');
+    const d = await call('spawn', { provider: 'pi', cwd: missing }, { mode: 'daemon', run: rec.run });
+    expect(d.isError).toBe(true);
+    expect(text(d)).toContain(`cwd '${missing}' does not exist on the daemon host`);
+    const s = await call('workflow_run', { file: 'x.ts', cwd: 'nope' }, { run: rec.run });
+    expect(text(s)).toContain("cwd 'nope' does not exist");
+    const f = await call('settings', { cwd: 'a-file' }, { run: rec.run });
+    expect(text(f)).toContain("cwd 'a-file' is not a directory");
+    const r = await call('workflow_retry', { run_id: 'r1', file: '/w.ts', cwd: missing }, { mode: 'daemon', run: rec.run });
+    expect(text(r)).toContain('does not exist on the daemon host');
+    // A path on another host (a host call) is not checked here.
+    const remote = await call('spawn', { provider: 'pi', cwd: '/elsewhere', host: 'mini' }, { run: recorder(() => ({ json: { id: 'x', provider: 'pi', cwd: '/elsewhere' } })).run });
+    expect(remote.isError).toBeUndefined();
+    expect(rec.calls).toHaveLength(0);
   });
 
   test('spawn rejects branch without worktree before running anything', async () => {
@@ -414,7 +466,7 @@ describe('argv building (array argv, never a shell)', () => {
     await call('workflow_run', { file: 'wf/x.ts', cwd: 'sub' }, { run: rec.run });
     await call('workflow_run', { file: '/remote/x.ts', host: 'mini' }, { run: rec.run });
     await call('workflow_resume', { run_id: 'r1', file: 'wf/x.ts' }, { run: rec.run });
-    await call('workflow_retry', { run_id: 'r1', file: '/abs/x.ts', step: 'build' }, { run: rec.run });
+    await call('workflow_retry', { run_id: 'r1', file: '/abs/x.ts', step: 'build', cwd: 'sub' }, { run: rec.run });
     expect(rec.calls.map((c) => c.args)).toEqual([
       ['--no-color', 'workflow', 'run', `${SERVER_CWD}/wf/x.ts`, '--detach', '--max-concurrency=2', '--json'],
       ['--no-color', 'workflow', 'run', `${SERVER_CWD}/wf/x.ts`, '--detach', '--json'],
@@ -423,13 +475,26 @@ describe('argv building (array argv, never a shell)', () => {
       ['--no-color', 'workflow', 'retry', 'r1', '/abs/x.ts', '--step=build', '--detach', '--json'],
     ]);
     expect(rec.calls[1]!.cwd).toBe(`${SERVER_CWD}/sub`);
+    // resume/retry: the detached runner starts in cwd (default: the server's), so steps without one run there.
+    expect(rec.calls[3]!.cwd).toBe(SERVER_CWD);
+    expect(rec.calls[4]!.cwd).toBe(`${SERVER_CWD}/sub`);
     const withCwd = await call('workflow_run', { file: '/x.ts', cwd: '/c', host: 'mini' }, { run: rec.run });
     expect(withCwd.isError).toBe(true);
     const relDaemon = await call('workflow_run', { file: 'x.ts', cwd: '/c' }, { mode: 'daemon', run: rec.run });
     expect(relDaemon.isError).toBe(true);
-    const relResume = await call('workflow_resume', { run_id: 'r1', file: 'x.ts' }, { mode: 'daemon', run: rec.run });
+    const relResume = await call('workflow_resume', { run_id: 'r1', file: 'x.ts', cwd: SERVER_CWD }, { mode: 'daemon', run: rec.run });
     expect(relResume.isError).toBe(true);
-    expect(rec.calls).toHaveLength(5);
+    // On a daemon, resume/retry need cwd (in the schema, and checked when called directly).
+    const d = { mode: 'daemon' as const, waitTimeoutSec: 45 };
+    expect(tool('workflow_resume').schema(d).safeParse({ run_id: 'r1', file: '/w.ts' }).success).toBe(false);
+    expect(tool('workflow_retry').schema(d).safeParse({ run_id: 'r1', file: '/w.ts', cwd: '/c' }).success).toBe(true);
+    const noCwd = await tool('workflow_resume').run({ run_id: 'r1', file: '/w.ts' }, { env: toolEnv('daemon', rec.run), signal: new AbortController().signal });
+    expect(text(noCwd)).toContain('cwd is required on the daemon');
+    const daemonOk = await call('workflow_retry', { run_id: 'r1', file: '/w.ts', cwd: SERVER_CWD }, { mode: 'daemon', run: rec.run });
+    expect(daemonOk.isError).toBeUndefined();
+    expect(rec.calls.at(-1)!.args).toEqual(['--local', '--no-color', 'workflow', 'retry', 'r1', '/w.ts', '--detach', '--json']);
+    expect(rec.calls.at(-1)!.cwd).toBe(SERVER_CWD);
+    expect(rec.calls).toHaveLength(6);
   });
 
   test('settings runs in the requested directory (resolved against the server cwd)', async () => {
@@ -478,6 +543,23 @@ describe('results and errors', () => {
     expect(text(r)).toContain("no session found for 'nope'");
     expect(text(r)).toContain('hint: list the sessions');
     expect(r.structuredContent).toMatchObject({ error: "no session found for 'nope'" });
+  });
+
+  test('unauthorized after a default-host route: the hint says to pass host (calls without host carry no credentials)', async () => {
+    const routed = { code: 1, json: { error: 'mini: unauthorized: authentication required' }, stderr: 'orc: → mini (from ORC_HOST)\n' };
+    expect(defaultHostRoute(routed.stderr)).toEqual({ host: 'mini', from: 'ORC_HOST' });
+    const r = await call('list', {}, { run: recorder(() => routed).run });
+    expect(r.isError).toBe(true);
+    expect(text(r)).toContain('followed the default host mini (from ORC_HOST)');
+    expect(text(r)).toContain('pass host: "mini" explicitly');
+    // An explicit host call (no route notice) keeps the trust/token hint.
+    const direct = cliFailure({ ...BASE_RESULT, code: 1, json: { error: 'mini: unauthorized: invalid credentials' } }, 'orc list');
+    expect(String(direct.structuredContent?.hint)).toContain('orc remote add on that host');
+    expect(String(direct.structuredContent?.hint)).not.toContain('pass host');
+    // The hint survives in a multi-id wait where every id failed that way.
+    const w = await call('wait', { ids: ['a', 'b'] }, { run: recorder(() => routed).run });
+    expect(w.isError).toBe(true);
+    expect(text(w)).toContain('pass host: "mini" explicitly');
   });
 
   test('send: exit 3 (unknown delivery) is an error that says not to blindly retry', async () => {
@@ -764,6 +846,7 @@ describe('the CLI child runner', () => {
     script,
     `const args = process.argv.slice(2);
 if (args.includes('sleep')) { await Bun.sleep(30_000); }
+if (args.includes('nap')) { await Bun.sleep(300); }
 const stdin = args.includes('-') ? await Bun.stdin.text() : null;
 if (args.includes('fail')) { process.stderr.write('bad things\\n'); process.stdout.write(JSON.stringify({ error: 'it failed' }) + '\\n'); process.exit(1); }
 process.stdout.write(JSON.stringify({ args, stdin, cwd: process.cwd(), env: process.env.MARK ?? null }, null, 2) + '\\n');
@@ -795,11 +878,67 @@ process.stdout.write(JSON.stringify({ args, stdin, cwd: process.cwd(), env: proc
     expect(Date.now() - started).toBeLessThan(10_000);
   });
 
+  test('children are capped: calls beyond the limit queue, and an abort while queued cancels without spawning', async () => {
+    const limiter = new ChildLimiter(1);
+    const limited = createCliRunner([process.execPath, script], { limiter });
+    const env = process.env as Record<string, string>;
+    const started = Date.now();
+    const first = limited({ args: ['nap'], env });
+    const second = limited({ args: ['nap'], env });
+    await Bun.sleep(20);
+    expect(limiter.running).toBe(1);
+    expect(limiter.queued).toBe(1);
+    const ac = new AbortController();
+    const third = limited({ args: ['nap'], env, signal: ac.signal });
+    await Bun.sleep(20);
+    expect(limiter.queued).toBe(2);
+    ac.abort();
+    const t = await third;
+    expect(t.aborted).toBe(true);
+    expect(t.code).toBeNull();
+    expect(limiter.queued).toBe(1);
+    const [a, b] = await Promise.all([first, second]);
+    expect(a.code).toBe(0);
+    expect(b.code).toBe(0);
+    // One at a time: the second child started after the first exited.
+    expect(Date.now() - started).toBeGreaterThanOrEqual(2 * 300);
+    expect(limiter.running).toBe(0);
+    expect(SHARED_CHILD_LIMITER.max).toBe(MAX_CLI_CHILDREN);
+    expect(MAX_CLI_CHILDREN).toBe(32);
+    expect(() => new ChildLimiter(0)).toThrow();
+  });
+
+  test('a missing working directory is named, not reported as a posix_spawn ENOENT', async () => {
+    const r = await run({ args: ['x'], cwd: path.join(dir, 'missing'), env: process.env as Record<string, string> });
+    expect(r.spawnError).toBe(`working directory '${path.join(dir, 'missing')}' does not exist`);
+  });
+
   test('a NUL byte in an argument is refused; JSON parsing falls back to the last line', async () => {
     const r = await run({ args: ['a\0b'], env: process.env as Record<string, string> });
     expect(r.spawnError).toContain('NUL');
     expect(parseCliJson('warning: x\n{"a":1}\n')).toEqual({ a: 1 });
     expect(parseCliJson('')).toBeUndefined();
     expect(parseCliJson('nope')).toBeUndefined();
+  });
+});
+
+describe('orc mcp stdio: requests in flight', () => {
+  test('a request is in flight from receipt until its response is sent', async () => {
+    const f = new InFlightRequests();
+    f.received({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: {} });
+    f.received({ jsonrpc: '2.0', id: 'a', method: 'tools/list' });
+    f.received({ jsonrpc: '2.0', method: 'notifications/initialized' }); // a notification: nothing to answer
+    f.received({ jsonrpc: '2.0', id: 9, result: {} }); // a response from the client: not ours to answer
+    expect(f.size).toBe(2);
+    let idle = false;
+    const done = f.idle().then(() => (idle = true));
+    f.answered({ jsonrpc: '2.0', id: 1, result: {} });
+    f.answered({ jsonrpc: '2.0', method: 'notifications/progress', params: {} });
+    await Bun.sleep(5);
+    expect(idle).toBe(false);
+    f.answered({ jsonrpc: '2.0', id: 'a', error: { code: -1, message: 'x' } });
+    await done;
+    expect(f.size).toBe(0);
+    await f.idle(); // already idle: resolves at once
   });
 });

@@ -9,6 +9,7 @@
  * `orc --host <h> …`) and `daemon` (`orc daemon`'s `/mcp`; every call runs `orc --local …`
  * on the daemon host, paths must be absolute, and each tool needs a daemon scope).
  */
+import fs from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
 import type { Scope } from '../daemon/auth.ts';
@@ -25,6 +26,7 @@ import type { WorkflowRun } from '../workflow.ts';
 import { childEnv } from './exec.ts';
 import type { CliResult, CliRunner } from './exec.ts';
 import { guideText, guideTopic, guideTopics } from './guide.ts';
+import { DEFAULT_MAX_CHARS, MAX_MAX_CHARS, MAX_SYSTEM_PROMPT_CHARS, MAX_WAIT_IDS, MAX_WAIT_TIMEOUT_SEC } from './limits.ts';
 import {
   cliErrorMessage,
   cliFailure,
@@ -86,15 +88,8 @@ export interface OrcTool {
   run(args: Record<string, unknown>, ctx: ToolCtx): Promise<ToolResult>;
 }
 
-/** `wait` accepts this many ids per call (each is one `orc wait` child process). */
-export const MAX_WAIT_IDS = 16;
-/** `wait`'s upper bound on timeout_seconds (the CLI's own default). */
-export const MAX_WAIT_TIMEOUT_SEC = 600;
-/** `read` / `workflow_logs` output bounds. */
-export const DEFAULT_MAX_CHARS = 16_000;
-export const MAX_MAX_CHARS = 100_000;
-/** A system prompt travels in argv (`--system-prompt=`): stay far below the per-argument limit. */
-export const MAX_SYSTEM_PROMPT_CHARS = 32_000;
+export { DEFAULT_MAX_CHARS, MAX_MAX_CHARS, MAX_SYSTEM_PROMPT_CHARS, MAX_WAIT_IDS, MAX_WAIT_TIMEOUT_SEC };
+
 /** Safety net for one CLI child (a `wait` child gets its timeout + this). */
 const CALL_TIMEOUT_MS = 180_000;
 const WAIT_GRACE_MS = 30_000;
@@ -203,6 +198,31 @@ function needAbsolute(env: ToolEnv, field: string, value: string | undefined, re
   return path.isAbsolute(value) ? null : errorResult(`${field} must be an absolute path on the daemon host (got '${value}')`, hint);
 }
 
+/**
+ * A directory a CLI child runs in (or that the CLI resolves on this host): absolute and
+ * `required` on the daemon (needAbsolute), and an existing directory — otherwise the child
+ * could not even start, and the error would name bun's posix_spawn instead of the path.
+ * `remote`: the path is on another host (a `host` call), so it is not checked here.
+ */
+async function checkCwd(
+  env: ToolEnv,
+  field: string,
+  value: string | undefined,
+  opts: { required?: boolean; remote?: boolean } = {},
+): Promise<ToolResult | null> {
+  const abs = needAbsolute(env, field, value, opts.required === true);
+  if (abs) return abs;
+  if (value === undefined || opts.remote === true) return null;
+  const where = env.mode === 'daemon' ? ' on the daemon host' : '';
+  let isDir: boolean;
+  try {
+    isDir = (await fs.stat(path.resolve(env.cwd, value))).isDirectory();
+  } catch {
+    return errorResult(`${field} '${value}' does not exist${where}`, 'pass an existing directory (absolute on a daemon).');
+  }
+  return isDir ? null : errorResult(`${field} '${value}' is not a directory${where}`);
+}
+
 function str(v: unknown): string | undefined {
   return typeof v === 'string' ? v : undefined;
 }
@@ -226,7 +246,7 @@ const spawnTool: OrcTool = {
       ? ' cwd is required and must be an absolute path on the daemon host.'
       : ' Relative cwd/workspace resolve against this server\'s directory.'),
   schema: (cfg) =>
-    z.object({
+    z.strictObject({
       provider: z.enum(PROVIDERS).optional().describe('claude | codex | pi (default: settings)'),
       model: z.string().min(1).max(200).optional().describe('model name (default: settings [models], else the provider default)'),
       prompt: z.string().min(1).optional().describe('the task: goal, context, constraints, how to verify, what to deliver'),
@@ -250,7 +270,9 @@ const spawnTool: OrcTool = {
     }),
   async run(a, ctx) {
     const cwd = str(a.cwd);
-    const bad = needAbsolute(ctx.env, 'cwd', cwd, true) ?? needAbsolute(ctx.env, 'workspace', str(a.workspace));
+    const bad =
+      (await checkCwd(ctx.env, 'cwd', cwd, { required: true, remote: str(a.host) !== undefined })) ??
+      needAbsolute(ctx.env, 'workspace', str(a.workspace));
     if (bad) return bad;
     if (a.branch !== undefined && a.worktree !== true) return errorResult('branch needs worktree: true');
     const args = ['spawn'];
@@ -297,7 +319,7 @@ const sendTool: OrcTool = {
   description: () =>
     'Send a follow-up prompt to a session: a correction, the judge\'s findings, the next task. Returns {ok, phase, messageId, replayed}: acknowledged = the agent accepted it; queued = it is delivered when the current turn ends. After send, the state stays running until that turn ends, so call wait next (race-free). A suspended session is woken (wake: false only queues). Pass idempotency_key when you may retry: a repeat with the same key and text is a no-op (replayed: true). An error with phase unknown means delivery is uncertain and is never retried by orc: read the session first, then send again with a NEW key.',
   schema: (cfg) =>
-    z.object({
+    z.strictObject({
       id: sessionRef(),
       prompt: z.string().min(1).describe('the message, delivered verbatim as one prompt'),
       idempotency_key: z
@@ -340,8 +362,22 @@ interface WaitEntry {
   timedOut: boolean;
   elapsedMs?: number;
   error?: string;
+  /** What to do about `error`. */
+  hint?: string;
   /** The session id a ref (e.g. @alias) resolved to, when it differs. */
   resolvedId?: string;
+}
+
+/** A WaitEntry for an id whose CLI call failed: the error and its hint. */
+function failedEntry(ref: string, r: CliResult, what: string): WaitEntry {
+  const sc = cliFailure(r, what).structuredContent ?? {};
+  return {
+    id: ref,
+    reached: false,
+    timedOut: false,
+    error: String(sc.error ?? `${what} failed`),
+    ...(typeof sc.hint === 'string' ? { hint: sc.hint } : {}),
+  };
 }
 
 /** One id's outcome from its `orc wait --json` child. */
@@ -359,8 +395,7 @@ function waitEntryOf(ref: string, r: CliResult): WaitEntry {
     if (typeof j.id === 'string' && j.id !== ref) e.resolvedId = j.id;
     return e;
   }
-  const failed = cliFailure(r, `orc wait ${ref}`);
-  return { id: ref, reached: false, timedOut: false, error: String(failed.structuredContent?.error ?? 'wait failed') };
+  return failedEntry(ref, r, `orc wait ${ref}`);
 }
 
 const waitTool: OrcTool = {
@@ -373,7 +408,7 @@ const waitTool: OrcTool = {
   description: (cfg) =>
     `Block until sessions settle, bounded: returns within timeout_seconds (default ${cfg.waitTimeoutSec}) even if they are still running. That is NOT an error: call wait again with the pending ids. for: settled (default: done, waiting or failed) | done | waiting | failed. Pass several ids to watch a parallel team: mode all (default) returns when every id has settled, mode any as soon as one has (then leave settled ids out of the next call). done means the agent yielded and awaits input, not that it succeeded: read its last turn and verify the evidence. Up to ${MAX_WAIT_IDS} ids.`,
   schema: (cfg) =>
-    z.object({
+    z.strictObject({
       ids: z.array(sessionRef()).min(1).max(MAX_WAIT_IDS).describe('session ids (or @aliases) to wait for'),
       for: z.enum(['settled', 'done', 'waiting', 'failed']).default('settled').describe('the state(s) to wait for (default settled)'),
       timeout_seconds: z
@@ -436,8 +471,7 @@ const waitTool: OrcTool = {
             if (succeeded(s) && isRecord(j) && typeof j.state === 'string') {
               entries.set(id, { id, state: j.state, reached: until.includes(j.state as never), timedOut: false });
             } else {
-              const failed = cliFailure(s, `orc state ${id}`);
-              entries.set(id, { id, reached: false, timedOut: false, error: String(failed.structuredContent?.error ?? 'state failed') });
+              entries.set(id, failedEntry(id, s, `orc state ${id}`));
             }
           }),
         );
@@ -462,7 +496,8 @@ const waitTool: OrcTool = {
       sessions: list,
     };
     if (errored.length === list.length) {
-      return errorResult(errored.map((e) => `${e.id}: ${e.error}`).join('\n'), 'check the ids with list.', structured);
+      const hint = errored.find((e) => e.hint !== undefined)?.hint ?? 'check the ids with list.';
+      return errorResult(errored.map((e) => `${e.id}: ${e.error}`).join('\n'), hint, structured);
     }
     const lines = list.map((e) => {
       const who = e.resolvedId ? `${e.id} (${e.resolvedId})` : e.id;
@@ -502,7 +537,7 @@ const readTool: OrcTool = {
   description: () =>
     `Read a session's transcript, token-efficient (each tool call is summarized on one line). Default: the latest conversation turn, which after wait is the agent's answer. full: true returns the whole transcript; index: N (0-based) one turn; raw: true the session journal (lifecycle and provider events, for debugging). Output beyond max_chars (default ${DEFAULT_MAX_CHARS}) keeps the end and says how much was cut. Before a provider transcript exists, read returns the session journal instead (fallback: true).`,
   schema: (cfg) =>
-    z.object({
+    z.strictObject({
       id: sessionRef(),
       index: z.number().int().min(0).optional().describe('one conversation turn, 0-based (default: the latest)'),
       full: z.boolean().optional().describe('the whole transcript'),
@@ -581,7 +616,7 @@ const stateTool: OrcTool = {
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   description: () =>
     "A session's state, without waiting: {state, status, stopped, suspended, live, pendingMessages, lastTurn, ...}. state: starting | running | done | waiting | failed. failed + suspended: true = its process died (send or resume wakes it); failed + stopped: true = killed or taken over (resume); failed otherwise = the last turn failed (lastTurn.error). Prefer wait to polling state.",
-  schema: (cfg) => z.object({ id: sessionRef(), ...hostField(cfg) }),
+  schema: (cfg) => z.strictObject({ id: sessionRef(), ...hostField(cfg) }),
   async run(a, ctx) {
     const r = await orc(ctx, ['state', String(a.id)], { host: str(a.host) });
     if (!succeeded(r) || !isRecord(r.json)) return cliFailure(r, 'orc state');
@@ -603,7 +638,7 @@ const listTool: OrcTool = {
       ? ' Daemon: without workspace or run_id it lists every workspace (dead included); workspace must be an absolute path.'
       : ' With host only workspace, all and dead apply.'),
   schema: (cfg) =>
-    z.object({
+    z.strictObject({
       workspace: z.string().min(1).max(4096).optional().describe('only this workspace (path or key)'),
       all: z.boolean().optional().describe('every workspace, dead sessions included'),
       dead: z.boolean().optional().describe('include dead sessions'),
@@ -648,7 +683,7 @@ const killTool: OrcTool = {
   description: () =>
     'Stop a session; sticky: it is never woken again unless you resume it. Messages still queued for it are dropped. Its record and journal are kept (read still works); purge: true deletes them; worktree: true removes its git worktree checkout (the branch and its commits are kept). Kill each session once its slice is accepted or abandoned.',
   schema: (cfg) =>
-    z.object({
+    z.strictObject({
       id: sessionRef(),
       worktree: z.boolean().optional().describe('also remove its worktree checkout (the branch is kept)'),
       purge: z.boolean().optional().describe('also delete its record and journal'),
@@ -674,7 +709,7 @@ const resumeTool: OrcTool = {
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   description: () =>
     'Hand a killed, taken-over or suspended session back to an agent process and wait until it is ready; returns its state. Use it to continue a session you stopped, or to recover one whose process died (send also wakes a suspended session). Purged and legacy sessions cannot be resumed. Runs on this host only.',
-  schema: () => z.object({ id: sessionRef() }),
+  schema: () => z.strictObject({ id: sessionRef() }),
   async run(a, ctx) {
     const r = await orc(ctx, ['resume', String(a.id)]);
     if (!succeeded(r) || !isRecord(r.json)) return cliFailure(r, 'orc resume');
@@ -693,7 +728,7 @@ const pruneTool: OrcTool = {
   description: () =>
     "Remove the records and journals of every dead session on this host (not only yours). worktree: true also removes their worktree checkouts; suspended: true also stops and removes suspended sessions; taken_over: true includes sessions a human took over. Run it last, after killing your sessions. Runs on this host only.",
   schema: () =>
-    z.object({
+    z.strictObject({
       worktree: z.boolean().optional().describe('also remove their worktree checkouts'),
       suspended: z.boolean().optional().describe('also stop and remove suspended sessions'),
       taken_over: z.boolean().optional().describe('also remove sessions a human took over'),
@@ -721,10 +756,10 @@ const settingsTool: OrcTool = {
   description: (cfg) =>
     'This host\'s effective orc settings with their sources: the default provider, the default model per provider ([models]) and the default remote host. spawn uses these defaults when you omit provider/model: call it to choose models per role. cwd: the directory whose project .orc/settings.toml applies' +
     (cfg.mode === 'daemon' ? ' (an absolute path; default: the daemon\'s directory).' : " (default: this server's)."),
-  schema: () => z.object({ cwd: z.string().min(1).max(4096).optional().describe('directory whose project settings apply') }),
+  schema: () => z.strictObject({ cwd: z.string().min(1).max(4096).optional().describe('directory whose project settings apply') }),
   async run(a, ctx) {
     const cwdArg = str(a.cwd);
-    const bad = needAbsolute(ctx.env, 'cwd', cwdArg);
+    const bad = await checkCwd(ctx.env, 'cwd', cwdArg);
     if (bad) return bad;
     const cwd = cwdArg !== undefined ? path.resolve(ctx.env.cwd, cwdArg) : undefined;
     const r = await orc(ctx, ['settings'], { cwd });
@@ -749,7 +784,7 @@ const guideTool: OrcTool = {
   description: () =>
     "The lead's playbook (markdown): the team method in depth (roles, what each prompt must contain, the judge's rubric, the accept/reject loop), slicing work, choosing models, waiting and reading, integrating branches, workflows, failure handling, cleanup, remote hosts and limits. Call it once before your first spawn. topic returns one section (e.g. team, failures, cleanup).",
   schema: () =>
-    z.object({
+    z.strictObject({
       topic: z.string().min(1).max(64).optional().describe(`one section: ${guideTopics().join(', ')}`),
     }),
   async run(a) {
@@ -777,7 +812,7 @@ const workflowRunTool: OrcTool = {
       ? ' file and cwd must be absolute paths on the daemon host.'
       : ' Relative paths resolve against this server\'s directory; with host, file is an absolute path on that host and cwd does not apply.'),
   schema: (cfg) =>
-    z.object({
+    z.strictObject({
       file: filePath('the workflow file (TypeScript, default-exporting {name, steps})'),
       cwd:
         cfg.mode === 'daemon'
@@ -790,7 +825,8 @@ const workflowRunTool: OrcTool = {
     const host = str(a.host);
     let file = String(a.file);
     let cwd = str(a.cwd);
-    const bad = needAbsolute(ctx.env, 'file', file) ?? needAbsolute(ctx.env, 'cwd', cwd, true);
+    const bad =
+      needAbsolute(ctx.env, 'file', file) ?? (await checkCwd(ctx.env, 'cwd', cwd, { required: true, remote: host !== undefined }));
     if (bad) return bad;
     if (host !== undefined) {
       if (cwd !== undefined) return errorResult('cwd cannot be combined with host (the remote daemon decides where the run starts)');
@@ -816,7 +852,7 @@ const workflowListTool: OrcTool = {
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   description: () =>
     'List workflow runs, newest first, with their status (running | done | failed | orphaned | cancelled) and step results. A running run whose runner died is reported orphaned.',
-  schema: (cfg) => z.object({ ...hostField(cfg) }),
+  schema: (cfg) => z.strictObject({ ...hostField(cfg) }),
   async run(a, ctx) {
     const r = await orc(ctx, ['workflow', 'list'], { host: str(a.host) });
     if (!succeeded(r) || !Array.isArray(r.json)) return cliFailure(r, 'orc workflow list');
@@ -839,7 +875,7 @@ const workflowStatusTool: OrcTool = {
   annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
   description: () =>
     "A workflow run's record: status (running | done | failed | orphaned | cancelled), each step's result (ok, state, sessionId, worktree, branch, unverified), scheduling and attempts. Poll it after workflow_run; orphaned (the runner died) is recoverable with workflow_resume.",
-  schema: (cfg) => z.object({ run_id: runRef(), ...hostField(cfg) }),
+  schema: (cfg) => z.strictObject({ run_id: runRef(), ...hostField(cfg) }),
   async run(a, ctx) {
     const r = await orc(ctx, ['workflow', 'status', String(a.run_id)], { host: str(a.host) });
     if (!succeeded(r) || !isRecord(r.json)) return cliFailure(r, 'orc workflow status');
@@ -863,7 +899,7 @@ const workflowLogsTool: OrcTool = {
   description: () =>
     `What each step's agent did: per-step parsed transcripts (### step <id>). step limits it to one step; raw: true returns each step session's journal tail instead. Output beyond max_chars (default ${DEFAULT_MAX_CHARS}) keeps the end; read one step at a time for long runs.`,
   schema: (cfg) =>
-    z.object({
+    z.strictObject({
       run_id: runRef(),
       step: z.string().min(1).max(200).optional().describe('one step id'),
       raw: z.boolean().optional().describe('journal tails instead of transcripts'),
@@ -931,22 +967,28 @@ function recoveryTool(action: 'resume' | 'retry'): OrcTool {
       (isRetry
         ? "Start new attempts for a run's failed or incomplete steps in the background (step: that step and the steps after it); the attempt history is kept."
         : 'Resume an incomplete, failed or orphaned run in the background: steps that succeeded are skipped, in-flight ones are adopted.') +
-      ` file is the original workflow file (its plan must still match). Returns {runId, logPath, action} at once; then poll workflow_status. Runs on this host only.${cfg.mode === 'daemon' ? ' file must be an absolute path on the daemon host.' : ''}`,
-    schema: () =>
-      z.object({
+      ` file is the original workflow file (its plan must still match). Steps without their own cwd run in cwd: pass the directory the run was started in. Returns {runId, logPath, action} at once; then poll workflow_status. Runs on this host only.${cfg.mode === 'daemon' ? ' file and cwd must be absolute paths on the daemon host.' : " cwd defaults to this server's directory."}`,
+    schema: (cfg) =>
+      z.strictObject({
         run_id: runRef(),
         file: filePath('the original workflow file'),
+        cwd:
+          cfg.mode === 'daemon'
+            ? z.string().min(1).max(4096).describe('absolute directory the steps run in (where the run was started)')
+            : z.string().min(1).max(4096).optional().describe("directory the steps run in (default: this server's)"),
         ...(isRetry ? { step: z.string().min(1).max(200).optional().describe('retry from this step') } : {}),
       }),
     async run(a, ctx) {
       let file = String(a.file);
-      const bad = needAbsolute(ctx.env, 'file', file);
+      const cwdArg = str(a.cwd);
+      const bad = needAbsolute(ctx.env, 'file', file) ?? (await checkCwd(ctx.env, 'cwd', cwdArg, { required: true }));
       if (bad) return bad;
       file = path.resolve(ctx.env.cwd, file);
       const args = ['workflow', action, String(a.run_id), file];
       if (isRetry) opt(args, 'step', str(a.step));
       args.push('--detach');
-      const r = await orc(ctx, args);
+      // The detached runner starts in the child's cwd, and steps without a cwd run there.
+      const r = await orc(ctx, args, { cwd: cwdArg !== undefined ? path.resolve(ctx.env.cwd, cwdArg) : undefined });
       if (!succeeded(r) || !isRecord(r.json)) return cliFailure(r, `orc workflow ${action}`);
       const d = r.json;
       return okResult(d, `${action} of run ${String(d.runId)} started in the background\nnext: workflow_status {"run_id":"${String(d.runId)}"}\n${compactJson(d)}`);
@@ -964,7 +1006,7 @@ const workflowCancelTool: OrcTool = {
   description: () =>
     'Cancel a workflow run (idempotent): its runner is stopped and no new step starts. cascade: true also kills the sessions the run provably owns (never others). Returns the run in the workflow_status shape.',
   schema: (cfg) =>
-    z.object({ run_id: runRef(), cascade: z.boolean().optional().describe("also kill the run's own sessions"), ...hostField(cfg) }),
+    z.strictObject({ run_id: runRef(), cascade: z.boolean().optional().describe("also kill the run's own sessions"), ...hostField(cfg) }),
   async run(a, ctx) {
     const args = ['workflow', 'cancel', String(a.run_id)];
     flag(args, 'cascade', a.cascade as boolean | undefined);
@@ -986,7 +1028,7 @@ const workflowCleanupTool: OrcTool = {
   description: () =>
     'Remove what a workflow run owns: sessions: true kills its sessions, worktrees: true removes their worktrees. Only sessions and worktrees the run provably owns are touched.',
   schema: (cfg) =>
-    z.object({
+    z.strictObject({
       run_id: runRef(),
       sessions: z.boolean().optional().describe("kill the run's sessions"),
       worktrees: z.boolean().optional().describe("remove the run's worktrees"),
