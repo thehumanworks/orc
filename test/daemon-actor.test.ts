@@ -4,6 +4,7 @@
  * session journal/raw run logs/kill, over a live loopback socket and the fake provider.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { TEARDOWN_TIMEOUT_MS } from './runtime-helpers.ts';
 import fs from 'node:fs';
 import path from 'node:path';
 import { httpStatusFor, serveDaemon } from '../src/daemon/server.ts';
@@ -52,7 +53,7 @@ afterAll(async () => {
   if (prevFake === undefined) delete process.env[FAKE_PROVIDER_ENV];
   else process.env[FAKE_PROVIDER_ENV] = prevFake;
   fs.rmSync(root, { recursive: true, force: true });
-});
+}, TEARDOWN_TIMEOUT_MS);
 
 async function call(method: string, p: string, body?: unknown): Promise<{ status: number; json: any }> {
   const res = await fetch(`${base}${p}`, {

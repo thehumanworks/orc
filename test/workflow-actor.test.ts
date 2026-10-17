@@ -4,6 +4,7 @@
  * provider; plus a detached run followed with `orc workflow attach` from the CLI.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { TEARDOWN_TIMEOUT_MS } from './runtime-helpers.ts';
 import fs from 'node:fs';
 import path from 'node:path';
 import { FAKE_PROVIDER_ENV } from '../src/agent.ts';
@@ -35,7 +36,7 @@ afterAll(async () => {
   if (prevFake === undefined) delete process.env[FAKE_PROVIDER_ENV];
   else process.env[FAKE_PROVIDER_ENV] = prevFake;
   fs.rmSync(root, { recursive: true, force: true });
-});
+}, TEARDOWN_TIMEOUT_MS);
 
 /** attempt-transition phases per step, in emission order. */
 function phasesByStep(events: WorkflowEvent[]): Record<string, string[]> {

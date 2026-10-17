@@ -4,6 +4,7 @@
  * (it must never run). Mirrors the live verification gate with a fake provider.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { TEARDOWN_TIMEOUT_MS } from './runtime-helpers.ts';
 import fs from 'node:fs';
 import path from 'node:path';
 import { FAKE_PROVIDER_ENV } from '../src/agent.ts';
@@ -31,7 +32,7 @@ beforeAll(() => {
 afterAll(async () => {
   await killSessionProcesses(sids);
   fs.rmSync(root, { recursive: true, force: true });
-});
+}, TEARDOWN_TIMEOUT_MS);
 
 async function orc(args: string[], stdin?: string): Promise<{ code: number; out: string; err: string }> {
   const proc = Bun.spawn([process.execPath, CLI, ...args], {

@@ -5,6 +5,7 @@
  * takeover, purge, prune, the wake-time concurrency check (D2) and the system prompt file.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { TEARDOWN_TIMEOUT_MS } from './runtime-helpers.ts';
 import fs from 'node:fs';
 import path from 'node:path';
 import { FAKE_PROVIDER_ENV, agent } from '../src/agent.ts';
@@ -51,7 +52,7 @@ afterAll(async () => {
   if (prevFake === undefined) delete process.env[FAKE_PROVIDER_ENV];
   else process.env[FAKE_PROVIDER_ENV] = prevFake;
   fs.rmSync(root, { recursive: true, force: true });
-});
+}, TEARDOWN_TIMEOUT_MS);
 
 async function spawn(opts: Partial<Parameters<typeof agent>[0]> = {}): Promise<Session> {
   const s = await agent({ provider: 'claude', cwd, workspace: cwd, ...opts });

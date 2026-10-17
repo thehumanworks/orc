@@ -3,6 +3,7 @@
  * an idempotency key). Real detached actors over the scripted fake provider.
  */
 import { afterAll, beforeEach, describe, expect, test } from 'bun:test';
+import { TEARDOWN_TIMEOUT_MS } from './runtime-helpers.ts';
 import fs from 'node:fs';
 import path from 'node:path';
 import {
@@ -35,7 +36,7 @@ afterAll(async () => {
   if (prevHome === undefined) delete process.env.ORC_HOME;
   else process.env.ORC_HOME = prevHome;
   fs.rmSync(root, { recursive: true, force: true });
-});
+}, TEARDOWN_TIMEOUT_MS);
 
 describe('reopen', () => {
   test(
