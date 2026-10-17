@@ -5,7 +5,7 @@ host.
 
 ## Step by step on a Mac
 
-Needs Bun ≥ 1.3, git and a signed-in `claude` (2.1.300 verified). Optional: `pi` 1.2.0 for the
+Needs Bun ≥ 1.3.3, git and a signed-in `claude` (2.1.300 verified). Optional: `pi` 1.2.0 for the
 pi rows, and an OpenAI credential for the codex rows (codex is orc's built-in harness; the
 `codex` CLI is not used). Anything missing is reported SKIP, not FAIL.
 

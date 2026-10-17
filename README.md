@@ -19,7 +19,7 @@ Design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (the current system) and
 
 | need | version / notes |
 | --- | --- |
-| [Bun](https://bun.sh) | ≥ 1.3 (`engines.bun`); developed on 1.4.2 |
+| [Bun](https://bun.sh) | ≥ 1.3.3 (`engines.bun`); developed on 1.4.2 |
 | OS | macOS or Linux (POSIX process groups; macOS also needs `ps`). No Windows. |
 | at least one provider | see below; other CLI versions are not refused |
 | `claude` CLI | for `--provider claude`: on `PATH` (or `ORC_CLAUDE_BIN`), signed in. Verified: 2.1.300 |
@@ -35,23 +35,25 @@ tmux is **not** used.
 **Prebuilt binary** (no Bun needed): each [GitHub release](https://github.com/thehumanworks/orc/releases)
 attaches single-file executables built with `bun build --compile` (`orc-darwin-arm64`,
 `orc-darwin-x64`, `orc-linux-x64`, `orc-linux-arm64`; the Linux ones need glibc), a `SHA256SUMS`
-file and a build-provenance attestation.
+file and a build-provenance attestation. The x64 binaries embed Bun's default (non-baseline) x64
+runtime, so they need a CPU with AVX2 (Intel Haswell / AMD Excavator or newer).
 
 ```sh
 TAG=v0.1.0 ASSET=orc-darwin-arm64          # orc-<darwin|linux>-<arm64|x64>
 gh release download "$TAG" --repo thehumanworks/orc --pattern "$ASSET" --pattern SHA256SUMS
 grep " $ASSET\$" SHA256SUMS | shasum -a 256 -c -          # orc-darwin-arm64: OK
 gh attestation verify "$ASSET" --repo thehumanworks/orc   # built by this repo's release workflow
-chmod +x "$ASSET" && mv "$ASSET" ~/.local/bin/orc
+chmod +x "$ASSET" && mkdir -p ~/.local/bin && mv "$ASSET" ~/.local/bin/orc
 orc --version                                             # orc 0.1.0
 ```
 
-With every binary downloaded next to it, `shasum -a 256 -c SHA256SUMS` checks them all. On macOS,
+With every binary downloaded next to it, `shasum -a 256 -c SHA256SUMS` checks them all. On Linux,
+`sha256sum -c` can stand in for `shasum -a 256 -c` in both commands. On macOS,
 a binary downloaded with a browser is quarantined and Gatekeeper refuses to start it: clear the
 flag with `xattr -d com.apple.quarantine ~/.local/bin/orc` (`gh` and `curl` downloads are not
 quarantined).
 
-**From source** (Bun ≥ 1.3):
+**From source** (Bun ≥ 1.3.3):
 
 ```sh
 bun install
@@ -544,7 +546,7 @@ the per-provider gates: [`scripts/verify-runtime/README.md`](scripts/verify-runt
 
 ### Live verification on a Mac
 
-You need Bun ≥ 1.3, git and a signed-in `claude`. `pi` (for the pi rows) and an OpenAI credential
+You need Bun ≥ 1.3.3, git and a signed-in `claude`. `pi` (for the pi rows) and an OpenAI credential
 (for the codex rows) are optional: a provider you don't have is reported SKIP.
 
 ```sh
@@ -576,11 +578,11 @@ worktree of this repo; `bun scripts/dogfood/run.ts watch <id>` supervises it unt
 ### CI & releases
 
 `.github/workflows/ci.yml` runs on every pull request and push to `main`: typecheck + `bun test`
-on Linux and macOS, and `build.yml`, which compiles `orc-<os>-<arch>` with Bun 1.4.2 natively on
-four runners (linux/darwin × x64/arm64), smoke-tests each binary on the runner that built it
+on Linux and macOS, and `build.yml`, which builds `orc-<os>-<arch>` natively on four runners
+(linux/darwin × x64/arm64) with `bun run compile:cli`, the same script as local builds, and the Bun
+pinned in `.bun-version` (1.4.2). It smoke-tests each binary on the runner that built it
 (`--version` matches `package.json`, `--help`, the codex harness self-test, no `.env` /
-`bunfig.toml` autoload from the cwd) and uploads it as a workflow artifact. `compile:cli`,
-`install:cli` and `check:compile` build with the same flags.
+`bunfig.toml` autoload from the cwd) and uploads it as a workflow artifact.
 
 To cut a release, bump `version` in `package.json`, merge to `main`, then tag that commit:
 

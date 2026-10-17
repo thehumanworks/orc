@@ -13,9 +13,6 @@ defaults:
   run:
     shell: bash
 
-env:
-  BUN_VERSION: "1.4.2" # keep in sync with ci.yml
-
 jobs:
   binary:
     name: orc-${{ matrix.os }}-${{ matrix.arch }}
@@ -41,18 +38,24 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: ${{ env.BUN_VERSION }}
+          bun-version-file: .bun-version
+
+      # setup-bun only warns about a missing or empty version file (then falls back to the
+      # engines.bun range): make the pin binding for release binaries.
+      - name: Check Bun pin
+        run: |
+          pin="$(cat .bun-version)"
+          [ "$(bun --version)" = "$pin" ] || { echo "::error::bun $(bun --version) is not the .bun-version pin ($pin)"; exit 1; }
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      # Native build (no --target). A compiled Bun executable autoloads .env and bunfig.toml
-      # from its cwd unless built without; orc re-execs itself in agent worktrees, so both
-      # stay off (same flags as package.json compile:cli).
+      # Native build (no --target) with the same script as local builds (package.json
+      # compile:cli), so release binaries cannot drift from dev builds.
       - name: Compile
         run: |
-          bun build --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig \
-            ./src/cli/index.ts --outfile "$BIN"
+          bun run compile:cli
+          mv dist/orc "$BIN"
           ls -l "$BIN"
 
       - name: Smoke test
@@ -93,7 +96,8 @@ jobs:
 
           # The embedded codex harness passes its offline self-test (no network, no provider CLI).
           "$bin" __codex-harness --self-test > self-test.json || { cat self-test.json; fail "codex harness self-test exited non-zero"; }
-          jq -r '.checks[] | "  \(.check): \(if .ok then "ok" else "FAILED" end)"' self-test.json
+          jq -r '.checks[] | "  \(.check): \(if .ok then "ok" else "FAILED" end)"' self-test.json ||
+            { cat self-test.json; fail "codex harness self-test printed unexpected JSON"; }
           jq -e '.ok == true and (.checks | length) > 0 and all(.checks[]; .ok == true)' self-test.json > /dev/null ||
             { cat self-test.json; fail "codex harness self-test failed"; }
 
@@ -103,7 +107,8 @@ jobs:
           printf 'ORC_HOST=from-dotenv\n' > .env
           printf '[[[ not toml\n' > bunfig.toml
           env -u ORC_HOST "$bin" settings --json > settings.json || fail "a bunfig.toml in the cwd broke startup (autoload on?)"
-          jq -e '.host.source == "default"' settings.json > /dev/null || fail "a .env in the cwd was loaded: $(jq -c .host settings.json)"
+          jq -e '.host.source == "default"' settings.json > /dev/null ||
+            { cat settings.json; fail "a .env in the cwd was loaded (host is not the default)"; }
 
           echo "smoke test passed: $TARGET, orc $want"
 
