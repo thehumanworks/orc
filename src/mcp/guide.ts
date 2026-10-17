@@ -27,7 +27,7 @@ export const GUIDE_SECTIONS: readonly GuideSection[] = [
     slug: 'loop',
     title: 'The orchestration loop',
     body: `1. \`spawn\` starts an agent and returns at once with its \`id\` (and \`worktreePath\`/\`branch\` with \`worktree: true\`). The prompt is queued and delivered when the agent is ready.
-2. \`wait\` blocks until the agent settles, bounded (45 s per call by default). A result that says "still running" is normal: call \`wait\` again. Waiting on many ids in one call is how you watch a team.
+2. \`wait\` blocks until the agent settles, bounded (45 s per call by default; the wait tool's description states this server's default). A result that says "still running" is normal: call \`wait\` again. Waiting on many ids in one call is how you watch a team.
 3. \`read\` returns the latest conversation turn: after a \`wait\`, that is the agent's answer.
 4. \`send\` gives the next instruction (a correction, the judge's findings, the next step). After \`send\` returns, the state stays \`running\` until that turn ends, so \`send\` then \`wait\` is race-free.
 
@@ -135,9 +135,11 @@ DELIVER: <commits on the branch; the final message: what changed + verification 
     slug: 'workflows',
     title: 'Workflows',
     body: `- Use \`workflow_run\` for a repeatable, multi-step process (review, migration, release) or long unattended work. Use ad-hoc \`spawn\` when you must judge between steps.
-- A workflow is a TypeScript file default-exporting \`{ name, steps[] }\`. Each step is an agent (\`provider\`, \`prompt\` or \`taskFile\`, optional \`needs\` for ordering, \`worktree\`, \`verify\`); a step succeeds on a hard signal (\`verify\`, or a commit on its worktree branch), never on "the agent stopped". The file's \`maxConcurrency\` (or \`max_concurrency\`) runs independent steps in parallel.
+- A workflow is a TypeScript file default-exporting \`{ name, steps[] }\`. Each step is an agent (\`provider\`, \`prompt\` or \`taskFile\`, optional \`needs\` for ordering, \`worktree\`, \`verify\`, \`cwd\`). The file's \`maxConcurrency\` (or \`max_concurrency\`) runs independent steps in parallel.
+- A step succeeds only on a hard signal: its \`verify\` check passes (or the file's own \`done\` predicate function returns true), or, with \`worktree: true\` and no \`verify\`, its branch has at least one commit. A step with neither fails as \`unverified\` when the agent yields, unless it sets \`allowUnverified: true\`: give every step one of them.
 - \`workflow_run\` always runs in the background and returns \`runId\` at once. Poll \`workflow_status\` (status: running, done, failed, orphaned, cancelled); read what each step did with \`workflow_logs\`.
 - Recovery: \`workflow_resume\` continues an incomplete or orphaned run (succeeded steps are skipped); \`workflow_retry\` starts new attempts for failed steps (\`step\` targets one). Both need the original workflow file.
+- Where steps run: a step without its own \`cwd\` runs where its runner starts, which is the \`cwd\` of \`workflow_run\`, \`workflow_resume\` or \`workflow_retry\` (the server's directory if you omit it; on a daemon \`cwd\` is required). Pass resume and retry the directory the run was started in, and give steps an absolute \`cwd\` in the file when the directory matters.
 - \`workflow_cancel\` stops a run (\`cascade: true\` also kills the sessions it owns); \`workflow_cleanup\` removes the sessions and worktrees a finished run owns.`,
   },
   {
@@ -165,7 +167,7 @@ DELIVER: <commits on the branch; the final message: what changed + verification 
     title: 'Remote hosts',
     body: `- **stdio** (\`orc mcp\`): tools run \`orc\` on this machine. On remote-capable tools (spawn, send, wait, read, state, list, kill, workflow_run/list/status/logs/cancel/cleanup) \`host\` runs the call on that peer's orc daemon (host or host:port, as \`orc --host\`). resume, prune, settings, workflow_resume and workflow_retry are local only.
 - Without \`host\`, orc's own routing applies: a default host (ORC_HOST or settings.toml \`host\`) is followed, except inside an orc session.
-- Remote calls authenticate as this machine's tailnet identity (the peer must trust it: \`orc remote add\` there); an explicit \`host\` call also carries ORC_DAEMON_TOKEN / ORC_DAEMON_SECRET from the server's environment. Calls without \`host\` never carry them.
+- Remote calls authenticate as this machine's tailnet identity (the peer must trust it: \`orc remote add\` there); an explicit \`host\` call also carries ORC_DAEMON_TOKEN / ORC_DAEMON_SECRET from the server's environment. Calls without \`host\` never carry them, even when a default host sends them to a peer: when a default host is configured and that peer needs a token, pass \`host\` explicitly. \`unauthorized: authentication required\` on a call without \`host\` usually means exactly that.
 - **daemon** (\`/mcp\` on \`orc daemon\`): everything runs on the daemon's host. Give spawn and workflow_run an absolute \`cwd\` (and absolute paths everywhere); address sessions by id (an \`@alias\` resolves against the daemon's own directory). The tools you see depend on your token's scopes.`,
   },
   {
@@ -175,7 +177,8 @@ DELIVER: <commits on the branch; the final message: what changed + verification 
 - Supervise what you spawn: a handful of parallel slices you verify well beats a dozen you cannot track.
 - Read the last turn, not the full transcript; page long transcripts with \`index\`.
 - orc enforces no token or cost budget. An execution policy (maxSessions, maxConcurrentSessions, maxDepth, deadlineMs) may refuse a spawn: the error says which limit.
-- Bounds: \`wait\` returns within 45 s by default (600 at most) and watches up to 16 ids; \`read\` and \`workflow_logs\` return at most \`max_chars\` (16000 by default, 100000 at most).`,
+- Bounds: \`wait\` returns within 45 s by default (600 at most) and watches up to 16 ids; \`read\` and \`workflow_logs\` return at most \`max_chars\` (16000 by default, 100000 at most); at most 32 orc commands run at once per server (each \`wait\` id is one), and further calls queue.
+- Arguments are checked strictly: a misspelled or unknown one is an error, not ignored. Use the names the tool lists (\`idempotency_key\`, \`timeout_seconds\`, \`max_chars\`).`,
   },
   {
     slug: 'excluded',

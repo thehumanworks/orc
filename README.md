@@ -421,7 +421,11 @@ orc list --all-hosts               # fleet view with a host column
   `ORC_DAEMON_TOKEN`); or legacy `x-orc-secret` = `ORC_DAEMON_SECRET` (all scopes). Missing or
   invalid → 401; missing scope → 403. Scopes: `sessions:read|write`, `workflows:read|write`,
   `admin` (implies all; needed for kill/cancel/cleanup). Tokens are never logged or returned.
-- Daemon workflow file imports are confined to `ORC_WORKFLOW_ROOTS` (default: the daemon's cwd).
+- REST workflow file imports (`/workflows/run`, `resume`, `retry`) are meant to be confined to
+  `ORC_WORKFLOW_ROOTS` (default: the daemon's cwd), but a path outside the roots that names an
+  existing file is still accepted (a known gap). The MCP tools on `/mcp` (`workflow_run`,
+  `workflow_resume`, `workflow_retry`) run `orc --local workflow … <absolute file>` and have no
+  containment: they import any workflow file the daemon's user can read.
 - The daemon also serves the MCP tools at `/mcp`, behind the same auth (see
   [MCP](#mcp-orc-as-tools-for-a-lead-agent)).
 
@@ -435,7 +439,8 @@ Codex, any MCP client) at it and it runs a team of agents through tool calls.
   prompts on stdin) and returns that JSON as `structuredContent` (arrays wrapped, e.g.
   `{sessions: […]}`) plus compact text for the model (`guide` is text only). The CLI's `--json`
   output is the contract; nothing is re-implemented. CLI errors become `isError` results with the
-  message and a hint.
+  message and a hint. Arguments are validated strictly: an unknown or misspelled one (e.g.
+  `idempotencyKey` for `idempotency_key`) is an error, never silently ignored.
 - **The lead is taught the method.** The server's `instructions` and the `guide` tool (also the
   `orc://guide` resource; `orchestrate` is a prompt) carry the team method: split the work into
   vertical slices that can each be verified on their own; per slice a context gatherer (a fast,
@@ -457,7 +462,7 @@ Codex, any MCP client) at it and it runs a team of agents through tool calls.
 | `kill`, `prune` | `kill <id> […]`, `prune […]` | `admin` |
 | `resume` | `resume <id>` | `sessions:write` |
 | `workflow_run` | `workflow run <file> --detach` (in `cwd`) | `workflows:write` |
-| `workflow_resume`, `workflow_retry` | `workflow resume\|retry <runId> <file> … --detach` | `workflows:write` |
+| `workflow_resume`, `workflow_retry` | `workflow resume\|retry <runId> <file> … --detach` (in `cwd`) | `workflows:write` |
 | `workflow_list`, `workflow_status`, `workflow_logs` | `workflow list\|status\|logs …` | `workflows:read` |
 | `workflow_cancel`, `workflow_cleanup` | `workflow cancel\|cleanup <runId> …` | `admin` |
 
@@ -510,19 +515,24 @@ bearer_token_env_var = "ORC_DAEMON_TOKEN"
   and tailnet IPs on the tailnet) and whose `Origin`, if any, names it too (CLI and agent
   clients send none); otherwise 403. Ports are not compared. `orc daemon --mcp-allow-host H`
   (repeatable) adds a name, e.g. a DNS alias or a proxy.
-- Everything runs **on the daemon host** (`orc --local …`, whatever its settings say): `spawn`
-  and `workflow_run` need an absolute `cwd`, paths must be absolute, and an `@alias` resolves
-  against the daemon's own directory (use ids). There is no `host` parameter.
+- Everything runs **on the daemon host** (`orc --local …`, whatever its settings say): `spawn`,
+  `workflow_run`, `workflow_resume` and `workflow_retry` need an absolute, existing `cwd` (a
+  workflow step without its own `cwd` runs there), paths must be absolute, and an `@alias` resolves
+  against the daemon's own directory (use ids). There is no `host` parameter. Workflow files are
+  not confined to `ORC_WORKFLOW_ROOTS` here (see Daemon).
 - Stateless: no MCP session; sessions and runs are addressed by their orc ids.
 
 **Timeouts and limits.** `wait` returns within 45 s by default even when agents are still running
 (the result says which are pending; the lead calls it again): Codex times out a tool call after
 60 s (`tool_timeout_sec`). Change it with `orc mcp --wait-timeout SEC` (stdio), or per call with
 `timeout_seconds` (≤ 600). `wait` takes up to 16 ids; `read` and `workflow_logs` return at most
-`max_chars` (16000 by default). The daemon credentials `ORC_DAEMON_SECRET`, `ORC_DAEMON_TOKENS`
-and `ORC_DAEMON_TOKEN` are never passed to the CLI children (so never to agents), except that an
-explicit `host` call keeps the client credentials (`ORC_DAEMON_TOKEN`, `ORC_DAEMON_SECRET`) it
-authenticates with. Calls without `host` that follow a default host rely on tailnet identity.
+`max_chars` (16000 by default). At most 32 CLI children run at once per server process (each
+`wait` id is one); further calls queue, and a cancelled call leaves the queue. The daemon
+credentials `ORC_DAEMON_SECRET`, `ORC_DAEMON_TOKENS` and `ORC_DAEMON_TOKEN` are never passed to
+the CLI children (so never to agents), except that an explicit `host` call keeps the client
+credentials (`ORC_DAEMON_TOKEN`, `ORC_DAEMON_SECRET`) it authenticates with. Calls without `host`
+that follow a default host carry none: when that peer needs a token, pass `host` explicitly (an
+`unauthorized` error on such a call says so).
 
 ## Settings (`ORC_HOST` and `settings.toml`)
 
@@ -626,7 +636,7 @@ delete a session's dir.
 | `ORC_CODEX_BOOT_TIMEOUT_MS` | codex harness ready timeout (default 60000) |
 | `ORC_CLAUDE_READY_TIMEOUT_MS` | claude initialize timeout (default 60000) |
 | `ORC_ACTOR_READY_TIMEOUT_MS` | the actor's provider-ready timeout (default 120000) |
-| `ORC_WORKFLOW_ROOTS` | daemon workflow import allowlist (`path.delimiter`-separated) |
+| `ORC_WORKFLOW_ROOTS` | daemon REST workflow import allowlist (`path.delimiter`-separated; see Daemon for its limits) |
 | `ORC_DAEMON_TOKENS`, `ORC_DAEMON_TOKEN`, `ORC_DAEMON_SECRET` | daemon auth (server, client, legacy) |
 | `CODEX_HOME` | codex agent/prompt lookup |
 

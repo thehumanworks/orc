@@ -292,6 +292,7 @@ describe('instructions, descriptions and the guide', () => {
       'idempotency_key',
       'kill',
       'Never hand a session to a human',
+      'Certainty: before the first spawn, ask the user',
       'guide',
       'settings',
     ]) {
