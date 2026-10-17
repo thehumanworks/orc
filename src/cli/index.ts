@@ -36,6 +36,7 @@ import { resolveUntil } from '../state.ts';
 import { isLoopback, resolveBind } from '../daemon/bind.ts';
 import { tailscaleIp4, tailscaleSelf } from '../daemon/tailscale.ts';
 import { MCP_PATH, mcpAllowedHosts } from '../mcp/hosts.ts';
+import { DEFAULT_WAIT_TIMEOUT_SEC, MAX_WAIT_TIMEOUT_SEC } from '../mcp/limits.ts';
 import { serveDaemon } from '../daemon/server.ts';
 import { loadDaemonTokensFromEnv } from '../daemon/auth.ts';
 import type { Scope } from '../daemon/auth.ts';
@@ -1770,11 +1771,11 @@ async function cmdMcp(args: string[]): Promise<number> {
     printError(`unexpected argument '${positionals[0]}' (usage: orc mcp [--wait-timeout SEC])`, json);
     return 1;
   }
-  let waitTimeoutSec = 45;
+  let waitTimeoutSec = DEFAULT_WAIT_TIMEOUT_SEC;
   if (values['wait-timeout'] !== undefined) {
     const n = Number(values['wait-timeout']);
-    if (!Number.isFinite(n) || n < 1 || n > 600) {
-      printError(`invalid --wait-timeout '${values['wait-timeout']}' (seconds, 1-600)`, json);
+    if (!Number.isFinite(n) || n < 1 || n > MAX_WAIT_TIMEOUT_SEC) {
+      printError(`invalid --wait-timeout '${values['wait-timeout']}' (seconds, 1-${MAX_WAIT_TIMEOUT_SEC})`, json);
       return 1;
     }
     waitTimeoutSec = n;

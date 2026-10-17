@@ -293,7 +293,14 @@ export function createFetch(opts: DaemonOptions): (req: Request, server: Bun.Ser
   };
 
   return async function fetch(req: Request, server: Bun.Server<undefined>): Promise<Response> {
-    const url = new URL(req.url);
+    // A malformed Host (`::1`, `a@b`, `h/x`, spaces, non-ASCII…) leaves Bun a request URL
+    // that does not parse: a 400, not an exception.
+    let url: URL;
+    try {
+      url = new URL(req.url);
+    } catch {
+      return jsonError(400, 'invalid request URL');
+    }
     if (url.pathname === MCP_PATH) return serveMcp(req, server);
     const match = matchRoute(req.method, url.pathname);
     if (!match) return jsonError(404, `no route for ${req.method} ${url.pathname}`);
@@ -822,6 +829,10 @@ export function serveDaemon(opts: DaemonOptions): Bun.Server<undefined> {
     hostname: opts.hostname,
     port: opts.port,
     idleTimeout: 0,
+    // Never Bun's development error page (it shows source and paths): an error that escapes
+    // the handler is a plain JSON 500.
+    development: false,
+    error: () => jsonError(500, 'internal error'),
     fetch: createFetch(opts),
   });
 }

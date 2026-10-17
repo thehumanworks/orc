@@ -1,14 +1,14 @@
 /**
  * The MCP server `instructions`: what a lead agent reads before it touches a tool. MCP
- * clients cut long instructions (Claude Code keeps 2,048 characters in older versions,
- * 4,096 in newer ones), so this stays under INSTRUCTIONS_MAX_CHARS (a test enforces it),
+ * clients cut long instructions (Claude Code keeps 2,048 characters in versions before
+ * 2.1.296, 4,096 since), so this stays within INSTRUCTIONS_MAX_CHARS (a test enforces it),
  * with the method first and a pointer to `guide` for the full playbook. Model-neutral:
  * roles are described by capability; `settings` shows the configured models.
  */
 import type { McpMode } from './tools.ts';
 
-/** Hard cap for the instructions text (enforced by test/mcp-tools.test.ts). */
-export const INSTRUCTIONS_MAX_CHARS = 1_900;
+/** Hard cap for the instructions text: older Claude Code keeps 2,048 characters (enforced by test/mcp-tools.test.ts). */
+export const INSTRUCTIONS_MAX_CHARS = 2_048;
 
 const BODY = `orc runs coding agents (claude, codex, pi) as durable background sessions. You are the LEAD: orchestrate, don't implement. Plan, delegate, verify, integrate.
 
@@ -23,6 +23,7 @@ Every prompt is self-contained: goal, context, constraints, how to verify, what 
 Isolation: worktree: true for code-writing agents whose slices may touch the same files; you merge the branches.
 Parallelism: spawn all independent agents first, then wait on all their ids in one call.
 Hygiene: alias every agent; pass idempotency_key when a send may be retried; kill a session once its slice is accepted.
+Certainty: before the first spawn, ask the user about anything that would block completion (unclear scope, design decisions you already know you need); raise later questions when they matter.
 Autonomy: you hold the reins. Never hand a session to a human or ask the user to drive a subagent; if blocked, say why.
 
 Call guide before your first spawn: the full playbook (prompts, judging, failures, workflows, cleanup). settings shows the default provider and models.`;

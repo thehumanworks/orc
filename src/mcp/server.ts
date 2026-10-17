@@ -13,13 +13,13 @@ import { createCliRunner } from './exec.ts';
 import type { CliRunner } from './exec.ts';
 import { guideText } from './guide.ts';
 import { orcInstructions } from './instructions.ts';
+import { DEFAULT_WAIT_TIMEOUT_SEC } from './limits.ts';
 import { errorResult } from './shape.ts';
 import type { ToolResult } from './shape.ts';
 import { toolsForMode } from './tools.ts';
 import type { McpMode, OrcTool, ToolEnv } from './tools.ts';
 
-/** `wait`'s default bound (seconds): under the ~60 s tool-call timeouts of common MCP clients. */
-export const DEFAULT_WAIT_TIMEOUT_SEC = 45;
+export { DEFAULT_WAIT_TIMEOUT_SEC };
 
 export interface OrcMcpServerOptions {
   mode: McpMode;

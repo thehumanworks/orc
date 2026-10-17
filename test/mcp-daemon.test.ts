@@ -7,6 +7,7 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { serveDaemon } from '../src/daemon/server.ts';
@@ -116,6 +117,30 @@ describe('daemon /mcp: authentication and the Host/Origin guard', () => {
     expect(same.status).toBe(200);
   }, T);
 
+  test('a malformed Host is a JSON 400, never an exception page (on /mcp and on REST routes)', async () => {
+    /** One raw HTTP/1.1 request: fetch() refuses to send these Host values. */
+    const raw = (host: string, reqPath: string): Promise<string> =>
+      new Promise((resolve) => {
+        const sock = net.connect(server.port!, '127.0.0.1', () => {
+          sock.write(`POST ${reqPath} HTTP/1.1\r\nHost: ${host}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}`);
+        });
+        let buf = '';
+        sock.on('data', (d) => (buf += d.toString()));
+        sock.on('end', () => resolve(buf));
+        sock.on('error', (e) => resolve(`ERROR ${e.message}`));
+      });
+    for (const host of ['::1', 'localhost@evil.example', '127.0.0.1/mcp', '127.0.0.1 evil', 'ⓛocalhost']) {
+      for (const reqPath of ['/mcp', '/sessions']) {
+        const res = await raw(host, reqPath);
+        const [head, body] = res.split('\r\n\r\n');
+        expect([host, reqPath, head!.split('\r\n')[0]]).toEqual([host, reqPath, 'HTTP/1.1 400 Bad Request']);
+        expect(head!.toLowerCase()).toContain('content-type: application/json');
+        expect(JSON.parse(body!)).toEqual({ error: 'invalid request URL' });
+        expect(res).not.toContain('<html');
+      }
+    }
+  }, T);
+
   test('an oversized body → 413', async () => {
     const big = await post({ authorization: 'Bearer root' }, 'x'.repeat(4 * 1024 * 1024 + 1));
     expect(big.status).toBe(413);
@@ -139,7 +164,12 @@ describe('daemon /mcp: tools by scope', () => {
     expect(c.getInstructions()).toBe(orcInstructions('daemon'));
     const tools = (await c.listTools()).tools;
     for (const t of tools) expect(Object.keys((t.inputSchema as { properties?: object }).properties ?? {})).not.toContain('host');
-    expect((tools.find((t) => t.name === 'spawn')!.inputSchema as { required?: string[] }).required).toContain('cwd');
+    for (const name of ['spawn', 'workflow_run', 'workflow_resume', 'workflow_retry']) {
+      expect([name, (tools.find((t) => t.name === name)!.inputSchema as { required?: string[] }).required]).toEqual([
+        name,
+        expect.arrayContaining(['cwd']),
+      ]);
+    }
   }, T);
 
   test('an out-of-scope call is an error result naming the missing scope, not a crash', async () => {
@@ -172,6 +202,9 @@ describe('daemon /mcp: real calls on the daemon host', () => {
     const rel = await callTool(writer, 'spawn', { provider: 'claude', cwd: 'work', prompt: 'x' });
     expect(rel.isError).toBe(true);
     expect(text(rel)).toContain('absolute path on the daemon host');
+    const missing = await callTool(writer, 'spawn', { provider: 'claude', cwd: path.join(root, 'nope'), prompt: 'x' });
+    expect(missing.isError).toBe(true);
+    expect(text(missing)).toContain('does not exist on the daemon host');
 
     const sp = await callTool(writer, 'spawn', { provider: 'claude', cwd: work, prompt: 'hello daemon mcp' });
     expect(sp.isError).toBeFalsy();
@@ -184,8 +217,8 @@ describe('daemon /mcp: real calls on the daemon host', () => {
     const listed = await callTool(writer, 'list');
     expect((listed.structuredContent!.sessions as { id: string }[]).map((s) => s.id)).toContain(id);
 
-    const root = await connect('root');
-    const k = await callTool(root, 'kill', { id, purge: true });
+    const admin = await connect('root');
+    const k = await callTool(admin, 'kill', { id, purge: true });
     expect(k.structuredContent).toMatchObject({ ok: true, id, purged: true });
   }, T);
 

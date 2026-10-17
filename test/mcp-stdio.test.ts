@@ -81,6 +81,16 @@ beforeAll(async () => {
   steps: [{ id: 'one', provider: 'claude', prompt: 'workflow step one', allowUnverified: true }],
 };\n`,
   );
+  fs.writeFileSync(
+    path.join(work, 'marker-wf.ts'),
+    `export default {
+  name: 'marker-wf',
+  steps: [{ id: 'check', provider: 'claude', prompt: 'marker check', verify: { file: { path: 'MARKER' } } }],
+};\n`,
+  );
+  fs.mkdirSync(path.join(root, 'no-marker'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'with-marker'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'with-marker', 'MARKER'), 'here\n');
   client = await connect('legacy', ['--wait-timeout', '20']);
 });
 
@@ -126,6 +136,7 @@ describe('orc mcp over stdio', () => {
     expect(wait.annotations).toMatchObject({ readOnlyHint: true });
     expect(tools.tools.find((t) => t.name === 'kill')!.annotations).toMatchObject({ destructiveHint: true });
     expect(Object.keys((tools.tools.find((t) => t.name === 'spawn')!.inputSchema as { properties: object }).properties)).toContain('host');
+    for (const t of tools.tools) expect([t.name, (t.inputSchema as { additionalProperties?: unknown }).additionalProperties]).toEqual([t.name, false]);
     const resources = await client.listResources();
     expect(resources.resources.map((r) => r.uri)).toEqual(['orc://guide']);
     const guide = await client.readResource({ uri: 'orc://guide' });
@@ -252,6 +263,70 @@ describe('orc mcp over stdio', () => {
     const unknownRun = await callTool(client, 'workflow_status', { run_id: 'no-such-run' });
     expect(unknownRun.isError).toBe(true);
     expect(text(unknownRun)).toContain("no run found for 'no-such-run'");
+  }, T);
+});
+
+describe('orc mcp: arguments, recovery cwd, stdin EOF', () => {
+  test('an unknown or camelCase argument is an error result, not silently dropped', async () => {
+    const sent = await callTool(client, 'send', { id: 'abc', prompt: 'x', idempotencyKey: 'k' });
+    expect(sent.isError).toBe(true);
+    // Refused by input validation, before any CLI child runs.
+    expect(text(sent)).toMatch(/^Input validation error: .*Unrecognized key.*idempotencyKey/);
+    const waited = await callTool(client, 'wait', { ids: ['abc'], timeout: 1 });
+    expect(waited.isError).toBe(true);
+    expect(text(waited)).toMatch(/Unrecognized key.*timeout/);
+    const read = await callTool(client, 'read', { id: 'abc', maxChars: 2_000 });
+    expect(read.isError).toBe(true);
+    expect(text(read)).toMatch(/Unrecognized key.*maxChars/);
+  }, T);
+
+  test('workflow_retry runs the steps in its cwd: a step that failed in one directory passes in another', async () => {
+    const file = path.join(work, 'marker-wf.ts');
+    const status = async (runId: string): Promise<Record<string, any>> => {
+      const deadline = Date.now() + 40_000;
+      for (;;) {
+        const s = (await callTool(client, 'workflow_status', { run_id: runId })).structuredContent!;
+        if (s.status !== 'running' || Date.now() > deadline) return s;
+        await Bun.sleep(250);
+      }
+    };
+    const run = await callTool(client, 'workflow_run', { file, cwd: path.join(root, 'no-marker') });
+    const runId = run.structuredContent!.runId as string;
+    const first = await status(runId);
+    expect(first.status).toBe('failed');
+    expect(first.steps[0]).toMatchObject({ id: 'check', ok: false });
+    const retry = await callTool(client, 'workflow_retry', { run_id: runId, file, cwd: path.join(root, 'with-marker') });
+    expect(retry.isError).toBeFalsy();
+    expect(retry.structuredContent).toMatchObject({ runId, action: 'retry' });
+    const second = await status(runId);
+    expect(second.status).toBe('done');
+    expect(second.steps[0]).toMatchObject({ id: 'check', ok: true });
+    expect((await callTool(client, 'workflow_cleanup', { run_id: runId, sessions: true })).isError).toBeFalsy();
+  }, T);
+
+  test('requests already read are answered when the client closes stdin right after sending them', async () => {
+    const msgs = [
+      { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'raw', version: '1' } } },
+      { jsonrpc: '2.0', method: 'notifications/initialized' },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'list', arguments: {} } },
+      { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'settings', arguments: {} } },
+    ];
+    const proc = Bun.spawn([process.execPath, CLI, 'mcp'], {
+      cwd: work,
+      env: serverEnv(),
+      stdin: new Blob([`${msgs.map((m) => JSON.stringify(m)).join('\n')}\n`]),
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const out = await new Response(proc.stdout).text();
+    expect(await proc.exited).toBe(0);
+    const answers = out
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l) as { id?: number; result?: { content?: { text: string }[]; isError?: boolean } });
+    expect(answers.map((a) => a.id).sort()).toEqual([1, 2, 3]);
+    expect(answers.find((a) => a.id === 2)?.result?.content?.[0]?.text).toContain('(no sessions)');
+    expect(answers.find((a) => a.id === 3)?.result?.isError).toBeFalsy();
   }, T);
 });
 
