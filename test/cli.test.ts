@@ -1,6 +1,10 @@
 import { describe, test, expect } from 'bun:test';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { readSelectionFromFlags, resolveCommand } from '../src/cli/index.ts';
 import { HELP_TEXT } from '../src/cli/output.ts';
+import { plainCliEnv } from './runtime-helpers.ts';
 
 describe('resolveCommand routing', () => {
   test('spawn aliases', () => {
@@ -114,4 +118,39 @@ describe('max-concurrency CLI validation', () => {
     expect(dumped).not.toContain('SECRET_PROMPT_DO_NOT_LEAK');
     expect(view).not.toHaveProperty('plan');
   });
+});
+
+describe('errors that escape a command (option parsing)', () => {
+  const CLI = path.join(import.meta.dir, '..', 'src', 'cli', 'index.ts');
+  async function orc(args: string[]): Promise<{ code: number; out: string; err: string }> {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'orc-cli-parse-'));
+    try {
+      const proc = Bun.spawn([process.execPath, CLI, ...args], {
+        cwd: home,
+        env: plainCliEnv({ ...process.env, ORC_HOME: home, ORC_HOST: '' }),
+        stdin: 'ignore',
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+      return { code: await proc.exited, out, err };
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  }
+
+  test('with --json: the {"error"} document on stdout, exit 1; without: fatal: on stderr', async () => {
+    const json = await orc(['list', '--bogus', '--json']);
+    expect(json.code).toBe(1);
+    expect(json.err).toBe('');
+    expect(JSON.parse(json.out).error).toContain("Unknown option '--bogus'");
+    const human = await orc(['list', '--bogus']);
+    expect(human.code).toBe(1);
+    expect(human.out).toBe('');
+    expect(human.err).toMatch(/^fatal: Unknown option '--bogus'/);
+    // A host-local command too.
+    const settings = await orc(['settings', '--json', '--nope']);
+    expect(settings.code).toBe(1);
+    expect(JSON.parse(settings.out).error).toContain("Unknown option '--nope'");
+  }, 30_000);
 });

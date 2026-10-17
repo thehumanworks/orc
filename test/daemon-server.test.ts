@@ -54,11 +54,11 @@ afterAll(() => {
 const url = (s: Bun.Server<undefined>, p: string) => `http://127.0.0.1:${s.port}${p}`;
 
 describe('daemon over a live loopback socket', () => {
-  test('GET /health needs NO auth and reports ok/version/host/api', async () => {
+  test('GET /health needs NO auth and reports ok/version/host/api and the MCP path', async () => {
     const s = start({ secret: 'topsecret', allowlist: ['mini'] });
     const res = await fetch(url(s, '/health'));
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true, version: 'test', host: 'testhost', api: 2 });
+    expect(await res.json()).toEqual({ ok: true, version: 'test', host: 'testhost', api: 2, mcp: '/mcp' });
   });
 
   test('GET /health defaults to the package.json version', async () => {
@@ -66,7 +66,7 @@ describe('daemon over a live loopback socket', () => {
     servers.push(s);
     const pkg = JSON.parse(await fs.readFile(path.join(import.meta.dir, '..', 'package.json'), 'utf8')) as { version: string };
     const res = await fetch(url(s, '/health'));
-    expect(await res.json()).toEqual({ ok: true, version: pkg.version, host: 'testhost', api: 2 });
+    expect(await res.json()).toEqual({ ok: true, version: pkg.version, host: 'testhost', api: 2, mcp: '/mcp' });
   });
 
   test('a gated route with NO secret and NO identity → 401 (fail closed)', async () => {
