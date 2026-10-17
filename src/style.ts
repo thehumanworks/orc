@@ -7,8 +7,10 @@
  *   `PLAIN` — the default everywhere — returns every input unchanged, so SDK, daemon and
  *   MCP consumers never receive ANSI, and the CLI's colour-off output is byte-identical to
  *   the unstyled renderers. Glyphs (● ✓ ✗ …) appear only when colour is on.
- * - One status palette (`toneOf`): a status word gets the same colour and glyph in every
- *   view (list, state, wait, detail views, workflow steps and runs).
+ * - One status palette (`toneOf`): a status word gets the same colour in every view, and
+ *   the same glyph wherever it stands on its own (`status`/`tag`: state, wait, detail
+ *   views, a list row's lifecycle tag, step ok/FAIL, run results). Secondary statuses
+ *   inside dense rows (`tone`) are colour only.
  * - `Style.sanitize` additionally makes dynamic text terminal-safe (terminal-text.ts); the
  *   CLI turns it on for a TTY destination, independent of colour.
  * - `decideColor()` — the CLI's per-stream colour decision.
@@ -163,8 +165,6 @@ export class Style {
   };
 
   readonly bold = (s: string): string => this.paint(s, 'bold');
-  readonly dim = (s: string): string => this.paint(s, 'dim');
-  readonly italic = (s: string): string => this.paint(s, 'italic');
   /** Section headings. */
   readonly heading = (s: string): string => this.paint(s, 'bold');
   /** Session / run / step ids: the thing a row is about. */

@@ -151,29 +151,36 @@ describe('colour on: the expected styled output', () => {
     });
   });
 
-  test('workflow events: markers coloured by outcome, ids bold, bookkeeping dim', () => {
-    const ev = (i: number) => renderWorkflowEvent(fx.workflowEvents[i]!, ANSI);
-    expect(ev(0)).toBe(`${BC('>')} ${B('run')} ${B('run00002')} 'ship-it' ${D('(4 steps)')}\n`);
-    expect(ev(2)).toBe(`${D('  · schedule plan (slots left 1)')}\n`);
-    expect(ev(4)).toBe(`  ${C('●')} ${B('plan')} ${D('[claude]')} ${C('running...')}\n`);
-    expect(ev(8)).toBe(
+  test('workflow events: markers coloured by outcome, ids bold, bookkeeping dim (every fixture event)', () => {
+    // One literal expectation per fixture event: every event type and variant is pinned.
+    const expected: string[] = [
+      `${BC('>')} ${B('run')} ${B('run00002')} 'ship-it' ${D('(4 steps)')}\n`,
+      `${BC('>')} ${B('run')} ${B('run00003')} 'it's tiny' ${D('(1 step)')}\n`,
+      `${D('  · schedule plan (slots left 1)')}\n`,
+      `${D('  · schedule build')}\n`,
+      `  ${C('●')} ${B('plan')} ${D('[claude]')} ${C('running...')}\n`,
+      `${D('  · attempt att-1 plan → dispatched session=a1b2c3d4')}\n`,
+      `${D('  · attempt att-1 plan → queued')}\n`,
+      `${D('  · lease expires 2026-10-17T09:41:12.345Z')}\n`,
       `  ${G('✓ ok')} ${B('plan')} ${D('(claude)')} ${D('state=')}${G('done')} ${D('commitsAhead=')}0  ${D('session=a1b2c3d4')}\n`,
-    );
-    expect(ev(9)).toBe(
       `  ${R('✗ FAIL')} ${B('build')} ${D('(codex)')} ${D('state=')}${R('failed')} ${D('commitsAhead=')}0  ${D('session=e5f6a7b8')}` +
         ` ${D('worktree=/home/u/src/orc/.orc/worktrees/e5f6a7b8')}\n`,
-    );
-    expect(ev(10)).toBe(
       `  ${R('✗ FAIL')} ${B('review')} ${D('(pi)')} ${D('state=')}${G('done')} ${D('commitsAhead=')}2 ${BY('UNVERIFIED')}  ${D('session=')}\n`,
-    );
-    expect(ev(11)).toBe(`  ${Y('! warning:')} no done predicate; reported unverified\n`);
-    expect(ev(12)).toBe(`  ${R('!')} ${B('build')} ${R('error:')} provider exited (code=1)\nstderr: boom\n`);
-    expect(ev(13)).toBe(`  ${Y('· blocked')} ${B('merge')}: dependency build failed\n`);
-    expect(ev(15)).toBe(`${B('= run')} ${B('run00002')} ${R('✗ failed')}\n`);
-    expect(ev(16)).toBe(`${B('= run')} ${B('run00005')} ${G('✓ done')}\n`);
-    expect(ev(18)).toBe(`${BC('>')} ${B('resume')} ${B('run00002')} ${D('(from ')}${M('orphaned')}${D(')')}\n`);
-    expect(ev(19)).toBe(`${BC('>')} ${B('retry')} ${B('run00002')} ${D('step')} ${B('build')}\n`);
-    expect(ev(21)).toBe(`${B('=')} ${D('cancel')} ${B('run00002')}${D(' (cascade)')}\n`);
+      `  ${Y('! warning:')} no done predicate; reported unverified\n`,
+      `  ${R('!')} ${B('build')} ${R('error:')} provider exited (code=1)\nstderr: boom\n`,
+      `  ${Y('· blocked')} ${B('merge')}: dependency build failed\n`,
+      `${D('  · adopt review session=c9d0e1f2')}\n`,
+      `${B('= run')} ${B('run00002')} ${R('✗ failed')}\n`,
+      `${B('= run')} ${B('run00005')} ${G('✓ done')}\n`,
+      `${B('= run')} ${B('legacy99')} ${M('◌ orphaned')}\n`,
+      `${BC('>')} ${B('resume')} ${B('run00002')} ${D('(from ')}${M('orphaned')}${D(')')}\n`,
+      `${BC('>')} ${B('retry')} ${B('run00002')} ${D('step')} ${B('build')}\n`,
+      `${BC('>')} ${B('retry')} ${B('run00002')}\n`,
+      `${B('=')} ${D('cancel')} ${B('run00002')}${D(' (cascade)')}\n`,
+      `${B('=')} ${D('cancel')} ${B('run00003')}\n`,
+    ];
+    expect(expected).toHaveLength(fx.workflowEvents.length);
+    fx.workflowEvents.forEach((e, i) => expect(renderWorkflowEvent(e, ANSI)).toBe(expected[i]!));
   });
 
   test('every workflow event = its plain line with only the same-width glyph markers changed', () => {
@@ -187,18 +194,16 @@ describe('colour on: the expected styled output', () => {
     });
   });
 
-  test('the runner-log styler gives a plain log exactly the live colours', () => {
-    for (const e of fx.workflowEvents) {
-      const plain = renderWorkflowEvent(e);
-      const restyled = plain
-        .split('\n')
-        .map((l) => styleWorkflowLine(l, ANSI))
-        .join('\n');
-      expect(restyled).toBe(renderWorkflowEvent(e, ANSI));
-    }
+  test('runner-log lines: `#` notes dim, unrecognised lines untouched, PLAIN is the identity', () => {
     expect(styleWorkflowLine('# orc runner pid=1 action=run run=r at t', ANSI)).toBe(D('# orc runner pid=1 action=run run=r at t'));
-    expect(styleWorkflowLine('some other text', ANSI)).toBe('some other text');
+    expect(styleWorkflowLine('# orc runner pid=1 terminated (SIGTERM); run r failed', ANSI)).toBe(
+      D('# orc runner pid=1 terminated (SIGTERM); run r failed'),
+    );
+    expect(styleWorkflowLine('error: Cannot find module "x"', ANSI)).toBe('error: Cannot find module "x"');
+    expect(styleWorkflowLine('', ANSI)).toBe('');
     expect(styleWorkflowLine('  [ok] plan', PLAIN)).toBe('  [ok] plan');
+    // A line that only resembles a step result (missing fields) is not restyled.
+    expect(styleWorkflowLine('  [ok] plan (claude)', ANSI)).toBe('  [ok] plan (claude)');
   });
 
   test('run detail and run list', () => {

@@ -141,11 +141,16 @@ orc --color[=WHEN] <command>                        auto (default) | always | ne
 `orc help` prints the full reference. A session is addressed by short id, full session id,
 `@alias` (current workspace) or `@workspace:alias`.
 
-Output to a terminal is coloured: one colour + glyph per status everywhere (`● running`,
-`✓ done`, `✗ failed`, `! waiting`, `◌ suspended`, `○ dead`), ids bold, secondary detail dim.
-`--no-color` or `NO_COLOR=1` turns it off, `--color=always` or `FORCE_COLOR=1` forces it (the
-flags win). Piped/redirected output is plain text and `--json` is never coloured. Agent text
-printed to a terminal has escape sequences and control characters stripped.
+Output to a terminal is coloured. A status word has the same colour everywhere (running
+cyan, done green, failed red, waiting yellow, suspended magenta, dead dim). Where a status
+stands on its own (`orc state`/`wait`, detail views, a list row's lifecycle tag, a step's
+ok/FAIL, a run's result) it also gets a glyph: `● running`, `✓ done`, `✗ failed`,
+`! waiting`, `◌ suspended`, `○ dead`. Secondary statuses inside dense rows (a list row's
+agent state, `state=` in step lines, settings file states) are colour only. Ids are bold,
+secondary detail dim. `--no-color` or `NO_COLOR=1` turns colour off, `--color=always` or
+`FORCE_COLOR=1` forces it (the flags win). Piped/redirected output is plain text and
+`--json` is never coloured. Agent text printed to a terminal has escape sequences and
+control characters stripped.
 
 ### spawn options
 
