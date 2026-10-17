@@ -53,6 +53,7 @@ import {
 import { serveDaemon } from '../src/daemon/server.ts';
 import { sanitizeLockName } from '../src/lock.ts';
 import { renderRunDetail } from '../src/cli/output.ts';
+import { mismatchedStartTime } from './runtime-helpers.ts';
 
 const CLI = path.resolve(import.meta.dir, '..', 'src', 'cli', 'index.ts');
 const POLICY_FAIL_WF = path.join(import.meta.dir, 'fixtures', 'policy-fail-workflow.ts');
@@ -260,7 +261,7 @@ describe('owner liveness = lease not expired ∧ owner alive', () => {
     ['fresh lease + live runner', fresh, self(), true],
     ['fresh lease + dead runner', fresh, { pid: DEAD_PID, startTime: null }, false],
     ['expired lease + live runner', expired, self(), false],
-    ['fresh lease + runner pid reused (start time mismatch)', fresh, { pid: process.pid, startTime: 'proc:1' }, false],
+    ['fresh lease + runner pid reused (start time mismatch)', fresh, { pid: process.pid, startTime: mismatchedStartTime() }, false],
   ] as const)('isLeaseLive: %s', (_label, lease, runner, want) => {
     expect(isLeaseLive(lease, { nowMs: now, runner })).toBe(want);
   });
@@ -268,7 +269,7 @@ describe('owner liveness = lease not expired ∧ owner alive', () => {
   test('no runner → the lease identity decides (pid + start time)', () => {
     expect(isLeaseLive(fresh, { nowMs: now })).toBe(true); // us
     expect(isLeaseLive({ ...fresh, pid: DEAD_PID, startTime: null }, { nowMs: now })).toBe(false);
-    expect(isLeaseLive({ ...fresh, startTime: 'proc:1' }, { nowMs: now })).toBe(false); // reused pid
+    expect(isLeaseLive({ ...fresh, startTime: mismatchedStartTime() }, { nowMs: now })).toBe(false); // reused pid
     expect(isLeaseLive({ ...fresh, startTime: undefined }, { nowMs: now })).toBe(true); // pid-only
     expect(isLeaseLive({ ...fresh, pid: 0 }, { nowMs: now })).toBe(true); // unknown pid ⇒ expiry only
     expect(isLeaseLive(expired, { nowMs: now })).toBe(false);
@@ -320,7 +321,7 @@ describe('reconcileRun (no driver: process identity)', () => {
   });
 
   test('running + runner pid reused (start-time mismatch) → orphaned', async () => {
-    const run = await persisted({ runner: runnerOf({ pid: process.pid, startTime: 'proc:1' }), lease: makeLease() });
+    const run = await persisted({ runner: runnerOf({ pid: process.pid, startTime: mismatchedStartTime() }), lease: makeLease() });
     expect((await reconcileRun(run)).status).toBe('orphaned');
   });
 

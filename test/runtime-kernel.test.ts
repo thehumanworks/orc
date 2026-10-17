@@ -43,7 +43,7 @@ import { processStartTime } from '../src/runtime/process.ts';
 import { TurnLedger, deriveState, summarizeLedger, verdictFor } from '../src/runtime/derive.ts';
 import type { SessionView } from '../src/runtime/derive.ts';
 import { getRuntimeFactory } from '../src/runtime/providers/index.ts';
-import { mkTmp, waitFor } from './runtime-helpers.ts';
+import { mismatchedStartTime, mkTmp, waitFor } from './runtime-helpers.ts';
 
 const prevHome = process.env.ORC_HOME;
 const root = mkTmp('orc-kernel-unit-');
@@ -264,7 +264,7 @@ describe('liveness', () => {
     expect(leaseLive(st({ phase: 'suspended', lease }))).toBe(false);
     expect(leaseLive(st({ phase: 'stopped', lease }))).toBe(false);
     expect(leaseLive(st({ phase: 'running', lease: { ...lease, expiresAt: new Date(Date.now() - 1).toISOString() } }))).toBe(false);
-    expect(leaseLive(st({ phase: 'running', lease: { ...lease, startTime: 'proc:1' } }))).toBe(false);
+    expect(leaseLive(st({ phase: 'running', lease: { ...lease, startTime: mismatchedStartTime() } }))).toBe(false);
     expect(leaseLive(st({ phase: 'running', lease: { ...lease, pid: 2 ** 22 + 7 } }))).toBe(false);
   });
 

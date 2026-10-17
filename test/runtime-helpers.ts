@@ -9,8 +9,21 @@ import type { JournalEntry, SpawnSpec } from '../src/runtime/types.ts';
 import type { FakeScript } from '../src/runtime/providers/fake.ts';
 import { readJournal } from '../src/runtime/journal.ts';
 import { readActorState } from '../src/runtime/actor-state.ts';
+import { processStartTime } from '../src/runtime/process.ts';
 
 export const LAUNCHER = path.join(import.meta.dir, 'fixtures', 'runtime-launcher.ts');
+
+/**
+ * A start-time token that does NOT match this live process, from the SAME source as its
+ * real one (`proc:` with procfs, `ps:` elsewhere, e.g. macOS). isSameProcessAlive treats
+ * tokens from different sources as not comparable and falls back to pid liveness, so a
+ * pid-reuse test must mismatch within the source this host produces.
+ */
+export function mismatchedStartTime(): string {
+  const own = processStartTime(process.pid);
+  if (own === null) throw new Error(`cannot read this process's start time (pid ${process.pid})`);
+  return own.startsWith('proc:') ? 'proc:1' : 'ps:Thu Jan  1 00:00:00 1970';
+}
 
 export function mkTmp(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
