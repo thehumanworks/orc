@@ -14,7 +14,7 @@ historical (tmux-era) research log.
 
 ## Stack
 
-- Bun (TypeScript, ESM), `engines.bun >= 1.3`. Ships from source or as one binary
+- Bun (TypeScript, ESM), `engines.bun >= 1.3.3`. Ships from source or as one binary
   (`bun build --compile`). The kernel uses `Bun.spawn` pipes, `node:fs`, `util.parseArgs`. The only
   runtime dependencies, for the codex harness, are `@earendil-works/pi-ai` and
   `@earendil-works/pi-agent-core`, pinned to exactly 1.2.0.
