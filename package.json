@@ -19,9 +19,9 @@
     "test": "bun test",
     "typecheck": "bun x tsc --noEmit",
     "verify:live": "bun scripts/verify-runtime/all.ts",
-    "compile:cli": "bun build --compile ./src/cli/index.ts --outfile dist/orc",
+    "compile:cli": "bun build --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig ./src/cli/index.ts --outfile dist/orc",
     "install:cli": "bun run compile:cli && mv dist/orc ~/.local/bin/orc",
-    "check:compile": "bun build --compile ./src/cli/index.ts --outfile dist/orc && ./dist/orc __codex-harness --self-test"
+    "check:compile": "bun run compile:cli && ./dist/orc --version && ./dist/orc __codex-harness --self-test"
   },
   "devDependencies": {
     "@types/bun": "latest",

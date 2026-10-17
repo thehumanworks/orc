@@ -33,6 +33,7 @@ import type { RunnerSpawner } from '../workflow-runner.ts';
 import { selectTurns } from '../transcript.ts';
 import type { TurnSelection } from '../transcript.ts';
 import type { JournalEntry } from '../runtime/types.ts';
+import { VERSION } from '../version.ts';
 import { DAEMON_API_VERSION } from './client.ts';
 
 /** Journal entries per step returned by raw run logs. */
@@ -109,17 +110,6 @@ function publicWorkflowRunView(run: WorkflowRun): Record<string, unknown> {
   };
 }
 
-/** orc version, for `/health`. Read from package.json (best-effort; informational). */
-async function readVersion(): Promise<string> {
-  try {
-    const pkgPath = path.resolve(import.meta.dir, '../../package.json');
-    const pkg = (await Bun.file(pkgPath).json()) as { version?: string };
-    return pkg.version ?? '0.0.0';
-  } catch {
-    return '0.0.0';
-  }
-}
-
 export interface DaemonOptions {
   /** Resolved bind address (from `resolveBind`). */
   hostname: string;
@@ -143,7 +133,7 @@ export interface DaemonOptions {
   allowlist?: string[];
   /** This host's identity for `/health` + `/whoami` (defaults to os.hostname()). */
   hostName?: string;
-  /** orc version string for `/health` (defaults to package.json). */
+  /** orc version string for `/health` (defaults to VERSION: package.json, embedded at build). */
   version?: string;
   /** Resolve a request's source IP. Default uses `server.requestIP`. Injectable for tests. */
   resolveIp?: (req: Request, server: Bun.Server<undefined>) => string | null;
@@ -219,7 +209,7 @@ export function createFetch(opts: DaemonOptions): (req: Request, server: Bun.Ser
   const hostName = opts.hostName ?? os.hostname();
   const configuredSecret = opts.secret && opts.secret.length > 0 ? opts.secret : null;
   const tokens: ReadonlyMap<string, readonly Scope[]> = opts.tokens ?? new Map();
-  const versionPromise = opts.version ? Promise.resolve(opts.version) : readVersion();
+  const version = opts.version || VERSION;
 
   const getAllowlist = async (): Promise<string[]> =>
     opts.allowlist !== undefined ? opts.allowlist : await peerHosts();
@@ -233,7 +223,7 @@ export function createFetch(opts: DaemonOptions): (req: Request, server: Bun.Ser
 
     // /health is the ONLY unauthenticated route (liveness).
     if (authReq.type === 'public' || match.name === 'health') {
-      return json({ ok: true, version: await versionPromise, host: hostName, api: DAEMON_API_VERSION });
+      return json({ ok: true, version, host: hostName, api: DAEMON_API_VERSION });
     }
 
     // ---- Authn + authz (fail closed) — every other route. ----
@@ -264,7 +254,7 @@ export function createFetch(opts: DaemonOptions): (req: Request, server: Bun.Ser
         identity,
         allowlist,
         principal: authn.principal,
-        versionPromise,
+        version,
         spawnRunner: opts.spawnRunner,
       });
     } catch (e) {
@@ -306,7 +296,7 @@ interface DispatchCtx {
   identity: Identity | null;
   allowlist: string[];
   principal: Principal;
-  versionPromise: Promise<string>;
+  version: string;
   spawnRunner?: RunnerSpawner;
 }
 
@@ -320,7 +310,7 @@ async function dispatch(
 ): Promise<Response> {
   switch (name) {
     case 'health':
-      return json({ ok: true, version: await ctx.versionPromise, host: ctx.hostName, api: DAEMON_API_VERSION });
+      return json({ ok: true, version: ctx.version, host: ctx.hostName, api: DAEMON_API_VERSION });
 
     case 'whoami':
       return json({

@@ -55,6 +55,7 @@ import type { Session, SessionStateDetail } from '../session.ts';
 import type { SendResult } from '../messages.ts';
 import { renderJournal } from '../journal-render.ts';
 import type { JournalEntry } from '../runtime/types.ts';
+import { VERSION } from '../version.ts';
 import {
   printJson,
   printError,
@@ -2345,6 +2346,19 @@ const REMOTE_CAPABLE: ReadonlySet<string> = new Set([
   'workflow',
 ]);
 
+/** `orc --version [--json]` (alias `-V`): this binary's version — `orc <v>` or `{version}`. */
+function cmdVersion(args: string[]): number {
+  const { values, positionals } = parse(args, { json: { type: 'boolean' } });
+  const json = jsonFlag(values);
+  if (positionals.length > 0) {
+    printError(`unexpected argument '${positionals[0]}' (usage: orc --version [--json])`, json);
+    return 1;
+  }
+  if (json) printJson({ version: VERSION });
+  else process.stdout.write(`orc ${VERSION}\n`);
+  return 0;
+}
+
 async function main(): Promise<number> {
   // Hidden: the detached per-session actor (src/runtime/actor-main.ts). Not a user command.
   if (process.argv[2] === '__actor') return (await import('../runtime/actor-main.ts')).runActorMain(process.argv.slice(3));
@@ -2356,6 +2370,9 @@ async function main(): Promise<number> {
   // Peel the global `--host <h>` / `--local` (they may precede the subcommand) BEFORE
   // per-command parsing, which is strict on unknown options.
   const { host, local: localFlag, rest: argv } = extractHostFlag(process.argv.slice(2));
+  // `--version` / `-V` is answered before settings are loaded or a host is chosen: it
+  // reports THIS binary and never goes remote (not with --host, nor with a default host).
+  if (argv[0] === '--version' || argv[0] === '-V') return cmdVersion(argv.slice(1));
   const local = localFlag === true;
   const sub = argv[0];
   const rest = argv.slice(1);
