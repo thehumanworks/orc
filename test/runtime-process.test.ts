@@ -17,7 +17,7 @@ import {
 } from '../src/runtime/process.ts';
 import { mismatchedStartTime } from './runtime-helpers.ts';
 
-const tmp =() => fs.mkdtempSync(path.join(os.tmpdir(), 'orc-proc-'));
+const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'orc-proc-'));
 
 async function waitFor(pred: () => boolean, ms = 5_000): Promise<boolean> {
   const end = Date.now() + ms;

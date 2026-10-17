@@ -4,6 +4,7 @@
  * child, against an isolated ORC_HOME.
  */
 import { afterAll, beforeEach, describe, expect, test } from 'bun:test';
+import { TEARDOWN_TIMEOUT_MS } from './runtime-helpers.ts';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -64,7 +65,7 @@ afterAll(async () => {
   if (prevHome === undefined) delete process.env.ORC_HOME;
   else process.env.ORC_HOME = prevHome;
   fs.rmSync(root, { recursive: true, force: true });
-});
+}, TEARDOWN_TIMEOUT_MS);
 
 async function newSession(script: FakeScript = {}, opts: { startTimeoutMs?: number } = {}): Promise<string> {
   const spec = fakeSpec(mkTmp('orc-actor-cwd-'), script);

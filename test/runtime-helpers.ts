@@ -91,13 +91,11 @@ interface ProcRow {
   cmd: string;
 }
 
-/**
- * Live (non-zombie) processes whose command line contains `needle`. A child that was
- * forked but has not exec'd yet still shows its parent's command line, so matches whose
- * parent also matches are dropped.
- */
-export function liveProcs(needle: string): ProcRow[] {
-  const rows: Array<ProcRow & { ppid: number }> = [];
+type ProcTable = Array<ProcRow & { ppid: number }>;
+
+/** One snapshot of the live (non-zombie) processes: a /proc scan on Linux, one `ps` elsewhere. */
+function processTable(): ProcTable {
+  const rows: ProcTable = [];
   if (fs.existsSync('/proc/self/stat')) {
     for (const name of fs.readdirSync('/proc')) {
       if (!/^\d+$/.test(name)) continue;
@@ -106,7 +104,7 @@ export function liveProcs(needle: string): ProcRow[] {
         const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
         if (fields[0] === 'Z' || fields[0] === 'X') continue;
         const cmd = fs.readFileSync(`/proc/${name}/cmdline`, 'utf8').split('\0').join(' ').trim();
-        if (cmd.includes(needle)) rows.push({ pid: Number(name), ppid: Number(fields[1]), cmd });
+        rows.push({ pid: Number(name), ppid: Number(fields[1]), cmd });
       } catch {
         /* raced with exit */
       }
@@ -116,38 +114,57 @@ export function liveProcs(needle: string): ProcRow[] {
     for (const line of r.stdout.toString().split('\n')) {
       const m = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line);
       if (!m || m[3]!.startsWith('Z')) continue;
-      if (m[4]!.includes(needle)) rows.push({ pid: Number(m[1]), ppid: Number(m[2]), cmd: m[4]! });
+      rows.push({ pid: Number(m[1]), ppid: Number(m[2]), cmd: m[4]! });
     }
   }
+  return rows;
+}
+
+/**
+ * Live (non-zombie) processes whose command line contains `needle`, from `table` (default: a
+ * fresh snapshot). A child that was forked but has not exec'd yet still shows its parent's
+ * command line, so matches whose parent also matches are dropped.
+ */
+export function liveProcs(needle: string, table: ProcTable = processTable()): ProcRow[] {
+  const rows = table.filter((r) => r.cmd.includes(needle));
   const pids = new Set(rows.map((r) => r.pid));
   return rows.filter((r) => !pids.has(r.ppid)).map(({ pid, cmd }) => ({ pid, cmd }));
 }
 
-export const fakeProviderPids = (sid: string) =>
-  liveProcs(`fake-child.ts --orc-session ${sid}`).map((r) => r.pid);
-export const actorPids = (sid: string) => liveProcs(`__actor ${sid}`).map((r) => r.pid);
+const providerNeedle = (sid: string) => `fake-child.ts --orc-session ${sid}`;
+const actorNeedle = (sid: string) => `__actor ${sid}`;
+export const fakeProviderPids = (sid: string) => liveProcs(providerNeedle(sid)).map((r) => r.pid);
+export const actorPids = (sid: string) => liveProcs(actorNeedle(sid)).map((r) => r.pid);
+
+/**
+ * Timeout for a hook that calls killSessionProcesses: `afterAll(fn, TEARDOWN_TIMEOUT_MS)`.
+ * bun:test's default hook timeout (5 s) equals the helper's own wait for the processes to
+ * exit, so a slow teardown (many sessions, `ps` probes on macOS) would time the hook out.
+ */
+export const TEARDOWN_TIMEOUT_MS = 30_000;
 
 /** SIGKILL every actor/provider process (and its group) belonging to these sessions. */
 export async function killSessionProcesses(sids: string[]): Promise<void> {
-  for (const sid of sids) {
-    for (const pid of [...actorPids(sid), ...fakeProviderPids(sid)]) {
-      try {
-        process.kill(-pid, 'SIGKILL');
-      } catch {
-        /* not a group leader / gone */
-      }
-      try {
-        process.kill(pid, 'SIGKILL');
-      } catch {
-        /* gone */
-      }
+  // One process-table snapshot per pass, not two per session (each one is a `ps` on macOS).
+  const sessionPids = (): number[] => {
+    const table = processTable();
+    return sids.flatMap((sid) =>
+      [...liveProcs(actorNeedle(sid), table), ...liveProcs(providerNeedle(sid), table)].map((r) => r.pid),
+    );
+  };
+  for (const pid of sessionPids()) {
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch {
+      /* not a group leader / gone */
+    }
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      /* gone */
     }
   }
-  await waitFor(
-    () => sids.every((s) => actorPids(s).length === 0 && fakeProviderPids(s).length === 0),
-    'session processes to exit',
-    5_000,
-  ).catch(() => undefined);
+  await waitFor(() => sessionPids().length === 0, 'session processes to exit', 5_000).catch(() => undefined);
 }
 
 /** Run the launcher fixture to completion: returns parsed stdout JSON. */

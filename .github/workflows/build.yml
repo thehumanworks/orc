@@ -44,7 +44,8 @@ jobs:
       # engines.bun range): make the pin binding for release binaries.
       - name: Check Bun pin
         run: |
-          pin="$(cat .bun-version)"
+          pin="$(tr -d '[:space:]' < .bun-version)"
+          pin="${pin#v}"
           [ "$(bun --version)" = "$pin" ] || { echo "::error::bun $(bun --version) is not the .bun-version pin ($pin)"; exit 1; }
 
       - name: Install dependencies
