@@ -14,6 +14,7 @@ import { randomUUID } from 'node:crypto';
 import { createCodexRuntime } from '../src/runtime/providers/codex.ts';
 import type { ProviderEvent } from '../src/runtime/types.ts';
 import { startFakeOpenAI, type FakeOpenAI } from './fixtures/openai-fake.ts';
+import { plainCliEnv } from './runtime-helpers.ts';
 
 const REPO = path.resolve(import.meta.dir, '..');
 const PKG = JSON.parse(fs.readFileSync(path.join(REPO, 'package.json'), 'utf8')) as { version: string; scripts: Record<string, string> };
@@ -76,7 +77,7 @@ describe('compiled orc binary', () => {
       fs.writeFileSync(path.join(orcHome, 'settings.toml'), 'provider = "pi"\n[models]\npi = "openai/gpt-5"\nfuture = "x"\n');
       const env: Record<string, string> = {};
       for (const [k, v] of Object.entries(process.env)) if (v !== undefined && !k.startsWith('ORC_')) env[k] = v;
-      const r = Bun.spawnSync([bin, 'settings', '--json'], { cwd: root, env: { ...env, ORC_HOME: orcHome }, stdout: 'pipe', stderr: 'pipe' });
+      const r = Bun.spawnSync([bin, 'settings', '--json'], { cwd: root, env: plainCliEnv({ ...env, ORC_HOME: orcHome }), stdout: 'pipe', stderr: 'pipe' });
       expect(r.exitCode).toBe(0);
       const view = JSON.parse(r.stdout.toString()) as Record<string, any>;
       expect(view.provider).toEqual({ value: 'pi', source: 'global', from: path.join(orcHome, 'settings.toml') });

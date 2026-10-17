@@ -11,7 +11,7 @@ import { runWorkflow } from '../src/workflow.ts';
 import type { StepDoneCtx, WorkflowDef, WorkflowEvent } from '../src/workflow.ts';
 import { readRegistry } from '../src/registry.ts';
 import { readRun } from '../src/runs.ts';
-import { killSessionProcesses, mkTmp } from './runtime-helpers.ts';
+import { killSessionProcesses, mkTmp, plainCliEnv } from './runtime-helpers.ts';
 
 const CLI = path.join(import.meta.dir, '..', 'src', 'cli', 'index.ts');
 const T = 60_000;
@@ -164,7 +164,7 @@ describe('detached workflow from the CLI', () => {
   ],
 };\n`,
       );
-      const env = { ...process.env, ORC_HOME: home };
+      const env = plainCliEnv({ ...process.env, ORC_HOME: home });
       const launch = Bun.spawn([process.execPath, CLI, 'workflow', 'run', file, '--detach', '--json'], {
         cwd: work,
         env,

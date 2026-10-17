@@ -31,6 +31,8 @@ import {
 } from './auth.ts';
 import { installTestEndpoint, testEndpoint } from './endpoint.ts';
 import { listLiveModels } from './models.ts';
+import { resolveStyle } from '../style.ts';
+import type { Style } from '../style.ts';
 
 /** Give up on an unfinished browser login after this long. */
 export const LOGIN_TIMEOUT_MS = 10 * 60 * 1000;
@@ -216,20 +218,21 @@ export async function loginStatus(env: Record<string, string | undefined> = proc
   };
 }
 
-export function renderLoginStatus(s: LoginStatus): string {
-  const mark = (k: LoginStatus['active']) => (s.active === k ? '→' : ' ');
+export function renderLoginStatus(s: LoginStatus, style?: Style): string {
+  const st = resolveStyle(style);
+  const mark = (k: LoginStatus['active']) => (s.active === k ? st.paint('→', 'bold', 'cyan') : ' ');
   return [
-    'codex credentials (first match is used):',
-    `${mark('orc')} 1. orc login     ${s.orc.credential}  [${s.orc.path}]`,
-    `${mark('pi')} 2. pi login      ${s.pi.credential}  [${s.pi.path}]`,
-    `${mark('env')} 3. OPENAI_API_KEY ${s.openaiApiKey ? 'set' : 'not set'}`,
-    ...(s.orc.error ? [`orc credential file error: ${s.orc.error}`] : []),
-    ...(s.pi.error ? [`pi credential file error: ${s.pi.error}`] : []),
+    st.heading('codex credentials (first match is used):'),
+    `${mark('orc')} 1. orc login     ${st.text(s.orc.credential)}  ${st.muted(`[${s.orc.path}]`)}`,
+    `${mark('pi')} 2. pi login      ${st.text(s.pi.credential)}  ${st.muted(`[${s.pi.path}]`)}`,
+    `${mark('env')} 3. OPENAI_API_KEY ${s.openaiApiKey ? st.success('set') : st.muted('not set')}`,
+    ...(s.orc.error ? [st.danger(`orc credential file error: ${s.orc.error}`)] : []),
+    ...(s.pi.error ? [st.danger(`pi credential file error: ${s.pi.error}`)] : []),
     s.active === 'error'
-      ? `error: ${s.error} — fix or remove the file (\`orc logout chatgpt\` removes orc's), then \`orc login chatgpt\``
+      ? `${st.errorLabel('error:')} ${st.text(`${s.error} — fix or remove the file (\`orc logout chatgpt\` removes orc's), then \`orc login chatgpt\``)}`
       : s.active === 'none'
-        ? 'none configured: run `orc login chatgpt` or set OPENAI_API_KEY'
-        : `active: ${s.active}`,
+        ? st.warning('none configured: run `orc login chatgpt` or set OPENAI_API_KEY')
+        : `${st.label('active:')} ${st.success(s.active)}`,
   ].join('\n');
 }
 

@@ -133,10 +133,17 @@ orc settings [--json]                               Effective settings and where
 orc --host <h> <command>                            Run a command against a peer's daemon
 orc --local <command>                               Run here, ignoring ORC_HOST / settings `host`
 orc --version [--json]                              This binary's version (alias: -V)
+orc --color[=WHEN] <command>                        auto (default) | always | never; --no-color = never
 ```
 
 `orc help` prints the full reference. A session is addressed by short id, full session id,
 `@alias` (current workspace) or `@workspace:alias`.
+
+Output to a terminal is coloured: one colour + glyph per status everywhere (`● running`,
+`✓ done`, `✗ failed`, `! waiting`, `◌ suspended`, `○ dead`), ids bold, secondary detail dim.
+`--no-color` or `NO_COLOR=1` turns it off, `--color=always` or `FORCE_COLOR=1` forces it (the
+flags win). Piped/redirected output is plain text and `--json` is never coloured. Agent text
+printed to a terminal has escape sequences and control characters stripped.
 
 ### spawn options
 

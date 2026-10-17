@@ -43,6 +43,7 @@ import {
 } from '../src/runtime/process.ts';
 import type { SpawnDetachedOptions } from '../src/runtime/process.ts';
 import type { ProcessIdentity } from '../src/runtime/types.ts';
+import { plainCliEnv } from './runtime-helpers.ts';
 import {
   awaitRunnerHandoff,
   followRunnerLog,
@@ -970,7 +971,7 @@ describe('CLI end-to-end (real detached runner, no agent)', () => {
   async function cli(args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
     const p = Bun.spawn([process.execPath, CLI, ...args], {
       cwd: home,
-      env: { ...process.env, ORC_HOME: process.env.ORC_HOME },
+      env: plainCliEnv({ ...process.env, ORC_HOME: process.env.ORC_HOME }),
       stdout: 'pipe',
       stderr: 'pipe',
     });

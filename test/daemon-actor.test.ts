@@ -14,7 +14,7 @@ import { remoteSendExitCode } from '../src/cli/index.ts';
 import { DaemonClient } from '../src/daemon/client.ts';
 import { FAKE_PROVIDER_ENV } from '../src/agent.ts';
 import { writeRun, WORKFLOW_SCHEMA_VERSION } from '../src/runs.ts';
-import { killSessionProcesses, mkTmp } from './runtime-helpers.ts';
+import { killSessionProcesses, mkTmp, plainCliEnv } from './runtime-helpers.ts';
 
 const CLI = path.join(import.meta.dir, '..', 'src', 'cli', 'index.ts');
 const T = 45_000;
@@ -66,7 +66,7 @@ async function call(method: string, p: string, body?: unknown): Promise<{ status
 async function orcRemote(args: string[], port = server.port): Promise<{ code: number; out: string; err: string }> {
   const proc = Bun.spawn([process.execPath, CLI, '--host', `127.0.0.1:${port}`, ...args], {
     cwd: work,
-    env: { ...process.env, ORC_DAEMON_SECRET: 's3cret' },
+    env: plainCliEnv({ ...process.env, ORC_DAEMON_SECRET: 's3cret' }),
     stdout: 'pipe',
     stderr: 'pipe',
   });

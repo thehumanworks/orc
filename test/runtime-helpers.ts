@@ -12,6 +12,16 @@ import { readActorState } from '../src/runtime/actor-state.ts';
 
 export const LAUNCHER = path.join(import.meta.dir, 'fixtures', 'runtime-launcher.ts');
 
+/**
+ * The env for a spawned `orc` CLI whose output a test matches exactly: colour can never
+ * apply (NO_COLOR=1, FORCE_COLOR / CLICOLOR_FORCE removed), whatever the developer's shell
+ * exports. A backstop only: piped stdio already means no colour.
+ */
+export function plainCliEnv<T extends Record<string, string | undefined>>(env: T): T {
+  const { FORCE_COLOR: _force, CLICOLOR_FORCE: _cliForce, ...rest } = env;
+  return { ...rest, NO_COLOR: '1' } as unknown as T;
+}
+
 export function mkTmp(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }

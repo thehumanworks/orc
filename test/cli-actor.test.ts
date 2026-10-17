@@ -9,7 +9,7 @@ import path from 'node:path';
 import { FAKE_PROVIDER_ENV } from '../src/agent.ts';
 import { resolveCommand, sendExitCode } from '../src/cli/index.ts';
 import { HELP_TEXT } from '../src/cli/output.ts';
-import { actorPids, fakeProviderPids, killSessionProcesses, mkTmp } from './runtime-helpers.ts';
+import { actorPids, fakeProviderPids, killSessionProcesses, mkTmp, plainCliEnv } from './runtime-helpers.ts';
 
 const CLI = path.join(import.meta.dir, '..', 'src', 'cli', 'index.ts');
 const T = 60_000;
@@ -36,12 +36,12 @@ afterAll(async () => {
 async function orc(args: string[], stdin?: string): Promise<{ code: number; out: string; err: string }> {
   const proc = Bun.spawn([process.execPath, CLI, ...args], {
     cwd: work,
-    env: {
+    env: plainCliEnv({
       ...process.env,
       ORC_HOME: home,
       PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ''}`,
       [FAKE_PROVIDER_ENV]: JSON.stringify({ rules: [{ match: 'HANG', action: 'hang' }] }),
-    },
+    }),
     stdin: stdin !== undefined ? new Blob([stdin]) : 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',
@@ -161,7 +161,7 @@ describe('orc CLI on the actor runtime (tmux shadowed on PATH)', () => {
       sids.push(spawned.sessionId);
       const proc = Bun.spawn([process.execPath, CLI, 'attach', spawned.id], {
         cwd: work,
-        env: { ...process.env, ORC_HOME: home, PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ''}` },
+        env: plainCliEnv({ ...process.env, ORC_HOME: home, PATH: `${shimDir}${path.delimiter}${process.env.PATH ?? ''}` }),
         stdout: 'pipe',
         stderr: 'pipe',
       });

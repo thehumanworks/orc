@@ -27,6 +27,7 @@ import {
   launchDetachedRecovery,
   launchDetachedRun,
   trapRunnerTermination,
+  RUNNER_FLAG,
 } from '../workflow-runner.ts';
 
 import type { WorkflowDef, WorkflowEvent, WorkflowRun, StepResult } from '../workflow.ts';
@@ -59,6 +60,7 @@ import { VERSION } from '../version.ts';
 import {
   printJson,
   printError,
+  formatError,
   renderSessionDetail,
   renderSessionList,
   renderSessionListWithHost,
@@ -66,9 +68,15 @@ import {
   renderRunDetail,
   publicRunView,
   renderRunList,
-  HELP_TEXT,
+  formatWarning,
+  renderHelp,
+  runnerLogWriter,
+  setTerminalStyles,
+  terminalStyles,
 } from './output.ts';
-import type { SessionView, HostSessionView } from './output.ts';
+import type { SessionView, HostSessionView, TerminalStyles } from './output.ts';
+import { COLOR_MODES, createStyle, decideColor } from '../style.ts';
+import type { ColorMode, Style } from '../style.ts';
 
 type ArgvOptions = NonNullable<ParseArgsConfig['options']>;
 
@@ -85,6 +93,16 @@ function parse(args: string[], options: ArgvOptions): Parsed {
     strict: true,
   });
   return { values: values as Parsed['values'], positionals };
+}
+
+/** The stdout style (PLAIN until main() decides; JSON output never goes through it). */
+function out(): Style {
+  return terminalStyles().out;
+}
+
+/** The stderr style. */
+function err(): Style {
+  return terminalStyles().err;
 }
 
 /**
@@ -291,7 +309,7 @@ async function cmdSpawn(args: string[], settings?: Settings): Promise<number> {
     if (json) {
       printJson(rec);
     } else {
-      process.stdout.write(`${renderSessionDetail(rec)}\n`);
+      process.stdout.write(`${renderSessionDetail(rec, out())}\n`);
     }
     return 0;
   } catch (e) {
@@ -333,10 +351,10 @@ export function remoteSendExitCode(phase: string | undefined): number {
   }
 }
 
-function renderSendResult(id: string, r: { phase: string; messageId?: string; replayed?: boolean }): string {
+function renderSendResult(id: string, r: { phase: string; messageId?: string; replayed?: boolean }, st: Style): string {
   const replay = r.replayed ? ', replayed' : '';
   const key = r.messageId ? ` [${r.messageId}]` : '';
-  return `sent to ${id} (${r.phase}${replay})${key}\n`;
+  return `sent to ${st.id(id)} (${st.tone(r.phase)}${st.muted(replay)})${st.muted(key)}\n`;
 }
 
 async function cmdSend(args: string[]): Promise<number> {
@@ -386,12 +404,15 @@ async function cmdSend(args: string[]): Promise<number> {
   }
   const code = sendExitCode(r.phase);
   if (json) printJson({ ok: code === 0, id: session.id, ...r });
-  else if (code === 0) process.stdout.write(renderSendResult(session.id, r));
+  else if (code === 0) process.stdout.write(renderSendResult(session.id, r, out()));
   else {
     process.stderr.write(
-      r.phase === 'unknown'
-        ? `error: delivery to ${session.id} is unknown (cut before the provider acknowledged it); not re-sent — check \`orc read ${session.id}\` and send again with a new key\n`
-        : `error: delivery to ${session.id} failed before the provider accepted it\n`,
+      formatError(
+        r.phase === 'unknown'
+          ? `delivery to ${session.id} is unknown (cut before the provider acknowledged it); not re-sent — check \`orc read ${session.id}\` and send again with a new key`
+          : `delivery to ${session.id} failed before the provider accepted it`,
+        err(),
+      ),
     );
   }
   return code;
@@ -450,7 +471,7 @@ async function cmdRead(args: string[]): Promise<number> {
       if (json) {
         printJson(selected);
       } else {
-        process.stdout.write(`${renderTurns(selected)}\n`);
+        process.stdout.write(`${renderTurns(selected, out())}\n`);
       }
       return 0;
     }
@@ -461,15 +482,20 @@ async function cmdRead(args: string[]): Promise<number> {
     if (json) {
       printJson({ id: session.id, fallback: true, journal });
     } else {
-      process.stderr.write('(no on-disk transcript yet — showing the session journal; --raw for JSONL)\n');
-      const text = renderJournal(journal);
-      process.stdout.write(text.length > 0 ? `${text}\n` : '(empty)\n');
+      writeJournalFallback(journal);
     }
     return 0;
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
   }
+}
+
+/** `read` with no provider transcript yet: a stderr notice, then the journal rendered as text. */
+function writeJournalFallback(journal: JournalEntry[]): void {
+  process.stderr.write(`${err().muted('(no on-disk transcript yet — showing the session journal; --raw for JSONL)')}\n`);
+  const text = renderJournal(journal, out());
+  process.stdout.write(text.length > 0 ? `${text}\n` : `${out().muted('(empty)')}\n`);
 }
 
 /** Record + kernel status (D1) + derived state, for list/get views. */
@@ -516,7 +542,7 @@ async function cmdList(args: string[]): Promise<number> {
       })),
     );
   } else {
-    process.stdout.write(`${renderSessionList(views, { lineage: showLineage })}\n`);
+    process.stdout.write(`${renderSessionList(views, { lineage: showLineage, style: out() })}\n`);
   }
   return 0;
 }
@@ -543,12 +569,12 @@ async function cmdListAllHosts(values: Parsed['values'], json: boolean): Promise
       const remote = await client.listSessions(filter);
       for (const r of remote) rows.push({ ...r, state: r.state as SessionView['state'], host: p.host });
     } catch (e) {
-      process.stderr.write(`warning: peer ${p.host} unreachable: ${(e as Error).message}\n`);
+      process.stderr.write(formatWarning(`peer ${p.host} unreachable: ${(e as Error).message}`, err()));
     }
   }
 
   if (json) printJson(rows);
-  else process.stdout.write(`${renderSessionListWithHost(rows)}\n`);
+  else process.stdout.write(`${renderSessionListWithHost(rows, out())}\n`);
   return 0;
 }
 
@@ -583,7 +609,7 @@ async function cmdAttach(args: string[]): Promise<number> {
   const onInt = () => ac.abort();
   process.once('SIGINT', onInt);
   try {
-    return await session.attach({ signal: ac.signal });
+    return await session.attach({ signal: ac.signal, style: out() });
   } catch (e) {
     printError((e as Error).message, false);
     return 1;
@@ -621,7 +647,7 @@ async function cmdResume(args: string[]): Promise<number> {
     return 1;
   }
   if (json) printJson(d);
-  else process.stdout.write(`resumed ${session.id}: ${d.state}\n`);
+  else process.stdout.write(`resumed ${out().id(session.id)}: ${out().status(d.state)}\n`);
   return 0;
 }
 
@@ -648,8 +674,9 @@ async function cmdTakeover(args: string[]): Promise<number> {
     const t = await session.takeover();
     if (json) printJson({ id: t.id, cwd: t.cwd, command: t.command, ...(t.note ? { note: t.note } : {}) });
     else {
+      const st = out();
       process.stdout.write(
-        `# orc stopped ${t.id}; continue it yourself with:\n${t.command}\n${t.note ? `# ${t.note}\n` : ''}# hand it back with: orc resume ${t.id}\n`,
+        `${st.muted(`# orc stopped ${t.id}; continue it yourself with:`)}\n${st.command(t.command)}\n${t.note ? `${st.muted(`# ${t.note}`)}\n` : ''}${st.muted(`# hand it back with: orc resume ${t.id}`)}\n`,
       );
     }
     return 0;
@@ -685,7 +712,7 @@ async function cmdKill(args: string[]): Promise<number> {
     return 1;
   }
   if (json) printJson({ ok: true, id: session.id, purged: purge });
-  else process.stdout.write(`${purge ? 'purged' : 'killed'} ${session.id}\n`);
+  else process.stdout.write(`${purge ? 'purged' : 'killed'} ${out().id(session.id)}\n`);
   return 0;
 }
 
@@ -711,7 +738,7 @@ async function cmdPrune(args: string[]): Promise<number> {
   if (json) printJson({ ok: true, pruned: removed });
   else {
     const what = values.suspended === true ? 'dead/suspended' : 'dead';
-    process.stdout.write(`pruned ${removed.length} ${what} record(s)\n`);
+    process.stdout.write(`pruned ${out().bold(String(removed.length))} ${what} record(s)\n`);
   }
   return 0;
 }
@@ -747,7 +774,7 @@ async function cmdState(args: string[]): Promise<number> {
   if (json) printJson(d);
   else {
     const note = d.stopped ? ' (stopped)' : d.suspended ? ' (suspended)' : '';
-    process.stdout.write(`${d.state}${note}\n`);
+    process.stdout.write(`${out().status(d.state)}${out().muted(note)}\n`);
   }
   return 0;
 }
@@ -801,7 +828,7 @@ async function cmdWait(args: string[]): Promise<number> {
   if (json) {
     printJson({ id: session.id, state, elapsedMs, timedOut });
   } else {
-    process.stdout.write(`${state}${timedOut ? ' (timed out)' : ''}\n`);
+    process.stdout.write(`${out().status(state)}${timedOut ? out().warning(' (timed out)') : ''}\n`);
   }
   return reached ? 0 : 1;
 }
@@ -920,7 +947,7 @@ async function cmdWorkflowRun(args: string[], defaultModels?: DefaultModels): Pr
       sourcePath: absFile,
       maxConcurrency: conc.value,
       defaultModels: models,
-      onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
+      onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e, out())),
     });
   } catch (e) {
     printError((e as Error).message, json);
@@ -976,7 +1003,7 @@ async function cmdWorkflowRunDetached(
   try {
     const launch = await launchDetachedRun(def, absFile, { maxConcurrency, defaultModels });
     if (json) printJson({ runId: launch.runId, logPath: launch.logPath });
-    else process.stdout.write(`${launch.runId}\n`);
+    else process.stdout.write(`${out().text(launch.runId)}\n`);
     return 0;
   } catch (e) {
     const msg = (e as Error).message;
@@ -992,7 +1019,7 @@ async function cmdWorkflowList(args: string[]): Promise<number> {
   // Reconcile each stale `running` against its runner's liveness (persists the verdict).
   const reconciled = await Promise.all(runs.map((r) => reconcileRun(r)));
   if (json) printJson(reconciled.map(publicRunView));
-  else process.stdout.write(`${renderRunList(reconciled)}\n`);
+  else process.stdout.write(`${renderRunList(reconciled, out())}\n`);
   return 0;
 }
 
@@ -1012,7 +1039,7 @@ async function cmdWorkflowStatus(args: string[]): Promise<number> {
   // Don't trust a stale `running`: if the runner session is gone, report `orphaned`.
   const reconciled = await reconcileRun(run);
   if (json) printJson(publicRunView(reconciled));
-  else process.stdout.write(`${renderRunDetail(reconciled)}\n`);
+  else process.stdout.write(`${renderRunDetail(reconciled, out())}\n`);
   return 0;
 }
 
@@ -1054,11 +1081,17 @@ async function cmdWorkflowAttach(args: string[]): Promise<number> {
   const ac = new AbortController();
   const onInt = () => ac.abort();
   process.once('SIGINT', onInt);
+  const follow = runnerLogWriter(out(), (t) => void process.stdout.write(t));
   try {
-    const last = await followRunnerLog(runId, { signal: ac.signal });
-    if (!ac.signal.aborted && last) process.stderr.write(`# run ${runId} ${last.status}\n`);
+    const last = await followRunnerLog(runId, { signal: ac.signal, write: follow.write });
+    follow.end();
+    if (!ac.signal.aborted && last) {
+      const st = err();
+      process.stderr.write(`${st.muted('# run')} ${st.id(runId)} ${st.status(last.status)}\n`);
+    }
     return 0;
   } catch (e) {
+    follow.end();
     printError((e as Error).message, false);
     return 1;
   } finally {
@@ -1121,9 +1154,10 @@ async function cmdWorkflowLogs(args: string[]): Promise<number> {
       if (json) {
         printJson(logs);
       } else {
+        const st = out();
         process.stdout.write(
           `${logs
-            .map((l) => `### step ${l.step} (${l.provider})\n${renderJournal(l.journal) || '(no journal — session gone)'}`)
+            .map((l) => `${stepHeading(l.step, l.provider, st)}\n${renderJournal(l.journal, st) || st.muted('(no journal — session gone)')}`)
             .join('\n\n')}\n`,
         );
       }
@@ -1140,9 +1174,10 @@ async function cmdWorkflowLogs(args: string[]): Promise<number> {
     if (json) {
       printJson(logs.map((l) => ({ step: l.step, turns: l.turns })));
     } else {
+      const st = out();
       process.stdout.write(
         `${logs
-          .map((l) => `### step ${l.step} (${l.provider})\n${renderTurns(l.turns) || '(no transcript on disk yet)'}`)
+          .map((l) => `${stepHeading(l.step, l.provider, st)}\n${renderTurns(l.turns, st) || st.muted('(no transcript on disk yet)')}`)
           .join('\n\n')}\n`,
       );
     }
@@ -1177,7 +1212,7 @@ async function detachWorkflowControl(
   try {
     const launch = await launchDetachedRecovery(action, runId, def, absFile, { stepId });
     if (json) printJson({ runId, logPath: launch.logPath, action });
-    else process.stdout.write(`${runId}\n`);
+    else process.stdout.write(`${out().text(runId)}\n`);
     return 0;
   } catch (e) {
     const msg = (e as Error).message;
@@ -1260,7 +1295,7 @@ async function cmdWorkflowResume(args: string[]): Promise<number> {
         sourcePath: absPath,
         runner,
         signal: term.signal,
-        onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
+        onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e, out())),
       });
       if (term.signal.aborted) return runnerTerminated(run);
       if (json) printJson(run);
@@ -1312,7 +1347,7 @@ async function cmdWorkflowRetry(args: string[]): Promise<number> {
         stepId,
         runner,
         signal: term.signal,
-        onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
+        onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e, out())),
       });
       if (term.signal.aborted) return runnerTerminated(run);
       if (json) printJson(run);
@@ -1341,7 +1376,7 @@ async function cmdWorkflowCancel(args: string[]): Promise<number> {
   try {
     const run = await cancelWorkflow(runId, { cascade: values.cascade === true });
     if (json) printJson(run);
-    else process.stdout.write(`cancelled ${run.id}${values.cascade ? ' (cascade)' : ''}\n`);
+    else process.stdout.write(`${out().tone('cancelled')} ${out().id(run.id)}${out().muted(values.cascade ? ' (cascade)' : '')}\n`);
     return 0;
   } catch (e) {
     printError((e as Error).message, json);
@@ -1369,8 +1404,9 @@ async function cmdWorkflowCleanup(args: string[]): Promise<number> {
     });
     if (json) printJson(result);
     else {
+      const st = out();
       process.stdout.write(
-        `cleanup ${result.runId}: sessions=${result.sessions.length} worktrees=${result.worktrees.length}\n`,
+        `cleanup ${st.id(result.runId)}: ${st.label('sessions=')}${result.sessions.length} ${st.label('worktrees=')}${result.worktrees.length}\n`,
       );
     }
     return 0;
@@ -1441,10 +1477,11 @@ async function cmdDaemon(args: string[]): Promise<number> {
   if (json) {
     printJson(startup);
   } else {
-    process.stderr.write(`orc daemon listening on http://${decision.address}:${server.port}\n`);
+    const st = err();
+    process.stderr.write(`orc daemon listening on ${st.accent(`http://${decision.address}:${server.port}`)}\n`);
     if (values.insecure === true) {
       process.stderr.write(
-        'WARNING: --insecure bind — the agent-control API may be reachable off-tailnet.\n',
+        `${st.warningLabel('WARNING:')} ${st.warning('--insecure bind — the agent-control API may be reachable off-tailnet.')}\n`,
       );
     }
     const mechanisms: string[] = [];
@@ -1453,8 +1490,8 @@ async function cmdDaemon(args: string[]): Promise<number> {
     if (secret) mechanisms.push('legacy shared secret (x-orc-secret, all scopes)');
     process.stderr.write(
       mechanisms.length > 0
-        ? `auth: ${mechanisms.join(' + ')} (whois preferred; loopback whois cannot resolve)\n`
-        : 'auth: NONE configured — every request will 401. Add peers (orc remote add), set ORC_DAEMON_TOKENS, or ORC_DAEMON_SECRET.\n',
+        ? `${st.label('auth:')} ${mechanisms.join(' + ')} ${st.muted('(whois preferred; loopback whois cannot resolve)')}\n`
+        : `${st.label('auth:')} ${st.warning('NONE configured — every request will 401.')} Add peers (orc remote add), set ORC_DAEMON_TOKENS, or ORC_DAEMON_SECRET.\n`,
     );
   }
 
@@ -1487,7 +1524,7 @@ async function cmdLogin(args: string[]): Promise<number> {
   if (what === 'status') {
     const s = await login.loginStatus();
     if (json) printJson(s);
-    else process.stdout.write(`${login.renderLoginStatus(s)}\n`);
+    else process.stdout.write(`${login.renderLoginStatus(s, out())}\n`);
     return s.active === 'error' ? 1 : 0;
   }
   if (what === 'chatgpt') {
@@ -1534,7 +1571,7 @@ async function cmdRemoteAdmin(args: string[]): Promise<number> {
       }
       const entry = await addPeer(host, pport);
       if (json) printJson({ ok: true, peer: entry });
-      else process.stdout.write(`added peer ${entry.host}${entry.port ? `:${entry.port}` : ''}\n`);
+      else process.stdout.write(`added peer ${out().bold(`${entry.host}${entry.port ? `:${entry.port}` : ''}`)}\n`);
       return 0;
     }
     case 'list': {
@@ -1546,7 +1583,7 @@ async function cmdRemoteAdmin(args: string[]): Promise<number> {
       } else {
         process.stdout.write(
           peers.length > 0
-            ? `${peers.map((p) => `${p.host}${p.port ? `:${p.port}` : ''}`).join('\n')}\n`
+            ? `${peers.map((p) => out().text(`${p.host}${p.port ? `:${p.port}` : ''}`)).join('\n')}\n`
             : '(no peers)\n',
         );
       }
@@ -1567,7 +1604,7 @@ async function cmdRemoteAdmin(args: string[]): Promise<number> {
         return 1;
       }
       if (json) printJson({ ok: true, removed: host });
-      else process.stdout.write(`removed peer ${host}\n`);
+      else process.stdout.write(`removed peer ${out().bold(host)}\n`);
       return 0;
     }
     default:
@@ -1606,6 +1643,80 @@ export function extractHostFlag(argv: string[]): { host?: string; local?: true; 
 }
 
 /**
+ * Strip the global `--color[=WHEN]` / `--no-color` flags from argv, anywhere before a
+ * literal `--` (which ends option parsing: it and everything after it are kept verbatim).
+ * `--color` alone = always, `--no-color` = never; the last one wins. An invalid WHEN is
+ * reported in `error`. Pure + unit-testable.
+ */
+export function extractColorFlag(argv: string[]): { color?: ColorMode; error?: string; rest: string[] } {
+  const rest: string[] = [];
+  let color: ColorMode | undefined;
+  let error: string | undefined;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]!;
+    if (a === '--') {
+      rest.push(...argv.slice(i));
+      break;
+    }
+    if (a === '--no-color') {
+      color = 'never';
+      continue;
+    }
+    if (a === '--color') {
+      color = 'always';
+      continue;
+    }
+    if (a.startsWith('--color=')) {
+      const when = a.slice('--color='.length);
+      if ((COLOR_MODES as readonly string[]).includes(when)) color = when as ColorMode;
+      else error = `invalid --color '${when}' (auto|always|never)`;
+      continue;
+    }
+    rest.push(a);
+  }
+  return { ...(color !== undefined ? { color } : {}), ...(error !== undefined ? { error } : {}), rest };
+}
+
+/**
+ * A detached workflow runner (`workflow run … --run-id <id>`, `workflow resume|retry …
+ * --runner`): its stdout/stderr are the runner log, which stays plain text.
+ */
+export function isRunnerInvocation(command: string, rest: string[]): boolean {
+  return command === 'workflow' && rest.some((a) => a === RUNNER_FLAG || a === '--run-id' || a.startsWith('--run-id='));
+}
+
+/**
+ * This invocation's per-stream styles. Colour is decided per stream (`decideColor`), but
+ * never with `--json` (on either stream: a JSON consumer is a program) and never in a
+ * detached runner. Sanitizing (terminal-safe dynamic text) applies whenever the stream is
+ * a TTY, colour or not; piped/redirected output is never altered.
+ */
+export function terminalStylesFor(opts: {
+  mode?: ColorMode;
+  json: boolean;
+  runner: boolean;
+  env?: Record<string, string | undefined>;
+  stdoutIsTTY?: boolean;
+  stderrIsTTY?: boolean;
+}): TerminalStyles {
+  const env = opts.env ?? process.env;
+  const stream = (isTTY: boolean): Style =>
+    createStyle({
+      color: !opts.json && !opts.runner && decideColor({ mode: opts.mode, env, isTTY }),
+      sanitize: isTTY,
+    });
+  return {
+    out: stream(opts.stdoutIsTTY ?? process.stdout.isTTY === true),
+    err: stream(opts.stderrIsTTY ?? process.stderr.isTTY === true),
+  };
+}
+
+/** `### step <id> (<provider>)`, the per-step heading of `workflow logs`. */
+function stepHeading(step: string, provider: string, st: Style): string {
+  return `${st.heading(`### step ${step}`)} ${st.muted(`(${provider})`)}`;
+}
+
+/**
  * `orc settings [--json]` — the effective settings per key with their source (flag / env /
  * local file / global file / default), the files considered and any warnings. Host-local.
  */
@@ -1622,7 +1733,7 @@ async function cmdSettings(args: string[], opts: { local: boolean }): Promise<nu
   const peers = settings.host?.source === 'local' ? await readPeers() : [];
   const view = settingsView(settings, { local: opts.local, peers });
   if (json) printJson(view);
-  else process.stdout.write(`${renderSettingsView(view)}\n`);
+  else process.stdout.write(`${renderSettingsView(view, out())}\n`);
   return 0;
 }
 
@@ -1670,7 +1781,14 @@ async function remoteList(client: DaemonClient, args: string[], target: RemoteTa
       dead: values.dead === true,
     });
     if (json) printJson(views);
-    else process.stdout.write(`${renderSessionList(views.map((v) => ({ ...v, state: v.state as SessionView['state'] })))}\n`);
+    else {
+      process.stdout.write(
+        `${renderSessionList(
+          views.map((v) => ({ ...v, state: v.state as SessionView['state'] })),
+          { style: out() },
+        )}\n`,
+      );
+    }
     return 0;
   } catch (e) {
     void target;
@@ -1737,7 +1855,7 @@ async function remoteSpawn(client: DaemonClient, args: string[], settings?: Sett
   try {
     const rec = await client.spawn(body);
     if (json) printJson(rec);
-    else process.stdout.write(`${renderSessionDetail(rec)}\n`);
+    else process.stdout.write(`${renderSessionDetail(rec, out())}\n`);
     return 0;
   } catch (e) {
     printError((e as Error).message, json);
@@ -1777,8 +1895,8 @@ async function remoteSend(client: DaemonClient, args: string[]): Promise<number>
     const phase = r.phase ?? 'acknowledged';
     const code = remoteSendExitCode(r.phase);
     if (json) printJson(r);
-    else if (code === 0) process.stdout.write(renderSendResult(r.id, { ...r, phase }));
-    else process.stderr.write(`error: delivery to ${r.id} ${phase}\n`);
+    else if (code === 0) process.stdout.write(renderSendResult(r.id, { ...r, phase }, out()));
+    else process.stderr.write(formatError(`delivery to ${r.id} ${phase}`, err()));
     return code;
   } catch (e) {
     printError((e as Error).message, json);
@@ -1811,13 +1929,16 @@ async function remoteRead(client: DaemonClient, args: string[]): Promise<number>
     const res = await client.read(id, { raw: values.raw === true, selection });
     if (res.kind === 'parsed') {
       if (json) printJson(res.turns);
-      else process.stdout.write(`${renderTurns(res.turns)}\n`);
+      else process.stdout.write(`${renderTurns(res.turns, out())}\n`);
       return 0;
     }
     if ('pane' in res) {
       // A pre-actor (v1) daemon: it still answers raw/fallback reads with a pane.
       if (json) printJson({ id: res.id, ...(res.kind === 'fallback' ? { fallback: true } : {}), pane: res.pane });
-      else process.stdout.write(res.pane.endsWith('\n') ? res.pane : `${res.pane}\n`);
+      else {
+        const pane = out().text(res.pane);
+        process.stdout.write(pane.endsWith('\n') ? pane : `${pane}\n`);
+      }
       return 0;
     }
     if (res.kind === 'raw') {
@@ -1829,9 +1950,7 @@ async function remoteRead(client: DaemonClient, args: string[]): Promise<number>
     if (json) {
       printJson({ id: res.id, fallback: true, journal: res.journal });
     } else {
-      process.stderr.write('(no on-disk transcript yet — showing the session journal; --raw for JSONL)\n');
-      const text = renderJournal(res.journal);
-      process.stdout.write(text.length > 0 ? `${text}\n` : '(empty)\n');
+      writeJournalFallback(res.journal);
     }
     return 0;
   } catch (e) {
@@ -1869,7 +1988,7 @@ async function remoteWait(client: DaemonClient, args: string[]): Promise<number>
   try {
     const r = await client.wait(id, { for: forArg, timeoutMs });
     if (json) printJson(r);
-    else process.stdout.write(`${r.state}${r.timedOut ? ' (timed out)' : ''}\n`);
+    else process.stdout.write(`${out().status(r.state)}${r.timedOut ? out().warning(' (timed out)') : ''}\n`);
     return r.timedOut ? 1 : 0;
   } catch (e) {
     printError((e as Error).message, json);
@@ -1897,7 +2016,7 @@ async function remoteState(client: DaemonClient, args: string[]): Promise<number
       });
     } else {
       const note = rec.stopped ? ' (stopped)' : rec.suspended ? ' (suspended)' : '';
-      process.stdout.write(`${rec.state}${note}\n`);
+      process.stdout.write(`${out().status(String(rec.state))}${out().muted(note)}\n`);
     }
     return 0;
   } catch (e) {
@@ -1922,7 +2041,7 @@ async function remoteKill(client: DaemonClient, args: string[]): Promise<number>
   try {
     const r = await client.kill(id, { worktree: values.worktree === true, purge });
     if (json) printJson(r);
-    else process.stdout.write(`${r.purged ? 'purged' : 'killed'} ${r.id}\n`);
+    else process.stdout.write(`${r.purged ? 'purged' : 'killed'} ${out().id(r.id)}\n`);
     return 0;
   } catch (e) {
     printError((e as Error).message, json);
@@ -1959,7 +2078,8 @@ async function remoteAttach(
   if (json) {
     printJson({ id: resolved, host: target.host, command });
   } else {
-    process.stdout.write(`# session ${resolved} lives on ${target.host}; follow it over tailscale:\n${command}\n`);
+    const st = out();
+    process.stdout.write(`${st.muted(`# session ${resolved} lives on ${target.host}; follow it over tailscale:`)}\n${st.command(command)}\n`);
   }
   return 0;
 }
@@ -2034,11 +2154,11 @@ async function remoteWorkflowRun(client: DaemonClient, args: string[]): Promise<
     });
     if (isDetachedWorkflowLaunch(res)) {
       if (json) printJson(res);
-      else process.stdout.write(`${res.runId}\n`);
+      else process.stdout.write(`${out().text(res.runId)}\n`);
       return 0;
     }
     if (json) printJson(res);
-    else process.stdout.write(`${renderRunDetail(res)}\n`);
+    else process.stdout.write(`${renderRunDetail(res, out())}\n`);
     return res.status === 'done' ? 0 : 1;
   } catch (e) {
     printError((e as Error).message, json);
@@ -2052,7 +2172,7 @@ async function remoteWorkflowList(client: DaemonClient, args: string[]): Promise
   try {
     const runs = await client.listRuns();
     if (json) printJson(runs);
-    else process.stdout.write(`${renderRunList(runs)}\n`);
+    else process.stdout.write(`${renderRunList(runs, out())}\n`);
     return 0;
   } catch (e) {
     printError((e as Error).message, json);
@@ -2071,7 +2191,7 @@ async function remoteWorkflowStatus(client: DaemonClient, args: string[]): Promi
   try {
     const run = await client.getRun(runId);
     if (json) printJson(run);
-    else process.stdout.write(`${renderRunDetail(run)}\n`);
+    else process.stdout.write(`${renderRunDetail(run, out())}\n`);
     return 0;
   } catch (e) {
     printError((e as Error).message, json);
@@ -2100,12 +2220,13 @@ async function remoteWorkflowLogs(client: DaemonClient, args: string[]): Promise
       if (json) {
         printJson(res.logs);
       } else {
+        const st = out();
         process.stdout.write(
           `${res.logs
             .map((l) => {
               const body =
-                'journal' in l ? renderJournal(l.journal) : (l as { pane?: string }).pane?.trimEnd() ?? '';
-              return `### step ${l.step} (${l.provider})\n${body || '(no journal — session gone)'}`;
+                'journal' in l ? renderJournal(l.journal, st) : st.text((l as { pane?: string }).pane?.trimEnd() ?? '');
+              return `${stepHeading(l.step, l.provider, st)}\n${body || st.muted('(no journal — session gone)')}`;
             })
             .join('\n\n')}\n`,
         );
@@ -2115,9 +2236,10 @@ async function remoteWorkflowLogs(client: DaemonClient, args: string[]): Promise
     if (json) {
       printJson(res.logs.map((l) => ({ step: l.step, turns: l.turns })));
     } else {
+      const st = out();
       process.stdout.write(
         `${res.logs
-          .map((l) => `### step ${l.step} (${l.provider})\n${renderTurns(l.turns) || '(no transcript on disk yet)'}`)
+          .map((l) => `${stepHeading(l.step, l.provider, st)}\n${renderTurns(l.turns, st) || st.muted('(no transcript on disk yet)')}`)
           .join('\n\n')}\n`,
       );
     }
@@ -2160,7 +2282,8 @@ async function remoteWorkflowAttach(
   if (json) {
     printJson({ runId, host: target.host, command });
   } else {
-    process.stdout.write(`# run ${runId} runs on ${target.host}; follow its runner log over tailscale:\n${command}\n`);
+    const st = out();
+    process.stdout.write(`${st.muted(`# run ${runId} runs on ${target.host}; follow its runner log over tailscale:`)}\n${st.command(command)}\n`);
   }
   return 0;
 }
@@ -2182,12 +2305,12 @@ async function remoteWorkflowResume(client: DaemonClient, args: string[]): Promi
     const res = await client.resumeWorkflow(runId, file ? { file } : undefined);
     if ('status' in res) {
       if (json) printJson(res);
-      else process.stdout.write(`${renderRunDetail(res)}\n`);
+      else process.stdout.write(`${renderRunDetail(res, out())}\n`);
       return res.status === 'done' ? 0 : 1;
     }
     // Detached: { runId, logPath, action }
     if (json) printJson(res);
-    else process.stdout.write(`${res.runId}\n`);
+    else process.stdout.write(`${out().text(res.runId)}\n`);
     return 0;
   } catch (e) {
     printError((e as Error).message, json);
@@ -2214,12 +2337,12 @@ async function remoteWorkflowRetry(client: DaemonClient, args: string[]): Promis
     const res = await client.retryWorkflow(runId, body);
     if (res && typeof res === 'object' && 'runId' in res && !('status' in res)) {
       if (json) printJson(res);
-      else process.stdout.write(`${(res as { runId: string }).runId}\n`);
+      else process.stdout.write(`${out().text((res as { runId: string }).runId)}\n`);
       return 0;
     }
     const run = res as WorkflowRun;
     if (json) printJson(run);
-    else process.stdout.write(`${renderRunDetail(run)}\n`);
+    else process.stdout.write(`${renderRunDetail(run, out())}\n`);
     return run.status === 'done' ? 0 : 1;
   } catch (e) {
     printError((e as Error).message, json);
@@ -2241,7 +2364,7 @@ async function remoteWorkflowCancel(client: DaemonClient, args: string[]): Promi
   try {
     const run = await client.cancelWorkflow(runId, { cascade: values.cascade === true });
     if (json) printJson(run);
-    else process.stdout.write(`${renderRunDetail(run)}\n`);
+    else process.stdout.write(`${renderRunDetail(run, out())}\n`);
     return 0;
   } catch (e) {
     printError((e as Error).message, json);
@@ -2268,8 +2391,9 @@ async function remoteWorkflowCleanup(client: DaemonClient, args: string[]): Prom
     });
     if (json) printJson(result);
     else {
+      const st = out();
       process.stdout.write(
-        `cleaned run ${result.runId}: sessions=${result.sessions.length} worktrees=${result.worktrees.length}\n`,
+        `cleaned run ${st.id(result.runId)}: ${st.label('sessions=')}${result.sessions.length} ${st.label('worktrees=')}${result.worktrees.length}\n`,
       );
     }
     return 0;
@@ -2367,16 +2491,28 @@ async function main(): Promise<number> {
   if (process.argv[2] === '__codex-harness') {
     return (await import('../codex/harness.ts')).runCodexHarnessMain(process.argv.slice(3));
   }
-  // Peel the global `--host <h>` / `--local` (they may precede the subcommand) BEFORE
-  // per-command parsing, which is strict on unknown options.
-  const { host, local: localFlag, rest: argv } = extractHostFlag(process.argv.slice(2));
-  // `--version` / `-V` is answered before settings are loaded or a host is chosen: it
-  // reports THIS binary and never goes remote (not with --host, nor with a default host).
-  if (argv[0] === '--version' || argv[0] === '-V') return cmdVersion(argv.slice(1));
+  // Peel the global `--color[=WHEN]` / `--no-color` and `--host <h>` / `--local` (they may
+  // precede the subcommand) BEFORE per-command parsing, which is strict on unknown options.
+  const colorFlag = extractColorFlag(process.argv.slice(2));
+  const { host, local: localFlag, rest: argv } = extractHostFlag(colorFlag.rest);
   const local = localFlag === true;
   const sub = argv[0];
   const rest = argv.slice(1);
   const command = resolveCommand(sub);
+  setTerminalStyles(
+    terminalStylesFor({
+      mode: colorFlag.color,
+      json: rest.includes('--json'),
+      runner: isRunnerInvocation(command, rest),
+    }),
+  );
+  if (colorFlag.error) {
+    printError(colorFlag.error, rest.includes('--json'));
+    return 1;
+  }
+  // `--version` / `-V` is answered before settings are loaded or a host is chosen: it
+  // reports THIS binary and never goes remote (not with --host, nor with a default host).
+  if (sub === '--version' || sub === '-V') return cmdVersion(rest);
 
   if (!REMOTE_CAPABLE.has(command)) {
     // Host-local: default hosts never apply (nor error); an explicit --host keeps the
@@ -2394,7 +2530,7 @@ async function main(): Promise<number> {
     printError((e as Error).message, json);
     return 1;
   }
-  for (const w of settings.warnings) process.stderr.write(`orc: warning: ${w}\n`);
+  for (const w of settings.warnings) process.stderr.write(`${err().muted('orc:')} ${formatWarning(w, err())}`);
 
   // `list --all-hosts` is the fleet view from here: never redirected by a default host.
   const allHosts = command === 'list' && host === undefined && rest.includes('--all-hosts');
@@ -2408,7 +2544,7 @@ async function main(): Promise<number> {
       return 1;
     case 'remote':
       // stderr even with --json: stdout stays machine-clean.
-      if (!decision.explicit) process.stderr.write(defaultHostNotice(decision.host, decision.from));
+      if (!decision.explicit) process.stderr.write(err().muted(defaultHostNotice(decision.host, decision.from)));
       return cmdRemote(command, decision.host, rest, settings);
     case 'local':
       return runLocal(command, sub, rest, { local, settings });
@@ -2458,10 +2594,10 @@ async function runLocal(
     case 'settings':
       return cmdSettings(rest, { local: ctx.local });
     case 'help':
-      process.stdout.write(HELP_TEXT);
+      process.stdout.write(renderHelp(out()));
       return 0;
     default:
-      process.stderr.write(`unknown command '${sub}'\n\n${HELP_TEXT}`);
+      process.stderr.write(`${err().danger(`unknown command '${sub}'`)}\n\n${renderHelp(err())}`);
       return 1;
   }
 }
@@ -2474,7 +2610,8 @@ if (import.meta.main) {
       process.exit(code);
     })
     .catch((e) => {
-      process.stderr.write(`fatal: ${(e as Error).message}\n`);
+      const st = terminalStyles().err;
+      process.stderr.write(`${st.errorLabel('fatal:')} ${st.text((e as Error).message)}\n`);
       process.exit(1);
     });
 }
