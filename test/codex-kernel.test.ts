@@ -17,7 +17,7 @@ import { ensureSessionDirs } from '../src/runtime/layout.ts';
 import { sessionStatusOf } from '../src/session-status.ts';
 import type { SpawnSpec } from '../src/runtime/types.ts';
 import { cliEntryPath, isLiveProcess } from '../src/runtime/process.ts';
-import { actorPids, entries, liveProcs, waitFor, waitForEntry } from './runtime-helpers.ts';
+import { actorPids, entries, liveProcs, plainCliEnv, waitFor, waitForEntry } from './runtime-helpers.ts';
 import { startFakeOpenAI, type FakeOpenAI } from './fixtures/openai-fake.ts';
 
 const T = 60_000;
@@ -240,7 +240,7 @@ function cliEnv(extra: Record<string, string> = {}): Record<string, string> {
   for (const [k, v] of Object.entries(process.env)) {
     if (v !== undefined && !k.startsWith('ORC_')) env[k] = v;
   }
-  return { ...env, ORC_HOME: orcHome, ...sessionEnv(), ...extra };
+  return plainCliEnv({ ...env, ORC_HOME: orcHome, ...sessionEnv(), ...extra });
 }
 
 async function orc(args: string[], opts: { cwd?: string; stdin?: string } = {}): Promise<{ code: number; out: string; err: string }> {

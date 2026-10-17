@@ -15,6 +15,8 @@ import type { AgentState, Provider, SessionRecord, SessionStatus } from './types
 import { releaseSessionPolicy, wakePolicyHook } from './lineage.ts';
 import { sessionStatusOf } from './session-status.ts';
 import { renderJournalEntry } from './journal-render.ts';
+import { resolveStyle } from './style.ts';
+import type { Style } from './style.ts';
 import { nativeResumeCommand, nativeResumeNote, resolveTranscriptPath } from './provider-cli.ts';
 import {
   SessionStoppedError,
@@ -101,6 +103,11 @@ export interface AttachOptions {
   signal?: AbortSignal;
   /** Output sink (default: process.stdout). */
   write?: (text: string) => void;
+  /**
+   * How to render (default PLAIN: plain text). The CLI passes its stdout style: colour,
+   * and terminal-safe agent text when stdout is a TTY.
+   */
+  style?: Style;
 }
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -503,18 +510,19 @@ export class Session {
    */
   async attach(opts: AttachOptions = {}): Promise<number> {
     const write = opts.write ?? ((t: string) => void process.stdout.write(t));
+    const st = resolveStyle(opts.style);
     if (this.legacy) {
-      write(`# session ${this.id} is a legacy tmux session; nothing to follow\n`);
+      write(`${st.muted(`# session ${this.id} is a legacy tmux session; nothing to follow`)}\n`);
       return 1;
     }
     if (!hasSpawnSpec(this.sessionId)) {
-      write(`# session ${this.id} has no runtime state\n`);
+      write(`${st.muted(`# session ${this.id} has no runtime state`)}\n`);
       return 1;
     }
     const cursor = JournalCursor.forSession(this.sessionId);
     const flush = () => {
       for (const e of cursor.readNew()) {
-        const line = renderJournalEntry(e);
+        const line = renderJournalEntry(e, st);
         if (line !== null) write(`${line}\n`);
       }
     };
@@ -523,7 +531,7 @@ export class Session {
       if (!leaseLive(readActorState(this.sessionId))) {
         flush();
         const d = await this.stateDetail();
-        write(`# session ${this.id} ${d.stopped ? 'stopped' : 'suspended'}\n`);
+        write(`${st.muted(`# session ${this.id} ${d.stopped ? 'stopped' : 'suspended'}`)}\n`);
         return 0;
       }
       await new Promise<void>((resolve) => {

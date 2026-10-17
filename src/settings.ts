@@ -34,6 +34,8 @@ import { globalSettingsPath } from './paths.ts';
 import { DEFAULT_DAEMON_PORT, normalizeHost } from './daemon/peers.ts';
 import type { PeerEntry } from './daemon/peers.ts';
 import { parseHostArg } from './daemon/client.ts';
+import { resolveStyle } from './style.ts';
+import type { Style } from './style.ts';
 
 export const ORC_HOST_ENV = 'ORC_HOST';
 /** A project-local settings file, relative to the directory it applies to. */
@@ -537,24 +539,31 @@ export function settingsView(
   };
 }
 
-function viewLine(label: string, v: SettingView): string {
-  const value = v.value ?? '-';
+function viewLine(label: string, v: SettingView, st: Style): string {
+  const value = v.value == null ? st.muted('-'.padEnd(16)) : st.text(v.value).padEnd(16);
   const origin = v.from ? `${v.source}: ${v.from}` : v.source;
   const note = v.note ? ` — ${v.note}` : '';
-  return `${label.padEnd(14)}${value.padEnd(16)} (${origin})${note}`;
+  // A refused/invalid host is the one note that needs attention; the rest is commentary.
+  const noteStyled = /^(refused|invalid)\b/.test(v.note ?? '') ? st.warning(note) : st.muted(note);
+  return `${st.label(label.padEnd(14))}${value}${st.muted(` (${origin})`)}${noteStyled}`;
 }
 
-/** Human rendering of `orc settings`. */
-export function renderSettingsView(view: SettingsView): string {
+/** Human rendering of `orc settings` (`style`: default PLAIN, plain text). */
+export function renderSettingsView(view: SettingsView, style?: Style): string {
+  const st = resolveStyle(style);
+  const search = view.root ? `${view.cwd} → ${view.root}` : `${view.cwd} only (not in a git repo)`;
   const lines = [
-    viewLine('host', view.host),
-    viewLine('provider', view.provider),
-    ...SETTINGS_PROVIDERS.map((p) => viewLine(`models.${p}`, view.models[p])),
+    viewLine('host', view.host, st),
+    viewLine('provider', view.provider, st),
+    ...SETTINGS_PROVIDERS.map((p) => viewLine(`models.${p}`, view.models[p], st)),
     '',
-    `files (nearest first; local search ${view.root ? `${view.cwd} → ${view.root}` : `${view.cwd} only (not in a git repo)`}):`,
-    ...view.files.map((f) => `  ${f.scope.padEnd(7)}${f.status.padEnd(15)}${f.path}`),
+    `${st.heading('files')}${st.muted(` (nearest first; local search ${search})`)}${st.heading(':')}`,
+    ...view.files.map(
+      (f) =>
+        `  ${st.label(f.scope.padEnd(7))}${st.tone(f.status, f.status.padEnd(15))}${f.status === 'used' ? st.text(f.path) : st.muted(f.path)}`,
+    ),
   ];
-  if (view.nested) lines.push('', 'inside an orc session: default hosts (ORC_HOST, settings host) are ignored');
-  if (view.warnings.length > 0) lines.push('', 'warnings:', ...view.warnings.map((w) => `  ${w}`));
+  if (view.nested) lines.push('', st.warning('inside an orc session: default hosts (ORC_HOST, settings host) are ignored'));
+  if (view.warnings.length > 0) lines.push('', st.warningLabel('warnings:'), ...view.warnings.map((w) => `  ${st.warning(w)}`));
   return lines.join('\n');
 }

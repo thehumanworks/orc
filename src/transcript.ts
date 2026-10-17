@@ -6,6 +6,8 @@
  * journal is the `--raw` escape hatch).
  */
 import type { Provider } from './types.ts';
+import { resolveStyle } from './style.ts';
+import type { Attr, Style } from './style.ts';
 
 export type TurnRole = 'user' | 'assistant' | 'tool' | 'system';
 
@@ -268,12 +270,25 @@ export function selectTurns(
   return groups[index]!.slice();
 }
 
+/** Role-label attributes when colour is on (tool lines are dim as a whole). */
+const ROLE_ATTRS: ReadonlyMap<string, Attr[]> = new Map<string, Attr[]>([
+  ['user', ['bold', 'cyan']],
+  ['assistant', ['bold', 'magenta']],
+  ['system', ['dim', 'italic']],
+]);
+
 /**
  * Render turns as compact text: `<user> …` / `<assistant> …` for conversation, and
- * an indented `  [<summary>]` for tool turns.
+ * an indented `  [<summary>]` for tool turns. `style` (default PLAIN: plain text, as the
+ * SDK returns it) colours role labels and dims tool lines.
  */
-export function renderTurns(turns: Turn[]): string {
+export function renderTurns(turns: Turn[], style?: Style): string {
+  const st = resolveStyle(style);
   return turns
-    .map((t) => (t.role === 'tool' ? `  [${t.text}]` : `<${t.role}> ${t.text}`))
+    .map((t) =>
+      t.role === 'tool'
+        ? st.muted(`  [${t.text}]`)
+        : `${st.paint(`<${t.role}>`, ...(ROLE_ATTRS.get(t.role) ?? []))} ${st.text(t.text)}`,
+    )
     .join('\n');
 }

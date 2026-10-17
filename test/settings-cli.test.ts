@@ -13,7 +13,7 @@ import { FAKE_PROVIDER_ENV } from '../src/agent.ts';
 import { readRegistry } from '../src/registry.ts';
 import { readRun } from '../src/runs.ts';
 import { WORKFLOW_ROOTS_ENV } from '../src/workflow.ts';
-import { killSessionProcesses, mkTmp } from './runtime-helpers.ts';
+import { killSessionProcesses, mkTmp, plainCliEnv } from './runtime-helpers.ts';
 
 const CLI = path.join(import.meta.dir, '..', 'src', 'cli', 'index.ts');
 const T = 60_000;
@@ -86,7 +86,7 @@ async function orc(
 ): Promise<{ code: number; out: string; err: string }> {
   const proc = Bun.spawn([process.execPath, CLI, ...args], {
     cwd: c.cwd,
-    env: { ...cleanEnv(), ORC_HOME: c.home, ORC_DAEMON_SECRET: 's3cret', [FAKE_PROVIDER_ENV]: '1', ...extraEnv },
+    env: plainCliEnv({ ...cleanEnv(), ORC_HOME: c.home, ORC_DAEMON_SECRET: 's3cret', [FAKE_PROVIDER_ENV]: '1', ...extraEnv }),
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',
