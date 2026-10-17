@@ -142,7 +142,10 @@ orc --version [--json]                              This binary's version (alias
 orc --color[=WHEN] <command>                        auto (default) | always | never; --no-color = never
 ```
 
-`orc help` prints the full reference. A session is addressed by short id, full session id,
+`orc help` prints the full reference. Add `--help` (or `-h`) to a command or subcommand
+for focused help, for example `orc spawn --help` or `orc workflow run --help`. Help is
+shown locally without connecting to a daemon or loading project settings.
+A session is addressed by short id, full session id,
 `@alias` (current workspace) or `@workspace:alias`.
 
 Output to a terminal is coloured. A status word has the same colour everywhere (running

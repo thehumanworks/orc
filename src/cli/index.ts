@@ -79,6 +79,7 @@ import {
 import type { SessionView, HostSessionView, TerminalStyles } from './output.ts';
 import { COLOR_MODES, createStyle, decideColor } from '../style.ts';
 import type { ColorMode, Style } from '../style.ts';
+import { commandHelp, helpRequested, helpSubcommand } from './help.ts';
 
 type ArgvOptions = NonNullable<ParseArgsConfig['options']>;
 
@@ -2561,6 +2562,20 @@ async function main(): Promise<number> {
   // `--version` / `-V` is answered before settings are loaded or a host is chosen: it
   // reports THIS binary and never goes remote (not with --host, nor with a default host).
   if (sub === '--version' || sub === '-V') return cmdVersion(rest);
+
+  // Help describes this CLI, even when the daemon is offline or settings are invalid.
+  // Do this before routing, parsing required arguments, or invoking command effects.
+  if (command === 'help') {
+    process.stdout.write(renderHelp(out()));
+    return 0;
+  }
+  if (helpRequested(rest)) {
+    const text = commandHelp(command, helpSubcommand(command, rest));
+    if (text !== null) {
+      process.stdout.write(renderHelp(out(), text));
+      return 0;
+    }
+  }
 
   if (!REMOTE_CAPABLE.has(command)) {
     // Host-local: default hosts never apply (nor error); an explicit --host keeps the

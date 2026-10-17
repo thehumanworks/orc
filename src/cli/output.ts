@@ -659,14 +659,14 @@ const HELP_COMMAND_RE = /^( {2})(orc(?: {1,2}[a-z][a-z-]*)*)/;
 const HELP_TOKEN_RE = /(^|[^\w-])(--?[a-z][a-z0-9-]*)|(<[^<>\s]+>)/g;
 
 /**
- * HELP_TEXT styled at print time (HELP_TEXT itself stays plain): headings bold, command
+ * Help styled at print time (defaults to HELP_TEXT): headings bold, command
  * names bold cyan, flags cyan, placeholders italic. Only SGR codes are added, so the
  * text is unchanged once they are stripped. PLAIN (the default) returns HELP_TEXT as is.
  */
-export function renderHelp(style?: Style): string {
+export function renderHelp(style?: Style, text = HELP_TEXT): string {
   const st = resolveStyle(style);
-  if (!st.color) return HELP_TEXT;
-  return HELP_TEXT.split('\n')
+  if (!st.color) return text;
+  return text.split('\n')
     .map((line, i) => {
       if (i === 0 || HELP_HEADING_RE.test(line)) return sgr(line, ['bold']);
       const cmd = HELP_COMMAND_RE.exec(line);
