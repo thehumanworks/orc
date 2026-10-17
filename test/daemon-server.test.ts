@@ -61,6 +61,14 @@ describe('daemon over a live loopback socket', () => {
     expect(await res.json()).toEqual({ ok: true, version: 'test', host: 'testhost', api: 2 });
   });
 
+  test('GET /health defaults to the package.json version', async () => {
+    const s = serveDaemon({ hostname: '127.0.0.1', port: 0, secret: null, allowlist: [], whois: async () => null, hostName: 'testhost' });
+    servers.push(s);
+    const pkg = JSON.parse(await fs.readFile(path.join(import.meta.dir, '..', 'package.json'), 'utf8')) as { version: string };
+    const res = await fetch(url(s, '/health'));
+    expect(await res.json()).toEqual({ ok: true, version: pkg.version, host: 'testhost', api: 2 });
+  });
+
   test('a gated route with NO secret and NO identity → 401 (fail closed)', async () => {
     const s = start({ secret: 'topsecret', allowlist: ['mini'], whois: async () => null });
     const res = await fetch(url(s, '/sessions'));

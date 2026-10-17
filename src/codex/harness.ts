@@ -26,7 +26,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import pkg from '../../package.json';
+import { VERSION } from '../version.ts';
 import {
   createModels,
   InMemoryCredentialStore,
@@ -63,7 +63,7 @@ const SHUTDOWN_SETTLE_MS = 5_000;
 const THINKING_LEVELS: readonly ThinkingLevel[] = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
 
 export function harnessUserAgent(): string {
-  return `orc/${pkg.version} (codex-harness; pi-ai ${PI_AI_VERSION}; ${os.platform()} ${os.release()}; ${os.arch()})`;
+  return `orc/${VERSION} (codex-harness; pi-ai ${PI_AI_VERSION}; ${os.platform()} ${os.release()}; ${os.arch()})`;
 }
 
 /** The harness's built-in system prompt (used alone, or before an `append` file). */
@@ -249,7 +249,7 @@ export class CodexHarness {
       transcriptPath: sessionFile,
       info: {
         harness: 'orc-codex',
-        version: String(pkg.version),
+        version: VERSION,
         piAi: PI_AI_VERSION,
         mode: resume ? 'resume' : 'fresh',
         model: built.model.id,

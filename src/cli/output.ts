@@ -284,6 +284,7 @@ Usage:
   orc logout chatgpt                                  Remove orc's ChatGPT credential
   orc settings [--json]                               Effective settings (ORC_HOST, settings.toml) and their sources
   orc help                                            This help
+  orc --version [--json]                              This binary's version (alias: -V; never remote)
 
 spawn options:
   --provider, -p <p>     claude | codex | pi (required unless settings.toml sets \`provider\`)

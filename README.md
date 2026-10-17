@@ -32,6 +32,27 @@ tmux is **not** used.
 
 ## Install
 
+**Prebuilt binary** (no Bun needed): each [GitHub release](https://github.com/thehumanworks/orc/releases)
+attaches single-file executables built with `bun build --compile` (`orc-darwin-arm64`,
+`orc-darwin-x64`, `orc-linux-x64`, `orc-linux-arm64`; the Linux ones need glibc), a `SHA256SUMS`
+file and a build-provenance attestation.
+
+```sh
+TAG=v0.1.0 ASSET=orc-darwin-arm64          # orc-<darwin|linux>-<arm64|x64>
+gh release download "$TAG" --repo thehumanworks/orc --pattern "$ASSET" --pattern SHA256SUMS
+grep " $ASSET\$" SHA256SUMS | shasum -a 256 -c -          # orc-darwin-arm64: OK
+gh attestation verify "$ASSET" --repo thehumanworks/orc   # built by this repo's release workflow
+chmod +x "$ASSET" && mv "$ASSET" ~/.local/bin/orc
+orc --version                                             # orc 0.1.0
+```
+
+With every binary downloaded next to it, `shasum -a 256 -c SHA256SUMS` checks them all. On macOS,
+a binary downloaded with a browser is quarantined and Gatekeeper refuses to start it: clear the
+flag with `xattr -d com.apple.quarantine ~/.local/bin/orc` (`gh` and `curl` downloads are not
+quarantined).
+
+**From source** (Bun ≥ 1.3):
+
 ```sh
 bun install
 bun link                                 # `orc` on PATH, runs from source
@@ -111,6 +132,7 @@ orc logout chatgpt                                  Remove orc's ChatGPT credent
 orc settings [--json]                               Effective settings and where each value comes from
 orc --host <h> <command>                            Run a command against a peer's daemon
 orc --local <command>                               Run here, ignoring ORC_HOST / settings `host`
+orc --version [--json]                              This binary's version (alias: -V)
 ```
 
 `orc help` prints the full reference. A session is addressed by short id, full session id,
@@ -543,6 +565,26 @@ Dogfooding: `bun scripts/dogfood/run.ts spawn <task.md> [provider]` starts an im
 worktree of this repo; `bun scripts/dogfood/run.ts watch <id>` supervises it until it reports
 `DOGFOOD_COMPLETE` (with a commit), `DOGFOOD_BLOCKED: …`, or yields (example specs in
 `scripts/dogfood/tasks/`).
+
+### CI & releases
+
+`.github/workflows/ci.yml` runs on every pull request and push to `main`: typecheck + `bun test`
+on Linux and macOS, and `build.yml`, which compiles `orc-<os>-<arch>` with Bun 1.4.2 natively on
+four runners (linux/darwin × x64/arm64), smoke-tests each binary on the runner that built it
+(`--version` matches `package.json`, `--help`, the codex harness self-test, no `.env` /
+`bunfig.toml` autoload from the cwd) and uploads it as a workflow artifact. `compile:cli`,
+`install:cli` and `check:compile` build with the same flags.
+
+To cut a release, bump `version` in `package.json`, merge to `main`, then tag that commit:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0   # must be v<package.json version>
+```
+
+`release.yml` checks the tag against `package.json`, builds and smoke-tests the four binaries,
+writes `SHA256SUMS`, attests build provenance and publishes the GitHub release with generated
+notes and every asset (a tag with a `-`, e.g. `v0.2.0-rc.1`, is marked pre-release). If the run
+fails before publishing, re-run it from the Actions tab or with `gh workflow run release.yml --ref v0.2.0`.
 
 ## Upgrading from the tmux runtime
 
