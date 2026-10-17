@@ -88,18 +88,23 @@ describe('colour off is byte-identical to the renderers before styling (main @ 1
     expect(renderCapture(fx.journal)).toBe(g('capture'));
   });
 
-  test('HELP_TEXT = the old help plus only the three --color/--no-color lines', () => {
+  test('HELP_TEXT = the old help plus only the three --color/--no-color lines (and --version)', () => {
     const added = [
       '  --color[=WHEN]        colour: auto (default: only when writing to a terminal) | always | never',
       '  --no-color            same as --color=never. NO_COLOR=1 also disables colour, FORCE_COLOR=1',
       '                        forces it (the flags win); --json output is never coloured',
     ];
+    // Added by the `orc --version` change (test/version.test.ts covers it), not by colour.
+    const versionLine =
+      "  orc --version [--json]                              This binary's version (alias: -V; never remote)";
     const lines = HELP_TEXT.split('\n');
     const at = lines.indexOf(added[0]!);
     expect(at).toBeGreaterThan(0);
     expect(lines[at - 1]).toBe('  --json                machine-readable output; non-zero exit + {error} on failure');
     expect(lines.slice(at, at + 3)).toEqual(added);
-    expect([...lines.slice(0, at), ...lines.slice(at + 3)].join('\n')).toBe(g('help'));
+    expect(lines.filter((l) => l === versionLine)).toHaveLength(1);
+    const rest = [...lines.slice(0, at), ...lines.slice(at + 3)].filter((l) => l !== versionLine);
+    expect(rest.join('\n')).toBe(g('help'));
   });
 });
 
