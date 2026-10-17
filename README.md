@@ -32,8 +32,8 @@ tmux is **not** used.
 
 ## Install
 
-**Prebuilt binary** (no Bun needed): each [GitHub release](https://github.com/thehumanworks/orc/releases)
-attaches single-file executables built with `bun build --compile` (`orc-darwin-arm64`,
+**Prebuilt binary** (no Bun needed; from the first tagged release on): each
+[GitHub release](https://github.com/thehumanworks/orc/releases) attaches single-file executables built with `bun build --compile` (`orc-darwin-arm64`,
 `orc-darwin-x64`, `orc-linux-x64`, `orc-linux-arm64`; the Linux ones need glibc), a `SHA256SUMS`
 file and a build-provenance attestation. The x64 binaries embed Bun's default (non-baseline) x64
 runtime, so they need a CPU with AVX2 (Intel Haswell / AMD Excavator or newer).
@@ -62,8 +62,8 @@ bun run install:cli                      # or: compile a standalone binary to ~/
 bun run src/cli/index.ts <command> ...   # or: run it directly
 ```
 
-**With Nix** (Linux, Apple-silicon macOS): `nix run github:thehumanworks/orc -- --version`, or
-`nix build` in a checkout; see [Nix](#nix).
+**With Nix** (Linux, Apple-silicon macOS): `nix run github:thehumanworks/orc -- --version` (once
+the flake is on `main`), or `nix build` in a checkout; see [Nix](#nix).
 
 ## Quick start
 
@@ -738,7 +738,9 @@ nix fmt                   # nixfmt (RFC style) on the .nix files
 `flake.lock` pins nixpkgs; the only network access is a fixed-output `bun install --frozen-lockfile`
 of `bun.lock` (the same `node_modules` as a plain `bun install`), whose hash is in
 `nix/hashes.json`. The binary embeds nixpkgs' bun (on x86_64-linux its baseline build), so it is
-not byte-identical to a release binary. `overlays.default` adds `pkgs.orc`.
+not byte-identical to a release binary. `overlays.default` adds `pkgs.orc`. Nix takes bun from the
+locked nixpkgs while CI uses `.bun-version`; both are 1.4.2 today, but nothing ties them together,
+so after a `nix flake update` that moves bun, bump `.bun-version` to match (or pin it back).
 
 **When `bun.lock` changes** (or a `nix flake update` brings a bun that installs differently), Nix
 builds fail with `hash mismatch in fixed-output derivation` until the hash is refreshed. One hash

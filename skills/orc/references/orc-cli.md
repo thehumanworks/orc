@@ -10,6 +10,11 @@ Conventions:
   error): `orc help` (or `orc --help`, `-h`) prints the whole reference.
 - Errors: exit 1; with `--json` the error is `{"error": "..."}` on **stdout** (option-parse
   errors too), otherwise `error: ...` on stderr (`fatal: ...` for an option-parse error).
+- Global flags (before or after the subcommand): `--host <h>` / `--local` (see Settings) and
+  `--color[=auto|always|never]` / `--no-color` (human output only; colour is on only for a TTY,
+  `NO_COLOR` / `FORCE_COLOR` apply, `--json` is never coloured, and the colour flags are not read
+  after a literal `--`). `orc --version [--json]` (alias `-V`) prints this binary's version and
+  never goes remote.
 - A session is addressed by short id, full session id, `@alias` (current workspace) or
   `@workspace:alias`. Aliases resolve only to active (running or suspended) sessions; use the id
   for dead ones.
