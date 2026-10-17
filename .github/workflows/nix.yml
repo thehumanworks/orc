@@ -1,0 +1,66 @@
+# Pull requests and pushes to main: the Nix flake, natively on Linux x64/arm64 and macOS arm64
+# (nixpkgs has no x86_64-darwin). `nix flake check` builds orc, a smoke test of the binary in
+# the build sandbox and the typecheck; then `nix build`, the binary from ./result and the dev
+# shell. Additive: ci.yml and build.yml remain the Bun build and the release binaries.
+name: nix
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  flake:
+    name: flake (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+
+      - name: Flake check
+        run: nix flake check -L 2>&1 | tee -a "$RUNNER_TEMP/nix.log"
+
+      - name: Build
+        run: nix build -L 2>&1 | tee -a "$RUNNER_TEMP/nix.log"
+
+      - name: Run the binary
+        run: |
+          want="orc $(jq -r .version package.json)"
+          got="$(./result/bin/orc --version)"
+          echo "--version: $got"
+          [ "$got" = "$want" ] || { echo "::error title=nix build::--version printed '$got', want '$want'"; exit 1; }
+          ./result/bin/orc __codex-harness --self-test
+
+      - name: Dev shell
+        run: nix develop -c bun --version
+
+      # bun.lock changed but nix/hashes.json did not: say how to fix it.
+      - name: Explain a stale dependencies hash
+        if: failure()
+        run: |
+          got="$(sed -n "/hash mismatch in fixed-output derivation '.*-orc-node-modules-/,/got:/s|.*got: *\(sha256-[A-Za-z0-9+/=]*\).*|\1|p" "$RUNNER_TEMP/nix.log" 2>/dev/null | tail -n 1)"
+          if [ -n "$got" ]; then
+            echo "::error file=nix/hashes.json,title=stale npm dependencies hash::bun.lock changed, so nix/hashes.json is stale. Run 'nix run .#update-deps-hash' and commit nix/hashes.json (or set node_modules to $got)."
+          fi
