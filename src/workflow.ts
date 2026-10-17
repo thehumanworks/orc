@@ -17,6 +17,7 @@ import {
   isLeaseLive,
   writeRunOwned,
   readRun,
+  listRuns,
   updateRun,
   projectStepsFromAttempts as projectRunSteps,
   WORKFLOW_SCHEMA_VERSION,
@@ -29,7 +30,7 @@ import { assertValidRunId, runInstructionsDir, runResultPath, runAttemptDir } fr
 import { ensurePrivateDir, writePrivateFile } from './private-fs.ts';
 import { isSameProcessAlive } from './runtime/process.ts';
 import type { Turn } from './transcript.ts';
-import type { AgentState, ExecutionPolicy, Provider } from './types.ts';
+import type { AgentState, ExecutionPolicy, Provider, SessionRecord } from './types.ts';
 import { ORC_ENV } from './types.ts';
 import type { WaitForResult } from './session.ts';
 import type { DeliveryPhase, SendResult } from './messages.ts';
@@ -75,6 +76,7 @@ import { collectDeclaredOutputs, materializeStepInputs, ensureArtifactDirs, refF
 import type { ResultEnvelope } from './result-envelope.ts';
 import { readResultEnvelope } from './result-envelope.ts';
 import { isPathInsideRoot as isPathInsideRootImpl } from './workflow-path.ts';
+import { evaluateWorkflowModule, type WorkflowContext } from './workflow-loader.ts';
 import {
   buildNormalizedGraph,
   deriveSchedulerState,
@@ -178,6 +180,8 @@ export interface StepDoneCtx {
 
 export interface WorkflowDef {
   name: string;
+  /** Preserve failed-run sessions for inspection instead of stopping them. Default false. */
+  keepSessionsOnError?: boolean;
   steps: WorkflowStep[];
   policy?: ExecutionPolicy;
   /**
@@ -244,6 +248,8 @@ export type WorkflowEvent =
 
 export type StepExecutor = (args: {
   step: WorkflowStep;
+  /** Verified artifact files materialized for this consumer, by local input name. */
+  inputPaths?: Record<string, string>;
   runId: string;
   emit: (e: WorkflowEvent) => void;
   lineage?: {
@@ -284,6 +290,10 @@ export type AdoptionProbe = (
 ) => Promise<{ sessionAlive: boolean | null; verdict?: DeliveryVerdict; takenOver?: boolean }>;
 
 export interface RunWorkflowOptions {
+  /** Workflow input recorded for recovery. */
+  prompt?: string;
+  /** Overrides the definition on first launch; recovery uses the recorded policy. */
+  keepSessionsOnError?: boolean;
   onEvent?: (e: WorkflowEvent) => void;
   execStep?: StepExecutor;
   /** Adoption of in-flight attempts on resume/retry (D10). Injectable for tests. */
@@ -357,6 +367,9 @@ export function validateWorkflowDef(def: WorkflowDef): void {
     throw new Error(`workflow '${def.name}': \`steps\` must be a non-empty array`);
   }
   if (def.policy !== undefined) normalizePolicy(def.policy);
+  if (def.keepSessionsOnError !== undefined && typeof def.keepSessionsOnError !== 'boolean') {
+    throw new Error(`workflow '${def.name}': keepSessionsOnError must be a boolean`);
+  }
   if (def.maxConcurrency !== undefined) {
     try {
       normalizeMaxConcurrency(def.maxConcurrency, 'maxConcurrency');
@@ -426,6 +439,7 @@ export function buildPlan(def: WorkflowDef): WorkflowPlan {
     name: def.name,
     // Always persist normalized concurrency so resume/retry keep scheduling semantics.
     maxConcurrency,
+    ...(def.keepSessionsOnError !== undefined ? { keepSessionsOnError: def.keepSessionsOnError } : {}),
     steps: def.steps.map((s) => {
       const p: PlanStep = { id: s.id, provider: s.provider };
       if (s.alias !== undefined) p.alias = s.alias;
@@ -477,7 +491,11 @@ export function canonicalPlanJson(plan: WorkflowPlan): string {
     return o;
   });
   const maxConcurrency = normalizeMaxConcurrency(plan.maxConcurrency ?? 1);
-  return JSON.stringify({ name: plan.name, maxConcurrency, steps });
+  return JSON.stringify({
+    name: plan.name, maxConcurrency,
+    ...(plan.keepSessionsOnError !== undefined ? { keepSessionsOnError: plan.keepSessionsOnError } : {}),
+    steps,
+  });
 }
 
 export function planDigest(plan: WorkflowPlan): string {
@@ -534,9 +552,44 @@ export function interpolate(template: string, resultsById: Record<string, StepRe
   });
 }
 
-function resolveStep(step: WorkflowStep, resultsById: Record<string, StepResult>): WorkflowStep {
-  const subst = (s: string | undefined) => (s === undefined ? undefined : interpolate(s, resultsById));
+function resolveStep(
+  step: WorkflowStep,
+  resultsById: Record<string, StepResult>,
+  inputPaths: Record<string, string>,
+): WorkflowStep {
+  const subst = (s: string | undefined) => s === undefined ? undefined :
+    interpolate(s.replace(/\$\{inputs\.([A-Za-z0-9_.-]+)\}/g, (whole, name: string) => {
+      if (!Object.hasOwn(inputPaths, name)) {
+        // A workflow could already have a producer whose literal id is "inputs".
+        if (Object.hasOwn(resultsById, 'inputs')) return whole;
+        throw new Error(`step '${step.id}': unknown artifact input '${name}' in '${whole}'`);
+      }
+      return inputPaths[name]!;
+    }), resultsById);
   return { ...step, cwd: subst(step.cwd), prompt: subst(step.prompt), taskFile: subst(step.taskFile) };
+}
+
+async function resolveStepInputs(
+  step: WorkflowStep,
+  runId: string,
+  resultsById: Record<string, StepResult>,
+): Promise<Record<string, string>> {
+  return materializeStepInputs({
+    runId,
+    stepId: step.id,
+    inputs: step.inputs ?? [],
+    resolve: (fromStep, name) => {
+      const ref = resultsById[fromStep]?.artifacts?.[name];
+      if (!ref) return undefined;
+      return {
+        ...ref,
+        digest: ref.digest ?? ref.sha256,
+        byteSize: ref.bytes,
+        stepId: ref.stepId ?? fromStep,
+        attemptId: ref.attemptId ?? '',
+      };
+    },
+  });
 }
 
 export function evaluateStep(
@@ -668,9 +721,13 @@ export async function deliverInstructions(
   session: Pick<Session, 'send'>,
   step: WorkflowStep,
   runId: string,
-  opts?: { messageId?: string },
+  opts?: { messageId?: string; inputPaths?: Record<string, string> },
 ): Promise<SendResult> {
   const sendOpts = opts?.messageId ? { messageId: opts.messageId } : undefined;
+  const entries = Object.entries(opts?.inputPaths ?? {});
+  const inputContext = entries.length === 0 ? '' :
+    '\n\nArtifact inputs (absolute file paths):\n' +
+    entries.map(([name, file]) => `${name}: ${file}`).join('\n');
   if (step.taskFile) {
     const resolved = path.isAbsolute(step.taskFile)
       ? step.taskFile
@@ -680,11 +737,11 @@ export async function deliverInstructions(
     const dropped = await dropInstructionFile(runId, step.id, await f.text());
     return session.send(
       `Your task is fully specified in this file: ${dropped}\n` +
-        `Read it in full first, then carry it out exactly, end to end. Begin now.`,
+        `Read it in full first, then carry it out exactly, end to end. Begin now.${inputContext}`,
       sendOpts,
     );
   }
-  const prompt = step.prompt ?? '';
+  const prompt = (step.prompt ?? '') + inputContext;
   if (Buffer.byteLength(prompt, 'utf8') > LARGE_PROMPT_BYTES) {
     const dropped = await dropInstructionFile(runId, step.id, prompt);
     return session.send(
@@ -897,6 +954,7 @@ export async function finalizeStepOutcome(args: FinalizeStepArgs): Promise<{
 
 const defaultExecStep: StepExecutor = async ({
   step,
+  inputPaths,
   runId,
   lineage,
   transition,
@@ -969,7 +1027,7 @@ const defaultExecStep: StepExecutor = async ({
   const messageId = instructionMessageId(runId, step.id, attemptId);
   let sent: SendResult;
   try {
-    sent = await deliverInstructions(session, step, runId, { messageId });
+    sent = await deliverInstructions(session, step, runId, { messageId, inputPaths });
     if (sent.phase === 'failed') throw new Error(`step '${step.id}': instructions were rejected by the provider`);
   } catch (e) {
     await transition?.('failed', {
@@ -1143,8 +1201,15 @@ async function superviseStep(a: SuperviseArgs): Promise<StepResult> {
       for (const m of collected) {
         artifactMap[m.name] = refFromManifest(m);
       }
-    } catch {
+    } catch (cause) {
+      const error = `artifact collection failed: ${cause instanceof Error ? cause.message : String(cause)}`;
+      emit({ type: 'step-error', runId, stepId: step.id, error });
+      const observation: VerifierObservation = {
+        kind: 'artifact', type: 'artifact', passed: false, ok: false,
+        summary: error, message: error,
+      };
       return {
+        observations: [observation],
         id: step.id,
         sessionId: session.id,
         provider: step.provider,
@@ -1340,6 +1405,7 @@ async function runWorkflowOwned(
   // Merge CLI/daemon maxConcurrency override into the def before validation/plan.
   const defWithConc: WorkflowDef = {
     ...def,
+    keepSessionsOnError: opts.keepSessionsOnError ?? def.keepSessionsOnError,
     maxConcurrency:
       opts.maxConcurrency !== undefined
         ? normalizeMaxConcurrency(opts.maxConcurrency, 'maxConcurrency')
@@ -1398,6 +1464,7 @@ async function runWorkflowOwned(
     revision: existing?.revision ?? 0,
     id: runId,
     name: existing?.name ?? defWithConc.name,
+    ...((existing?.prompt ?? opts.prompt) !== undefined ? { prompt: existing?.prompt ?? opts.prompt } : {}),
     startedAt,
     status: 'running',
     finishedAt: undefined,
@@ -1693,8 +1760,7 @@ async function runWorkflowOwned(
       }
     }
 
-    const step = resolveStep(rawStep, resultsById);
-    emit({ type: 'step-start', runId, stepId: step.id, provider: step.provider });
+    emit({ type: 'step-start', runId, stepId: rawStep.id, provider: rawStep.provider });
 
     let attempt = createAttempt({
       stepId: rawStep.id,
@@ -1715,14 +1781,17 @@ async function runWorkflowOwned(
       await safeWriteOwned();
     });
 
-    await runAttempt(rawStep, attempt, (transition) =>
-      execStep({
+    await runAttempt(rawStep, attempt, async (transition) => {
+      const inputPaths = await resolveStepInputs(rawStep, runId, resultsById);
+      const step = resolveStep(rawStep, resultsById, inputPaths);
+      return execStep({
         step,
+        inputPaths,
         runId,
         emit,
         lineage: {
           rootRunId,
-          parentRunId: parentRunId ?? runId,
+          parentRunId: runId,
           stepId: step.id,
           depth: depth + 1,
           owner: ownerId,
@@ -1732,8 +1801,8 @@ async function runWorkflowOwned(
         transition,
         attempt,
         ...(defaultModels?.[step.provider] ? { model: defaultModels[step.provider] } : {}),
-      }),
-    );
+      });
+    });
   };
 
   /**
@@ -1938,10 +2007,11 @@ async function runWorkflowOwned(
         stepId: a.stepId,
         sessionId: a.sessionId ?? '',
       });
-      const step = resolveStep(rawStep, resultsById);
-      const promise = runAttempt(rawStep, a, (transition) =>
-        adoptStep({ step, runId, emit, attempt: a, transition }),
-      ).finally(() => {
+      const promise = runAttempt(rawStep, a, async (transition) => {
+        const inputPaths = await resolveStepInputs(rawStep, runId, resultsById);
+        const step = resolveStep(rawStep, resultsById, inputPaths);
+        return adoptStep({ step, runId, emit, attempt: a, transition });
+      }).finally(() => {
         inFlight.delete(a.stepId);
       });
       inFlight.set(a.stepId, { stepId: a.stepId, attemptId: a.attemptId, promise });
@@ -2061,8 +2131,21 @@ async function runWorkflowOwned(
     const latest = latestAttemptForStep(run.attempts, id);
     return r?.ok === true || latest?.phase === 'succeeded';
   });
-  run.status = allSucceeded ? 'done' : 'failed';
-  if (opts.resume && defWithConc.steps.every((s) => resultsById[s.id]?.ok)) run.status = 'done';
+  const finalStatus = allSucceeded || (opts.resume && defWithConc.steps.every((s) => resultsById[s.id]?.ok))
+    ? 'done' : 'failed';
+  // Keep the ownership lease active through cleanup. Publishing 'failed' first
+  // would let a retry launch new sessions while this invocation is still stopping them.
+  if (finalStatus === 'failed' && run.plan?.keepSessionsOnError !== true) {
+    try {
+      await cleanupFailedWorkflow(run);
+    } catch (error) {
+      emit({
+        type: 'step-warn', runId, stepId: 'cleanup',
+        message: `failed-run session cleanup: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
+  }
+  run.status = finalStatus;
   run.finishedAt = now();
   stopHeartbeat();
   await persistChain;
@@ -2216,12 +2299,14 @@ export interface CleanupOptions {
   killSession?: (sessionId: string, removeWorktree: boolean) => Promise<void>;
 }
 
-export async function loadWorkflowFile(file: string): Promise<{ def: WorkflowDef; absPath: string }> {
+export async function loadWorkflowFile(
+  file: string,
+  context: WorkflowContext = {},
+): Promise<{ def: WorkflowDef; absPath: string }> {
   const absPath = await resolveContainedWorkflowFile(file);
-  const mod = (await import(absPath)) as { default?: WorkflowDef };
+  const mod = await import(absPath);
   if (!mod.default) throw new Error(`workflow file '${file}' has no default export`);
-  validateWorkflowDef(mod.default);
-  return { def: mod.default, absPath };
+  return { def: await evaluateWorkflowModule(mod.default, context), absPath };
 }
 
 /**
@@ -2246,6 +2331,7 @@ function assertDigestMatches(existing: WorkflowRun, def: WorkflowDef, sourcePath
   const plan = buildPlan({
     ...def,
     maxConcurrency: existing.plan?.maxConcurrency ?? def.maxConcurrency,
+    keepSessionsOnError: existing.plan?.keepSessionsOnError,
   });
   const digest = planDigest(plan);
   const preDagDigestMatches =
@@ -2442,6 +2528,115 @@ export async function cancelWorkflow(runId: string, opts: CancelOptions = {}): P
   return (await readRun(runId)) ?? run;
 }
 
+/** Wait for the exact runner to exit before taking the final session snapshot. */
+async function stopCleanupRunner(runner: RunnerInfo | undefined): Promise<void> {
+  if (!runner || runner.pid === process.pid || !isSameProcessAlive(runner)) return;
+  const waitUntil = async (deadline: number) => {
+    while (isSameProcessAlive(runner) && Date.now() < deadline) await Bun.sleep(25);
+  };
+  await waitUntil(Date.now() + 5_000);
+  if (isSameProcessAlive(runner)) {
+    signalRunner(runner, 'SIGKILL');
+    await waitUntil(Date.now() + 1_000);
+  }
+  if (isSameProcessAlive(runner)) throw new Error(`runner ${runner.pid} did not stop during cleanup`);
+}
+
+/** Quiesce session producers, including runners registered while their parent stops. */
+async function cleanupFailedWorkflow(run: WorkflowRun): Promise<void> {
+  const stoppedRuns = new Set<string>();
+  const errors: unknown[] = [];
+  const deadline = Date.now() + 15_000;
+  while (true) {
+    for (const child of await workflowDescendants(run)) {
+      if (child.id === run.id) continue;
+      const identity = `${child.id}:${child.runner?.pid ?? ''}:${child.runner?.startTime ?? ''}`;
+      if (stoppedRuns.has(identity)) continue;
+      stoppedRuns.add(identity);
+      try {
+        if (child.status === 'running') {
+          await cancelWorkflow(child.id, { reason: `parent workflow '${run.id}' failed` });
+        } else {
+          signalRunner(child.runner, 'SIGTERM');
+        }
+        // Cancellation requests termination; it does not establish that a runner
+        // already inside agent() has finished registering its last session.
+        await stopCleanupRunner(child.runner);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    try {
+      await cleanupWorkflow(run.id, { sessions: true });
+    } catch (error) {
+      errors.push(error);
+    }
+    // After stopping provider groups, pick up sessions/runners delegated during
+    // their shutdown. A second scan closes the initial snapshot race.
+    const descendants = await workflowDescendants(run);
+    const newRunner = descendants.some((child) => child.id !== run.id &&
+      !stoppedRuns.has(`${child.id}:${child.runner?.pid ?? ''}:${child.runner?.startTime ?? ''}`));
+    const remaining = (await workflowSessions(run)).some((record) => sessionStatusOf(record) !== 'dead');
+    if (!newRunner && !remaining) break;
+    if (errors.length > 0 || Date.now() >= deadline) {
+      errors.push(new Error(`workflow '${run.id}' session cleanup did not quiesce`));
+      break;
+    }
+  }
+  if (errors.length > 0) {
+    throw new AggregateError(errors, errors.map((e) => e instanceof Error ? e.message : String(e)).join('; '));
+  }
+}
+
+/** Find this run's subtree, never every sibling sharing its rootRunId. */
+async function workflowDescendants(run: WorkflowRun): Promise<WorkflowRun[]> {
+  const runs = await listRuns();
+  const runIds = new Set([run.id]);
+  // Follow immediate parents: rootRunId alone cannot distinguish sibling runs.
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const candidate of runs) {
+      if (candidate.parentRunId && runIds.has(candidate.parentRunId) && !runIds.has(candidate.id)) {
+        runIds.add(candidate.id);
+        changed = true;
+      }
+    }
+  }
+  return [run, ...runs.filter((r) => r.id !== run.id && runIds.has(r.id))];
+}
+
+async function workflowSessions(run: WorkflowRun): Promise<SessionRecord[]> {
+  const [runs, records] = await Promise.all([workflowDescendants(run), readRegistry()]);
+  const runIds = new Set(runs.map((r) => r.id));
+  const sessionIds = new Set<string>();
+  for (const candidate of runs) {
+    for (const attempt of candidate.attempts ?? []) {
+      if (attempt.sessionId) sessionIds.add(attempt.sessionId);
+    }
+    for (const step of candidate.steps) if (step.sessionId) sessionIds.add(step.sessionId);
+  }
+  const owned = new Set<SessionRecord>();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const record of records) {
+      if (owned.has(record)) continue;
+      if (sessionIds.has(record.id) || sessionIds.has(record.sessionId) ||
+          (record.parentRunId && runIds.has(record.parentRunId)) ||
+          record.rootRunId === run.id ||
+          (record.parentSessionId && sessionIds.has(record.parentSessionId))) {
+        owned.add(record);
+        sessionIds.add(record.id);
+        sessionIds.add(record.sessionId);
+        changed = true;
+      }
+    }
+  }
+  // Stop descendants before their parents, limiting further delegation during cleanup.
+  return [...owned].sort((a, b) => (b.depth ?? 0) - (a.depth ?? 0));
+}
+
 export async function cleanupWorkflow(
   runId: string,
   opts: CleanupOptions = {},
@@ -2454,23 +2649,39 @@ export async function cleanupWorkflow(
   }
   const cleanedSessions: string[] = [];
   const cleanedWorktrees: string[] = [];
-  const root = run.rootRunId ?? run.id;
-  const records = await readRegistry();
-  const owned = records.filter(
-    (r) => r.rootRunId === root || r.parentRunId === runId || r.rootRunId === run.id,
-  );
   const kill =
     opts.killSession ??
     (async (id: string, removeWorktree: boolean) => {
       const rec = await findRecord(id);
       if (!rec) return;
-      await new Session(rec).kill({ removeWorktree, purge: false }).catch(() => {});
+      await new Session(rec).kill({ removeWorktree, purge: false });
     });
-  for (const r of owned) {
-    if (!r.rootRunId && !r.parentRunId) continue;
-    await kill(r.id, opts.worktrees === true);
-    cleanedSessions.push(r.id);
-    if (opts.worktrees && r.worktreePath) cleanedWorktrees.push(r.worktreePath);
+  const errors: Error[] = [];
+  const attempted = new Set<string>();
+  const deadline = Date.now() + 15_000;
+  while (true) {
+    const owned = (await workflowSessions(run)).filter((r) =>
+      !attempted.has(r.id) || (!opts.killSession && r.status !== 'dead' && !errors.length));
+    if (owned.length === 0) break;
+    if (Date.now() >= deadline) {
+      errors.push(new Error(`workflow '${runId}' sessions continued spawning during cleanup`));
+      break;
+    }
+    for (const r of owned) {
+      attempted.add(r.id);
+      try {
+        await kill(r.id, opts.worktrees === true);
+        if (!cleanedSessions.includes(r.id)) cleanedSessions.push(r.id);
+        if (opts.worktrees && r.worktreePath && !cleanedWorktrees.includes(r.worktreePath)) {
+          cleanedWorktrees.push(r.worktreePath);
+        }
+      } catch (cause) {
+        errors.push(new Error(`session '${r.id}': ${cause instanceof Error ? cause.message : String(cause)}`));
+      }
+    }
+  }
+  if (errors.length > 0) {
+    throw new AggregateError(errors, errors.map((e) => e.message).join('; '));
   }
   return { runId, sessions: cleanedSessions, worktrees: cleanedWorktrees };
 }

@@ -87,7 +87,7 @@ would host and expose.
 
 ### CLI surface (implemented)
 ```
-orc workflow run <file> [--detach] [--json] [--max-concurrency N]
+orc workflow run <file> [--prompt TEXT] [--keep-sessions-on-error] [--detach] [--json] [--max-concurrency N]
 orc workflow list [--json]
 orc workflow status <runId> [--json]
 orc workflow attach <runId> [--json]                  # follow a --detach run's runner.log
@@ -99,6 +99,16 @@ orc workflow cleanup <runId> [--sessions] [--worktrees] [--json]
 ```
 
 Daemon mirrors control routes: `POST /workflows/runs/:id/{resume,retry,cancel,cleanup}`.
+
+Workflow modules may export a factory `({ prompt }) => WorkflowDef` (sync or async) as well
+as a plain object. Text supplied with `--prompt` is persisted privately and reused when loading
+the original module for detached execution and recovery. The expanded plan remains the durable
+definition checked on resume/retry. See the [research example](../orc.workflows/research.ts) and
+[artifact input guide](../README.md#research-with-text-input-and-artifact-handoffs).
+
+Failed runs clean up owned sessions by default while retaining logs, artifacts, and worktrees.
+`keepSessionsOnError: true` on the workflow or `--keep-sessions-on-error` at launch retains the
+sessions. The choice is part of the durable plan. Successful runs retain sessions for inspection.
 
 ## Open questions (later phases)
 1. ~~Replace function `done` predicates with portable JSON-safe predicates (phase 3).~~ (portable `verify` shipped)

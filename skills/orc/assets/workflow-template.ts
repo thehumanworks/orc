@@ -52,7 +52,9 @@ export default {
   ],
 } satisfies WorkflowDef;
 
-// CLEANUP (workflow steps are intentionally left ALIVE so you can inspect them). When you're done:
+// CLEANUP: failed runs stop owned sessions by default, preserving logs and worktrees.
+// Use keepSessionsOnError: true or --keep-sessions-on-error to retain failed sessions.
+// Successful runs retain their sessions. When you're done:
 //   orc workflow status <runId> --json     # → each step's `sessionId`
 //   orc kill <sessionId> --worktree --purge # per step (removes the worktree + record)
 // then merge or delete the branch yourself. Don't leave sessions/worktrees lying around.

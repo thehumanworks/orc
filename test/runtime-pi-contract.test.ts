@@ -510,6 +510,9 @@ d('pi runtime contract (real pi --mode rpc, mock model)', () => {
       const streaming = mock.nextSlowStream();
       await rt.send('m-open', 'SLOW until closed');
       await streaming;
+      // The mock sending a chunk does not mean pi has received it yet. Wait for
+      // its RPC update before asserting that close preserves a partial reply.
+      await waitUntil(() => rawLog(s).some((r) => r.dir === 'recv' && r.line.includes('chunk0')));
       await rt.close({ graceMs: 3_000 });
       await c.done;
       // close() aborts first: pi itself settles the run (and answers the abort) before stdin ends.

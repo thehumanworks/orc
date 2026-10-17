@@ -19,6 +19,7 @@ import type { WorkflowDef, WorkflowStep, StepResult, StepExecutor, WorkflowEvent
 import { readRun } from '../src/runs.ts';
 import { WORKFLOW_SCHEMA_VERSION } from '../src/runs.ts';
 import { runPath } from '../src/paths.ts';
+import { collectOutputArtifact, refFromManifest } from '../src/artifacts.ts';
 
 const tmpHomes: string[] = [];
 async function freshHome(): Promise<string> {
@@ -538,8 +539,18 @@ describe('bounded concurrency execution', () => {
     // Concurrent schedule: cons must not run before prod.
     const order: string[] = [];
     const run = await runWorkflow(def, {
-      execStep: async ({ step: s }) => {
+      execStep: async ({ step: s, runId }) => {
         order.push(s.id);
+        let artifacts: StepResult['artifacts'];
+        if (s.id === 'prod') {
+          const cwd = process.env.ORC_HOME!;
+          await Bun.write(path.join(cwd, 'out.md'), 'producer report');
+          const manifest = await collectOutputArtifact({
+            runId, stepId: s.id, attemptId: 'producer-attempt', cwd,
+            decl: s.outputs![0]!,
+          });
+          artifacts = { report: refFromManifest(manifest!) };
+        }
         return {
           id: s.id,
           sessionId: `s-${s.id}`,
@@ -547,6 +558,7 @@ describe('bounded concurrency execution', () => {
           state: 'done',
           ok: true,
           commitsAhead: 0,
+          artifacts,
         };
       },
     });

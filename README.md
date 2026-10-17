@@ -323,7 +323,8 @@ pi-agent-core 1.2.0 and calls `https://api.openai.com/v1/responses` directly.
 ## Workflows
 
 A workflow is a TypeScript file (versioned in `orc.workflows/`) that default-exports a plain
-`{ name, steps[] }`; `orc workflow run` imports and validates it. Runs persist to
+`{ name, steps[] }` or a factory `({ prompt }) => ({ name, steps })`; `orc workflow run` imports
+and validates it. Supply text with `--prompt "Your question"`. Runs persist to
 `~/.orc/runs/<runId>.json`: a validated plan and digest before any side effect, per-step attempts
 (`queued|spawning|dispatched|running|verifying|succeeded|failed|waiting|cancelled|abandoned`),
 revision/CAS writes and an owner lease. A crashed run can be resumed, retried, cancelled or
@@ -331,7 +332,7 @@ cleaned up without silently duplicating children (durable intent + adoption + co
 exactly-once).
 
 ```sh
-orc workflow run <file> [--detach] [--json] [--max-concurrency N]
+orc workflow run <file> [--prompt TEXT] [--keep-sessions-on-error] [--detach] [--json] [--max-concurrency N]
 orc workflow list [--json]
 orc workflow status <runId> [--json]                 # a stale `running` with a dead owner → orphaned
 orc workflow attach <runId> [--json]                 # follow a --detach run's runner.log until it ends
@@ -397,8 +398,57 @@ export default {
 
 **A yield is not success.** A step succeeds by `done`, by `verify`, or (a `worktree` step with
 neither) by `state === 'done' && commitsAhead >= 1`. A non-worktree step with no check is
-**unverified** and fails unless `allowUnverified`. Step sessions are left alive for inspection;
-`orc workflow cleanup <runId> --sessions --worktrees` removes what the run owns.
+**unverified** and fails unless `allowUnverified`. Failed runs stop their owned sessions by
+default, preserving logs, artifacts, and worktrees. Set `keepSessionsOnError: true` on the
+workflow (or `--keep-sessions-on-error` when starting it) to retain them for debugging.
+Successful runs retain their sessions. `orc workflow cleanup <runId> --sessions --worktrees`
+explicitly cleans up a run's sessions and worktrees.
+
+### Research with text input and artifact handoffs
+
+[orc.workflows/research.ts](orc.workflows/research.ts) is a complete two-step example: Pi writes
+an optimized query, then Claude researches it and writes a cited JSON answer. From this checkout,
+run the source CLI to use these changes immediately:
+
+```sh
+bun src/cli/index.ts --local workflow run orc.workflows/research.ts \
+  --prompt "Which five inference subscriptions offer the best value for coding agents?"
+```
+
+After installing the updated CLI (`bun run install:cli`), the same command starts with `orc`.
+Run it from a directory where you want `optimized-query.txt` and `search-results.json` written;
+use an absolute workflow path if that directory is elsewhere. Pi and Claude must already be
+configured with working credentials and model access. Each provider needs file tools, and the
+research step needs web access. Inspect results with `orc --local workflow logs <runId>`.
+
+The workflow factory receives `prompt?: string`. It can reject missing text, as the research
+example does. The supplied text is saved privately with the run and reused for detached runs,
+resume, and retry; it is separate from step artifact `inputs`.
+Use `--prompt @question.txt` to read a file or `--prompt -` to read standard input.
+
+```ts
+inputs: [{
+  name: 'query',                       // local name used by this step
+  fromStep: 'search-query-optimizer', // producing step id; also creates a dependency
+  artifact: 'optimized-query',        // producer's outputs[].name (defaults to name)
+  materializeAs: 'optimized-query.txt', // optional relative filename
+}],
+prompt: 'Read ${inputs.query}, research it, and write search-results.json.',
+```
+
+`outputs` declares files the agent must create; it does not instruct the agent to write them.
+State the filename explicitly in the producer's prompt. Inputs copy verified artifact bytes
+into `~/.orc/runs/<runId>/inputs/<consumerStepId>/`; `${inputs.query}` resolves to the absolute
+copied path in a step's `prompt`, `taskFile`, or `cwd`. Use a quoted string or escape `\${…}` in a
+JavaScript template literal so JavaScript does not evaluate the placeholder itself. Different
+consumers have separate input directories. Missing or corrupt inputs fail before spawning the
+consumer. A required dependency must succeed even when its producer has `continueOnFail: true`;
+that flag only lets independent work continue. `allowUnverified` does not bypass missing outputs.
+
+The original research failure was a missing output: the optimizer replied in chat but never
+wrote `optimized-query.txt`. The example now requests the file explicitly, verifies artifacts,
+and binds the second step's input. Output collection failures include the underlying error in
+the workflow log and saved attempt diagnostics.
 
 Runnable example: `orc workflow run orc.workflows/example.ts --json` (claude writes a token, codex
 reads it back).

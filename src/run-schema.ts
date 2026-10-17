@@ -213,6 +213,8 @@ export interface PlanStep {
 export interface WorkflowPlan {
   name: string;
   steps: PlanStep[];
+  /** Preserve failed sessions for inspection instead of automatic cleanup. */
+  keepSessionsOnError?: boolean;
   /**
    * Max concurrent step executions for this plan (positive integer).
    * Absent or omitted on legacy plans ⇒ 1 (strict sequential array-order).
@@ -288,6 +290,8 @@ export interface WorkflowRun {
   workflowSourcePath?: string;
   sourcePath?: string;
   definitionDigest?: string;
+  /** Invocation input for reloading workflow factories; private like plan prompts. */
+  prompt?: string;
   deadlineAt?: string;
   counters?: RunCounters;
   /**
