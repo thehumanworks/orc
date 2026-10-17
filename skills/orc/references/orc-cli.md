@@ -8,8 +8,8 @@ Conventions:
 - Flags are parsed per subcommand and strictly (an unknown flag is an error). Every command except
   `help` takes `--json`. There is no per-subcommand `--help` (`orc spawn --help` is an unknown-flag
   error): `orc help` (or `orc --help`, `-h`) prints the whole reference.
-- Errors: exit 1; with `--json` the error is `{"error": "..."}` on **stdout**, otherwise
-  `error: ...` on stderr.
+- Errors: exit 1; with `--json` the error is `{"error": "..."}` on **stdout** (option-parse
+  errors too), otherwise `error: ...` on stderr (`fatal: ...` for an option-parse error).
 - A session is addressed by short id, full session id, `@alias` (current workspace) or
   `@workspace:alias`. Aliases resolve only to active (running or suspended) sessions; use the id
   for dead ones.
@@ -184,12 +184,24 @@ removed `codex app-server` runtime are `dead` with no transcript.
 Auth is fail-closed: allowlisted tailnet identity (all scopes), `Authorization: Bearer` (client
 `ORC_DAEMON_TOKEN`; server `ORC_DAEMON_TOKENS` JSON token→scopes), or legacy `x-orc-secret` =
 `ORC_DAEMON_SECRET`. 401 = no/invalid credentials; 403 = missing scope (`sessions:read|write`,
-`workflows:read|write`, `admin`). `GET /health` → `{ok, version, host, api: 2}`.
+`workflows:read|write`, `admin`). `GET /health` → `{ok, version, host, api: 2, mcp: "/mcp"}`.
 
 Other daemon errors (`{"error"}`): 400 invalid request · 403 execution policy forbids a spawn/wake
 · 404 unknown session or run · 409 stopped session (`orc resume` first), idempotency-key conflict,
 legacy session, or run state (cancelled / live owner) · 502 provider failed to start · 500 other.
 `--host` also works against a v1 (pre-actor) daemon (`submitted` send = success; `pane` reads).
+
+## MCP server
+
+| command | purpose |
+| --- | --- |
+| `orc mcp [--wait-timeout SEC]` | MCP over stdio (host-local). Tools: `guide spawn send wait read state list kill resume prune settings workflow_run workflow_list workflow_status workflow_logs workflow_resume workflow_retry workflow_cancel workflow_cleanup`; each runs `orc <cmd> … --json` (spawn `--no-wait`, workflow run/resume/retry `--detach`) and returns its JSON. `host` on remote-capable tools = `--host`. `wait` returns within SEC (default 45) |
+| `orc daemon [--mcp-allow-host H]…` | also serves the tools at `/mcp` (Streamable HTTP, stateless), run on the daemon host (`--local`; absolute paths; no `host`). Same auth; each tool needs its REST scope (`wait`/`read`/`state`/`list`/`settings`: `sessions:read`; `spawn`/`send`/`resume`: `sessions:write`; workflow reads/writes: `workflows:read`/`workflows:write`; `kill`/`prune`/`workflow_cancel`/`workflow_cleanup`: `admin`). `tools/list` shows only allowed tools. `Host`/`Origin` must name the daemon (403 otherwise) |
+
+The server instructions and the `guide` tool teach the lead the team method; not exposed:
+`attach`, `workflow attach`, `takeover`, `login`/`logout`, `daemon`, `remote`, `mcp`, `help`.
+Daemon credentials (`ORC_DAEMON_SECRET`/`ORC_DAEMON_TOKENS`/`ORC_DAEMON_TOKEN`) never reach the
+CLI children, except the client ones on an explicit `host` call.
 
 ## Settings: `ORC_HOST`, `settings.toml`, `--local`
 

@@ -130,6 +130,7 @@ orc login  chatgpt [--import-pi] [--no-browser]     Sign in with ChatGPT (codex)
 orc login  status [--json]                          Which OpenAI credential codex uses
 orc logout chatgpt                                  Remove orc's ChatGPT credential
 orc settings [--json]                               Effective settings and where each value comes from
+orc mcp    [--wait-timeout SEC]                     Serve these commands as MCP tools over stdio (see MCP)
 orc --host <h> <command>                            Run a command against a peer's daemon
 orc --local <command>                               Run here, ignoring ORC_HOST / settings `host`
 orc --version [--json]                              This binary's version (alias: -V)
@@ -407,8 +408,9 @@ orc list --all-hosts               # fleet view with a host column
   execution policy forbids a spawn or wake; 404 unknown session or run; 409 a stopped session
   (`orc resume` first), an idempotency-key conflict, a legacy session, or a run in the wrong state
   (cancelled, live owner); 502 the provider failed to start; 500 anything else.
-- `GET /health` reports `api: 2` (raw reads return `journal`). `--host` still works against a v1
-  (pre-actor) daemon: its `submitted` send phase counts as success and `pane` reads render.
+- `GET /health` reports `api: 2` (raw reads return `journal`) and `mcp: "/mcp"`. `--host` still
+  works against a v1 (pre-actor) daemon: its `submitted` send phase counts as success and `pane`
+  reads render.
 - `--host` covers `list`, `spawn`, `send`, `read`, `wait`, `state`, `kill` and `workflow`, with the
   local output except: `state --json` is only `{id, state, status, suspended, stopped}`; `list`
   takes only `--workspace`/`--all`/`--dead` (rows have no `lineage`); `workflow resume`/`retry`
@@ -420,6 +422,107 @@ orc list --all-hosts               # fleet view with a host column
   invalid → 401; missing scope → 403. Scopes: `sessions:read|write`, `workflows:read|write`,
   `admin` (implies all; needed for kill/cancel/cleanup). Tokens are never logged or returned.
 - Daemon workflow file imports are confined to `ORC_WORKFLOW_ROOTS` (default: the daemon's cwd).
+- The daemon also serves the MCP tools at `/mcp`, behind the same auth (see
+  [MCP](#mcp-orc-as-tools-for-a-lead-agent)).
+
+## MCP (orc as tools for a lead agent)
+
+`orc mcp` serves orc's commands as [MCP](https://modelcontextprotocol.io) tools over stdio, and
+`orc daemon` serves the same tools at `/mcp` (Streamable HTTP). Point a lead agent (Claude Code,
+Codex, any MCP client) at it and it runs a team of agents through tool calls.
+
+- **Every tool runs the CLI**: `orc <cmd> … --json` (this build, as a child process: argv only,
+  prompts on stdin) and returns that JSON as `structuredContent` (arrays wrapped, e.g.
+  `{sessions: […]}`) plus compact text for the model (`guide` is text only). The CLI's `--json`
+  output is the contract; nothing is re-implemented. CLI errors become `isError` results with the
+  message and a hint.
+- **The lead is taught the method.** The server's `instructions` and the `guide` tool (also the
+  `orc://guide` resource; `orchestrate` is a prompt) carry the team method: split the work into
+  vertical slices that can each be verified on their own; per slice a context gatherer (a fast,
+  cheap model), an implementor (the strongest model) and a judge (a strong model, ideally another
+  provider) who reviews before the lead accepts; worktrees for overlapping code; parallel waits;
+  cleanup. Model-neutral: `settings` shows the configured defaults.
+- Supported protocol revisions: 2026-07-28 (`server/discover`) and the 2025 ones (`initialize`),
+  via the official MCP TypeScript SDK.
+
+| tool | runs | daemon scope |
+| --- | --- | --- |
+| `guide` | — (the playbook; `topic` for one section) | any |
+| `spawn` | `spawn … --no-wait` (returns at once; the prompt is queued) | `sessions:write` |
+| `send` | `send <id> - [--idempotency-key K] [--no-wake]` | `sessions:write` |
+| `wait` | one `wait <id> --for … --timeout …` per id, concurrently (`ids`, `mode: all\|any`) | `sessions:read` |
+| `read` | `read <id> [--index N\|--full\|--raw]`, bounded by `max_chars` (the end is kept) | `sessions:read` |
+| `state`, `list` | `state <id>`, `list […]` | `sessions:read` |
+| `settings` | `settings` (in `cwd`) | `sessions:read` |
+| `kill`, `prune` | `kill <id> […]`, `prune […]` | `admin` |
+| `resume` | `resume <id>` | `sessions:write` |
+| `workflow_run` | `workflow run <file> --detach` (in `cwd`) | `workflows:write` |
+| `workflow_resume`, `workflow_retry` | `workflow resume\|retry <runId> <file> … --detach` | `workflows:write` |
+| `workflow_list`, `workflow_status`, `workflow_logs` | `workflow list\|status\|logs …` | `workflows:read` |
+| `workflow_cancel`, `workflow_cleanup` | `workflow cancel\|cleanup <runId> …` | `admin` |
+
+Not exposed, on purpose: `attach` and `workflow attach` (live streams for a human; use `read` /
+`workflow_logs`), `takeover` (hands a session to a human: the lead keeps the reins), `login` /
+`logout` (credentials), `daemon` and `remote` (serving and trust configuration), `mcp`, `help`.
+
+**stdio** (the lead's machine). Add the server to the lead's client:
+
+```sh
+claude mcp add --transport stdio orc -- orc mcp     # Claude Code (--scope user: every project)
+codex mcp add orc -- orc mcp                         # Codex CLI
+```
+
+```toml
+# Codex: ~/.codex/config.toml
+[mcp_servers.orc]
+command = "orc"
+args = ["mcp"]
+```
+
+From source, the command is `bun` with args `["<repo>/src/cli/index.ts", "mcp"]`. The server runs
+orc in its own working directory (clients start it in the session's directory) with the client's
+environment, so `ORC_HOME`, settings and default hosts apply as for `orc` itself. On the
+remote-capable tools (`spawn`, `send`, `wait`, `read`, `state`, `list`, `kill`, `workflow_run`,
+`workflow_list|status|logs|cancel|cleanup`), `host` sends that call to a peer's daemon
+(`orc --host`); the others run here only.
+
+**HTTP** (any daemon). `orc daemon` serves `/mcp` on its bind address, the tailscale IP by default:
+exposing the daemon on the tailnet exposes MCP too. The startup line prints the URL.
+
+```sh
+claude mcp add --transport http orc-mini http://mini:8787/mcp --header "Authorization: Bearer $ORC_DAEMON_TOKEN"
+```
+
+```toml
+# Codex: ~/.codex/config.toml
+[mcp_servers.orc-mini]
+url = "http://mini:8787/mcp"
+bearer_token_env_var = "ORC_DAEMON_TOKEN"
+```
+
+- **Auth** is the daemon's: an allowlisted tailnet identity (all scopes, no header needed), a
+  bearer token from `ORC_DAEMON_TOKENS`, or the legacy `x-orc-secret`; anything else is 401.
+- **Scopes**: each tool needs the scope of its REST route (table above; `wait` is an observation,
+  so `sessions:read`). `tools/list` shows only the tools the caller may call; calling another one
+  returns an error result that names the missing scope.
+- **Host/Origin guard** (DNS rebinding): `/mcp` answers only requests whose `Host` names the
+  daemon (the bound address; loopback names on loopback; this node's MagicDNS name, short name
+  and tailnet IPs on the tailnet) and whose `Origin`, if any, names it too (CLI and agent
+  clients send none); otherwise 403. Ports are not compared. `orc daemon --mcp-allow-host H`
+  (repeatable) adds a name, e.g. a DNS alias or a proxy.
+- Everything runs **on the daemon host** (`orc --local …`, whatever its settings say): `spawn`
+  and `workflow_run` need an absolute `cwd`, paths must be absolute, and an `@alias` resolves
+  against the daemon's own directory (use ids). There is no `host` parameter.
+- Stateless: no MCP session; sessions and runs are addressed by their orc ids.
+
+**Timeouts and limits.** `wait` returns within 45 s by default even when agents are still running
+(the result says which are pending; the lead calls it again): Codex times out a tool call after
+60 s (`tool_timeout_sec`). Change it with `orc mcp --wait-timeout SEC` (stdio), or per call with
+`timeout_seconds` (≤ 600). `wait` takes up to 16 ids; `read` and `workflow_logs` return at most
+`max_chars` (16000 by default). The daemon credentials `ORC_DAEMON_SECRET`, `ORC_DAEMON_TOKENS`
+and `ORC_DAEMON_TOKEN` are never passed to the CLI children (so never to agents), except that an
+explicit `host` call keeps the client credentials (`ORC_DAEMON_TOKEN`, `ORC_DAEMON_SECRET`) it
+authenticates with. Calls without `host` that follow a default host rely on tailnet identity.
 
 ## Settings (`ORC_HOST` and `settings.toml`)
 
