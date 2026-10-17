@@ -38,6 +38,9 @@ jobs:
 
       - name: Install Nix
         uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+        with:
+          # Sandboxed builds on every runner: Nix's default on Linux, not on macOS.
+          extra_nix_config: sandbox = true
 
       - name: Flake check
         run: nix flake check -L 2>&1 | tee -a "$RUNNER_TEMP/nix.log"
@@ -60,7 +63,8 @@ jobs:
       - name: Explain a stale dependencies hash
         if: failure()
         run: |
-          got="$(sed -n "/hash mismatch in fixed-output derivation '.*-orc-node-modules-/,/got:/s|.*got: *\(sha256-[A-Za-z0-9+/=]*\).*|\1|p" "$RUNNER_TEMP/nix.log" 2>/dev/null | tail -n 1)"
+          [ -f "$RUNNER_TEMP/nix.log" ] || exit 0 # failed before any Nix step ran
+          got="$(sed -n "/hash mismatch in fixed-output derivation '.*-orc-node-modules-/,/got:/s|.*got: *\(sha256-[A-Za-z0-9+/=]*\).*|\1|p" "$RUNNER_TEMP/nix.log" | tail -n 1)"
           if [ -n "$got" ]; then
             echo "::error file=nix/hashes.json,title=stale npm dependencies hash::bun.lock changed, so nix/hashes.json is stale. Run 'nix run .#update-deps-hash' and commit nix/hashes.json (or set node_modules to $got)."
           fi
