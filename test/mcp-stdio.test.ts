@@ -15,7 +15,7 @@ import { readRegistry } from '../src/registry.ts';
 import { orcInstructions } from '../src/mcp/instructions.ts';
 import { createCliRunner } from '../src/mcp/exec.ts';
 import { cliFailure } from '../src/mcp/shape.ts';
-import { killSessionProcesses, mkTmp, plainCliEnv } from './runtime-helpers.ts';
+import { killSessionProcesses, mkTmp, plainCliEnv, TEARDOWN_TIMEOUT_MS } from './runtime-helpers.ts';
 
 const CLI = path.join(import.meta.dir, '..', 'src', 'cli', 'index.ts');
 const T = 60_000;
@@ -90,7 +90,7 @@ afterAll(async () => {
   if (prevHome === undefined) delete process.env.ORC_HOME;
   else process.env.ORC_HOME = prevHome;
   fs.rmSync(root, { recursive: true, force: true });
-});
+}, TEARDOWN_TIMEOUT_MS);
 
 const EXPECTED_TOOLS = [
   'guide',

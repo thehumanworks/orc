@@ -14,7 +14,7 @@ import type { Scope } from '../src/daemon/auth.ts';
 import { FAKE_PROVIDER_ENV } from '../src/agent.ts';
 import { readRegistry } from '../src/registry.ts';
 import { orcInstructions } from '../src/mcp/instructions.ts';
-import { killSessionProcesses, mkTmp } from './runtime-helpers.ts';
+import { killSessionProcesses, mkTmp, TEARDOWN_TIMEOUT_MS } from './runtime-helpers.ts';
 
 const T = 60_000;
 const prevHome = process.env.ORC_HOME;
@@ -60,7 +60,7 @@ afterAll(async () => {
   if (prevFake === undefined) delete process.env[FAKE_PROVIDER_ENV];
   else process.env[FAKE_PROVIDER_ENV] = prevFake;
   fs.rmSync(root, { recursive: true, force: true });
-});
+}, TEARDOWN_TIMEOUT_MS);
 
 async function connect(token: string, mode: 'legacy' | 'auto' = 'legacy'): Promise<Client> {
   const client = new Client({ name: 'orc-mcp-daemon-test', version: '1.0.0' }, { versionNegotiation: { mode } });
