@@ -2610,8 +2610,16 @@ if (import.meta.main) {
       process.exit(code);
     })
     .catch((e) => {
-      const st = terminalStyles().err;
-      process.stderr.write(`${st.errorLabel('fatal:')} ${st.text((e as Error).message)}\n`);
+      // An error that escaped a command (e.g. an option-parse error: strict parseArgs throws
+      // before a command's own error handling): with --json, the documented {"error"} shape
+      // on stdout; otherwise `fatal:` on stderr.
+      const message = (e as Error).message;
+      if (process.argv.slice(2).includes('--json')) {
+        printError(message, true);
+      } else {
+        const st = terminalStyles().err;
+        process.stderr.write(`${st.errorLabel('fatal:')} ${st.text(message)}\n`);
+      }
       process.exit(1);
     });
 }
