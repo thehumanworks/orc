@@ -163,6 +163,48 @@ describe('compiled orc binary', () => {
     60_000,
   );
 
+  test(
+    'the compiled orc serves MCP over stdio (the SDK bundles; tools re-run the binary itself)',
+    async () => {
+      expect(built).toBe(true);
+      const { Client } = await import('@modelcontextprotocol/client');
+      const { StdioClientTransport } = await import('@modelcontextprotocol/client/stdio');
+      const orcHome = path.join(root, 'mcp-home');
+      fs.mkdirSync(orcHome, { recursive: true });
+      fs.writeFileSync(path.join(orcHome, 'settings.toml'), 'provider = "pi"\n');
+      for (const mode of ['legacy', 'auto'] as const) {
+        const client = new Client({ name: 'compiled-mcp-test', version: '1.0.0' }, { versionNegotiation: { mode } });
+        await client.connect(
+          new StdioClientTransport({ command: bin, args: ['mcp'], cwd: root, env: { ...envWithoutOrc(), ORC_HOME: orcHome }, stderr: 'pipe' }),
+        );
+        try {
+          expect(client.getProtocolEra()).toBe(mode === 'legacy' ? 'legacy' : 'modern');
+          expect(client.getServerVersion()).toMatchObject({ name: 'orc', version: PKG.version });
+          expect(client.getInstructions()).toContain('You are the LEAD');
+          const tools = (await client.listTools()).tools.map((t) => t.name);
+          expect(tools).toHaveLength(19);
+          expect(tools).toContain('spawn');
+          expect(tools).toContain('workflow_run');
+          // Input validation (zod → JSON Schema → validation) works in the bundle.
+          const invalid = (await client.callTool({ name: 'wait', arguments: { ids: [] } })) as { isError?: boolean };
+          expect(invalid.isError).toBe(true);
+          // A tool call runs `<binary> --no-color settings --json` and returns its JSON.
+          const settings = (await client.callTool({ name: 'settings', arguments: {} })) as {
+            isError?: boolean;
+            structuredContent?: { provider?: { value?: string } };
+          };
+          expect(settings.isError).toBeFalsy();
+          expect(settings.structuredContent?.provider?.value).toBe('pi');
+          const list = (await client.callTool({ name: 'list', arguments: {} })) as { structuredContent?: unknown };
+          expect(list.structuredContent).toEqual({ sessions: [] });
+        } finally {
+          await client.close();
+        }
+      }
+    },
+    60_000,
+  );
+
   test('package.json compile:cli builds with the same flags', () => {
     for (const flag of COMPILE_FLAGS) expect(PKG.scripts['compile:cli']).toContain(flag);
   });

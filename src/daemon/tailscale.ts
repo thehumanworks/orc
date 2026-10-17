@@ -46,6 +46,41 @@ export async function tailscaleIp4(): Promise<string | null> {
   return null;
 }
 
+/** This node on the tailnet: its MagicDNS FQDN (no trailing dot) and its tailnet IPs. */
+export interface TailnetSelf {
+  dnsName: string | null;
+  ips: string[];
+}
+
+/**
+ * PURE: `Self` of `tailscale status --json` (`{ Self: { DNSName, TailscaleIPs } }`), or null
+ * when it has neither a DNS name nor an IP. Never throws.
+ */
+export function parseStatusSelf(stdout: string): TailnetSelf | null {
+  let data: unknown;
+  try {
+    data = JSON.parse(stdout);
+  } catch {
+    return null;
+  }
+  const self = data && typeof data === 'object' ? (data as Record<string, unknown>).Self : undefined;
+  if (!self || typeof self !== 'object') return null;
+  const s = self as Record<string, unknown>;
+  const rawName = typeof s.DNSName === 'string' ? s.DNSName.trim().replace(/\.$/, '') : '';
+  const ips = Array.isArray(s.TailscaleIPs)
+    ? s.TailscaleIPs.filter((ip): ip is string => typeof ip === 'string' && ip.length > 0)
+    : [];
+  if (rawName.length === 0 && ips.length === 0) return null;
+  return { dnsName: rawName.length > 0 ? rawName.toLowerCase() : null, ips };
+}
+
+/** This node's tailnet name + IPs (`tailscale status --json`), or null when unavailable. */
+export async function tailscaleSelf(): Promise<TailnetSelf | null> {
+  const r = await tailscale(['status', '--json']);
+  if (!r || r.code !== 0) return null;
+  return parseStatusSelf(r.stdout);
+}
+
 /**
  * PURE: parse `tailscale whois --json <ip>` stdout into an Identity, or null when it does
  * not resolve a node. The success shape is `{ Node: { Name }, UserProfile?: { LoginName } }`

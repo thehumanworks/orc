@@ -88,7 +88,7 @@ describe('colour off is byte-identical to the renderers before styling (main @ 1
     expect(renderCapture(fx.journal)).toBe(g('capture'));
   });
 
-  test('HELP_TEXT = the old help plus only the three --color/--no-color lines (and --version)', () => {
+  test('HELP_TEXT = the old help plus only the three --color/--no-color lines (and --version, and orc mcp)', () => {
     const added = [
       '  --color[=WHEN]        colour: auto (default: only when writing to a terminal) | always | never',
       '  --no-color            same as --color=never. NO_COLOR=1 also disables colour, FORCE_COLOR=1',
@@ -97,13 +97,38 @@ describe('colour off is byte-identical to the renderers before styling (main @ 1
     // Added by the `orc --version` change (test/version.test.ts covers it), not by colour.
     const versionLine =
       "  orc --version [--json]                              This binary's version (alias: -V; never remote)";
+    // Added by the MCP server (`orc mcp`, the daemon's /mcp; test/mcp-*.test.ts cover it):
+    // one usage line and one section (with its trailing blank line), nothing else.
+    const mcpUsageLine =
+      "  orc mcp    [--wait-timeout SEC]                     Serve orc's commands as MCP tools over stdio (for a lead agent)";
+    const mcpSection = [
+      "mcp (orc's commands as tools for a lead agent):",
+      '  orc mcp               MCP over stdio. Tools: spawn send wait read state list kill resume prune',
+      '                        settings guide workflow_run|list|status|logs|resume|retry|cancel|cleanup.',
+      '                        Each runs `orc <cmd> … --json` (spawn with --no-wait, workflows with',
+      "                        --detach); `host` sends a call to a peer's daemon. The server's",
+      '                        instructions and the `guide` tool teach the lead the team method.',
+      '                        wait returns within --wait-timeout SEC (default 45): call it again.',
+      '  orc daemon            Also serves those tools at http://<bind>:<port>/mcp (Streamable HTTP),',
+      "                        always run on the daemon host, behind the daemon's auth. Each tool needs",
+      '                        its REST scope: sessions:read (read state list wait settings),',
+      '                        sessions:write (spawn send resume), workflows:read|write, admin (kill',
+      '                        prune workflow cancel|cleanup). Host and Origin must name the daemon:',
+      '                        --mcp-allow-host H (repeatable) adds a name.',
+      '',
+    ];
     const lines = HELP_TEXT.split('\n');
     const at = lines.indexOf(added[0]!);
     expect(at).toBeGreaterThan(0);
     expect(lines[at - 1]).toBe('  --json                machine-readable output; non-zero exit + {error} on failure');
     expect(lines.slice(at, at + 3)).toEqual(added);
     expect(lines.filter((l) => l === versionLine)).toHaveLength(1);
-    const rest = [...lines.slice(0, at), ...lines.slice(at + 3)].filter((l) => l !== versionLine);
+    expect(lines.filter((l) => l === mcpUsageLine)).toHaveLength(1);
+    const rest = [...lines.slice(0, at), ...lines.slice(at + 3)].filter((l) => l !== versionLine && l !== mcpUsageLine);
+    const mcpAt = rest.indexOf(mcpSection[0]!);
+    expect(mcpAt).toBeGreaterThan(0);
+    expect(rest.slice(mcpAt, mcpAt + mcpSection.length)).toEqual(mcpSection);
+    rest.splice(mcpAt, mcpSection.length);
     expect(rest.join('\n')).toBe(g('help'));
   });
 });

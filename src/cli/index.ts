@@ -33,8 +33,9 @@ import {
 import type { WorkflowDef, WorkflowEvent, WorkflowRun, StepResult } from '../workflow.ts';
 import { readRun, listRuns } from '../runs.ts';
 import { resolveUntil } from '../state.ts';
-import { resolveBind } from '../daemon/bind.ts';
-import { tailscaleIp4 } from '../daemon/tailscale.ts';
+import { isLoopback, resolveBind } from '../daemon/bind.ts';
+import { tailscaleIp4, tailscaleSelf } from '../daemon/tailscale.ts';
+import { MCP_PATH, mcpAllowedHosts } from '../mcp/hosts.ts';
 import { serveDaemon } from '../daemon/server.ts';
 import { loadDaemonTokensFromEnv } from '../daemon/auth.ts';
 import type { Scope } from '../daemon/auth.ts';
@@ -1421,6 +1422,7 @@ async function cmdDaemon(args: string[]): Promise<number> {
     port: { type: 'string' },
     bind: { type: 'string' },
     insecure: { type: 'boolean' },
+    'mcp-allow-host': { type: 'string', multiple: true },
     json: { type: 'boolean' },
   });
   const json = jsonFlag(values);
@@ -1457,9 +1459,21 @@ async function cmdDaemon(args: string[]): Promise<number> {
   }
   const allowlist = await peerHosts();
 
+  // /mcp's DNS-rebinding guard: the names this daemon answers to (the bind address; loopback
+  // names on loopback; this node's MagicDNS name + IPs on the tailnet; --mcp-allow-host).
+  let mcpHosts: string[];
+  try {
+    const tailnet = isLoopback(decision.address) ? null : await tailscaleSelf();
+    const extra = (values['mcp-allow-host'] as unknown as string[] | undefined) ?? [];
+    mcpHosts = mcpAllowedHosts({ bind: decision.address, tailnet, extra });
+  } catch (e) {
+    printError(`invalid --mcp-allow-host: ${(e as Error).message}`, json);
+    return 1;
+  }
+
   let server: Bun.Server<undefined>;
   try {
-    server = serveDaemon({ hostname: decision.address, port, secret, tokens });
+    server = serveDaemon({ hostname: decision.address, port, secret, tokens, mcp: { allowedHosts: mcpHosts } });
   } catch (e) {
     printError(`failed to start daemon: ${(e as Error).message}`, json);
     return 1;
@@ -1473,12 +1487,16 @@ async function cmdDaemon(args: string[]): Promise<number> {
     allowlistedPeers: allowlist.length,
     secretConfigured: secret !== null,
     tokensConfigured: tokens.size,
+    mcp: { path: MCP_PATH, allowedHosts: mcpHosts },
   };
   if (json) {
     printJson(startup);
   } else {
     const st = err();
     process.stderr.write(`orc daemon listening on ${st.accent(`http://${decision.address}:${server.port}`)}\n`);
+    process.stderr.write(
+      `${st.label('mcp:')} ${st.accent(`http://${decision.address}:${server.port}${MCP_PATH}`)} ${st.muted(`(Host: ${mcpHosts.join(', ')})`)}\n`,
+    );
     if (values.insecure === true) {
       process.stderr.write(
         `${st.warningLabel('WARNING:')} ${st.warning('--insecure bind — the agent-control API may be reachable off-tailnet.')}\n`,
@@ -1735,6 +1753,33 @@ async function cmdSettings(args: string[], opts: { local: boolean }): Promise<nu
   if (json) printJson(view);
   else process.stdout.write(`${renderSettingsView(view, out())}\n`);
   return 0;
+}
+
+/**
+ * `orc mcp [--wait-timeout SEC]` — serve orc's commands as MCP tools over stdio for a lead
+ * agent (src/mcp/; loaded lazily: it pulls in the MCP SDK). Host-local. Each tool runs
+ * `orc <cmd> … --json`; `wait` returns within --wait-timeout seconds (default 45).
+ */
+async function cmdMcp(args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, {
+    'wait-timeout': { type: 'string' },
+    json: { type: 'boolean' },
+  });
+  const json = jsonFlag(values);
+  if (positionals.length > 0) {
+    printError(`unexpected argument '${positionals[0]}' (usage: orc mcp [--wait-timeout SEC])`, json);
+    return 1;
+  }
+  let waitTimeoutSec = 45;
+  if (values['wait-timeout'] !== undefined) {
+    const n = Number(values['wait-timeout']);
+    if (!Number.isFinite(n) || n < 1 || n > 600) {
+      printError(`invalid --wait-timeout '${values['wait-timeout']}' (seconds, 1-600)`, json);
+      return 1;
+    }
+    waitTimeoutSec = n;
+  }
+  return (await import('../mcp/stdio.ts')).runMcpStdio({ waitTimeoutSec });
 }
 
 /** Dispatch a command to its remote (HTTP) implementation when `--host` is present. */
@@ -2444,6 +2489,8 @@ export function resolveCommand(raw: string | undefined): string {
       return 'logout';
     case 'settings':
       return 'settings';
+    case 'mcp':
+      return 'mcp';
     case 'help':
     case '--help':
     case '-h':
@@ -2593,6 +2640,8 @@ async function runLocal(
       return cmdLogout(rest);
     case 'settings':
       return cmdSettings(rest, { local: ctx.local });
+    case 'mcp':
+      return cmdMcp(rest);
     case 'help':
       process.stdout.write(renderHelp(out()));
       return 0;

@@ -472,6 +472,7 @@ Usage:
   orc login  status [--json]                          Which OpenAI credential codex sessions use
   orc logout chatgpt                                  Remove orc's ChatGPT credential
   orc settings [--json]                               Effective settings (ORC_HOST, settings.toml) and their sources
+  orc mcp    [--wait-timeout SEC]                     Serve orc's commands as MCP tools over stdio (for a lead agent)
   orc help                                            This help
   orc --version [--json]                              This binary's version (alias: -V; never remote)
 
@@ -570,6 +571,20 @@ daemon + remote (drive agents on other orc hosts over tailscale):
                         from \$ORC_DAEMON_SECRET when set. Remote attach / workflow attach
                         print a \`tailscale ssh <host> orc …\` command instead of following.
   orc list --all-hosts  Fleet view: aggregate local + every trusted peer, with a host column.
+
+mcp (orc's commands as tools for a lead agent):
+  orc mcp               MCP over stdio. Tools: spawn send wait read state list kill resume prune
+                        settings guide workflow_run|list|status|logs|resume|retry|cancel|cleanup.
+                        Each runs \`orc <cmd> … --json\` (spawn with --no-wait, workflows with
+                        --detach); \`host\` sends a call to a peer's daemon. The server's
+                        instructions and the \`guide\` tool teach the lead the team method.
+                        wait returns within --wait-timeout SEC (default 45): call it again.
+  orc daemon            Also serves those tools at http://<bind>:<port>/mcp (Streamable HTTP),
+                        always run on the daemon host, behind the daemon's auth. Each tool needs
+                        its REST scope: sessions:read (read state list wait settings),
+                        sessions:write (spawn send resume), workflows:read|write, admin (kill
+                        prune workflow cancel|cleanup). Host and Origin must name the daemon:
+                        --mcp-allow-host H (repeatable) adds a name.
 
 settings (ORC_HOST + settings.toml):
   host = "studio"       default remote target (host or host:port, as --host)
