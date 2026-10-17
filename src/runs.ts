@@ -6,10 +6,14 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { assertValidRunId, runsDir, runPath } from './paths.ts';
 import { withLock } from './lock.ts';
+import { ensurePrivateDir, writePrivateFile } from './private-fs.ts';
+import { isSameProcessAlive, processStartTime } from './runtime/process.ts';
+import type { ProcessIdentity } from './runtime/types.ts';
 import type {
   AttemptPhase,
   PlanStep,
   RunLease,
+  RunnerInfo,
   OwnerLease,
   StepAttempt,
   StepResult,
@@ -24,6 +28,7 @@ export type {
   AttemptPhase,
   PlanStep,
   RunLease,
+  RunnerInfo,
   OwnerLease,
   StepAttempt,
   StepResult,
@@ -38,9 +43,13 @@ export type {
  * - v2: plan + attempts + leases
  * - v3: outcomes, verify observations, artifacts, turn events
  * - v4: persisted DAG dependencies and maxConcurrency
+ * - v5: detached runners are plain processes: `runner { pid, startTime, logPath,
+ *       startedAt }` replaces the tmux runner name (top-level and on the lease); the lease
+ *       carries the owner's `startTime`. A legacy tmux runner name normalizes to the
+ *       read-only `legacyRunnerTmux` marker (= dead runner → orphaned, resumable).
  * Missing schemaVersion on read ⇒ treat as v1. Old records still normalize.
  */
-export const WORKFLOW_SCHEMA_VERSION = 4;
+export const WORKFLOW_SCHEMA_VERSION = 5;
 export const RUN_SCHEMA_VERSION = WORKFLOW_SCHEMA_VERSION;
 export const DEFAULT_LEASE_MS = 60_000;
 
@@ -66,6 +75,15 @@ export class FinalizedRunError extends Error {
   }
 }
 
+/** Another live detached runner already owns the run. */
+export class LiveOwnerError extends Error {
+  readonly code = 'LIVE_OWNER' as const;
+  constructor(runId: string, pid: number) {
+    super(`run '${runId}' still has a live owner (runner pid ${pid}); wait or cancel first`);
+    this.name = 'LiveOwnerError';
+  }
+}
+
 const FINAL = new Set<WorkflowRunStatus>(['done', 'failed', 'orphaned', 'cancelled']);
 
 export function isFinalStatus(status: WorkflowRunStatus): boolean {
@@ -83,28 +101,33 @@ export function isSuccessAttemptPhase(phase: AttemptPhase): boolean {
   return phase === 'succeeded';
 }
 
-function processIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return (e as { code?: string }).code === 'EPERM';
-  }
+let selfStartTimeMemo: string | null | undefined;
+/** This process's start-time token (memoized: on macOS it shells out to `ps`). */
+function selfStartTime(): string | null {
+  if (selfStartTimeMemo === undefined) selfStartTimeMemo = processStartTime(process.pid);
+  return selfStartTimeMemo;
 }
 
+/**
+ * A fresh owner lease. Identity defaults to THIS process (pid + start time); pass
+ * `pid`/`startTime` to stamp another owner (e.g. a just-spawned detached runner).
+ */
 export function makeLease(opts?: {
   ownerId?: string;
   pid?: number;
-  runnerTmux?: string;
+  startTime?: string | null;
   nowMs?: number;
   leaseMs?: number;
 }): RunLease {
   const now = opts?.nowMs ?? Date.now();
   const leaseMs = opts?.leaseMs ?? DEFAULT_LEASE_MS;
+  const pid = opts?.pid ?? process.pid;
+  const startTime =
+    opts?.startTime !== undefined ? opts.startTime : pid === process.pid ? selfStartTime() : null;
   return {
     ownerId: opts?.ownerId ?? randomUUID().slice(0, 12),
-    pid: opts?.pid ?? process.pid,
-    runnerTmux: opts?.runnerTmux,
+    pid,
+    startTime,
     updatedAt: new Date(now).toISOString(),
     expiresAt: new Date(now + leaseMs).toISOString(),
   };
@@ -114,14 +137,29 @@ export function heartbeatLease(lease: RunLease, leaseMs = DEFAULT_LEASE_MS, nowM
   return {
     ...lease,
     pid: process.pid,
+    startTime: selfStartTime(),
     updatedAt: new Date(nowMs).toISOString(),
     expiresAt: new Date(nowMs + leaseMs).toISOString(),
   };
 }
 
+/**
+ * Owner liveness of a lease (design §4.6): the lease must not be expired AND its owner
+ * process must be alive. Owner = `runner` when given (a detached runner is the liveness
+ * authority; `lease.pid` is then informational), else the lease's own identity
+ * (`pid` + `startTime` when recorded — pid-reuse safe). `runnerAlive` is an explicit
+ * override (true/false) for callers that already probed the owner.
+ */
 export function isLeaseLive(
   lease: RunLease | undefined,
-  optsOrNow?: number | { nowMs?: number; runnerAlive?: boolean | null; checkPid?: boolean },
+  optsOrNow?:
+    | number
+    | {
+        nowMs?: number;
+        runnerAlive?: boolean | null;
+        runner?: ProcessIdentity | null;
+        checkPid?: boolean;
+      },
 ): boolean {
   if (!lease) return false;
   const opts = typeof optsOrNow === 'number' ? { nowMs: optsOrNow } : optsOrNow ?? {};
@@ -130,8 +168,9 @@ export function isLeaseLive(
   if (!Number.isFinite(exp) || now >= exp) return false;
   if (opts.runnerAlive === false) return false;
   if (opts.runnerAlive === true) return true;
+  if (opts.runner) return isSameProcessAlive(opts.runner);
   if (opts.checkPid !== false && lease.pid !== undefined && lease.pid > 0) {
-    if (!processIsAlive(lease.pid)) return false;
+    if (!isSameProcessAlive({ pid: lease.pid, startTime: lease.startTime ?? null })) return false;
   }
   return true;
 }
@@ -139,21 +178,27 @@ export function isLeaseLive(
 export type OwnerLiveness = 'live' | 'expired' | 'finalized' | 'unknown';
 
 export function classifyOwnerLiveness(
-  run: Pick<WorkflowRun, 'status' | 'lease' | 'runnerTmux'>,
+  run: Pick<WorkflowRun, 'status' | 'lease'> & Partial<Pick<WorkflowRun, 'runner' | 'legacyRunnerTmux'>>,
   opts?: { nowMs?: number; runnerAlive?: boolean | null; checkPid?: boolean },
 ): OwnerLiveness {
   if (isFinalStatus(run.status) && run.status !== 'orphaned') return 'finalized';
   if (run.status === 'orphaned') return 'expired';
-  if (!run.lease && !run.runnerTmux) return 'unknown';
+  const runnerAlive =
+    opts?.runnerAlive !== undefined && opts.runnerAlive !== null
+      ? opts.runnerAlive
+      : run.legacyRunnerTmux && !run.runner
+        ? false
+        : null;
+  if (runnerAlive === false) return 'expired';
+  if (!run.lease && !run.runner) return 'unknown';
+  if (!run.lease) return (runnerAlive ?? isSameProcessAlive(run.runner)) ? 'live' : 'expired';
   const live = isLeaseLive(run.lease, {
     nowMs: opts?.nowMs,
-    runnerAlive: opts?.runnerAlive,
-    checkPid: opts?.checkPid !== undefined ? opts.checkPid : !run.runnerTmux,
+    runnerAlive,
+    runner: run.runner ?? null,
+    checkPid: opts?.checkPid,
   });
-  if (opts?.runnerAlive === false) return 'expired';
-  if (live) return 'live';
-  if (run.lease) return 'expired';
-  return 'unknown';
+  return live ? 'live' : 'expired';
 }
 
 export function projectStepsFromAttempts(attempts: StepAttempt[]): StepResult[] {
@@ -241,7 +286,8 @@ export function normalizeRun(raw: unknown): WorkflowRun | null {
     steps,
   };
   if (typeof o.finishedAt === 'string') run.finishedAt = o.finishedAt;
-  if (typeof o.runnerTmux === 'string') run.runnerTmux = o.runnerTmux;
+  const runner = normalizeRunner(o.runner);
+  if (runner) run.runner = runner;
   if (typeof o.definitionDigest === 'string') run.definitionDigest = o.definitionDigest;
   if (typeof o.sourcePath === 'string') run.sourcePath = o.sourcePath;
   if (typeof o.workflowSourcePath === 'string') run.workflowSourcePath = o.workflowSourcePath;
@@ -251,6 +297,13 @@ export function normalizeRun(raw: unknown): WorkflowRun | null {
   if (typeof o.cancelledAt === 'string') run.cancelledAt = o.cancelledAt;
   if (typeof o.cancelReason === 'string') run.cancelReason = o.cancelReason;
   if (o.policy && typeof o.policy === 'object') run.policy = o.policy as ExecutionPolicy;
+  if (o.defaultModels && typeof o.defaultModels === 'object' && !Array.isArray(o.defaultModels)) {
+    const dm: Partial<Record<Provider, string>> = {};
+    for (const [p, m] of Object.entries(o.defaultModels as Record<string, unknown>)) {
+      if ((p === 'claude' || p === 'codex' || p === 'pi') && typeof m === 'string' && m.length > 0) dm[p] = m;
+    }
+    if (Object.keys(dm).length > 0) run.defaultModels = dm;
+  }
   if (o.plan && typeof o.plan === 'object') {
     const p = o.plan as Record<string, unknown>;
     if (typeof p.name === 'string' && Array.isArray(p.steps)) {
@@ -306,17 +359,46 @@ export function normalizeRun(raw: unknown): WorkflowRun | null {
       run.lease = {
         ownerId: l.ownerId,
         pid: typeof l.pid === 'number' ? l.pid : 0,
+        ...(typeof l.startTime === 'string' || l.startTime === null
+          ? { startTime: l.startTime as string | null }
+          : {}),
         updatedAt: l.updatedAt,
         expiresAt: l.expiresAt,
-        ...(typeof l.runnerTmux === 'string' ? { runnerTmux: l.runnerTmux } : {}),
       };
     }
+  }
+  // v4 → v5: a legacy tmux runner name (top level or on the lease) becomes a read-only
+  // marker — a dead runner — unless a v5 `runner` is present.
+  if (!run.runner) {
+    const legacy = legacyTmuxRunnerName(o);
+    if (legacy) run.legacyRunnerTmux = legacy;
   }
   // Ensure steps projection when only attempts exist.
   if (run.steps.length === 0 && run.attempts && run.attempts.length > 0) {
     run.steps = projectStepsFromAttempts(run.attempts);
   }
   return run;
+}
+
+/** Validate a persisted `runner`; anything malformed is dropped. */
+function normalizeRunner(raw: unknown): RunnerInfo | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.pid !== 'number' || !Number.isInteger(r.pid) || r.pid <= 0) return undefined;
+  if (!(typeof r.startTime === 'string' || r.startTime === null)) return undefined;
+  if (typeof r.logPath !== 'string' || r.logPath.length === 0) return undefined;
+  if (typeof r.startedAt !== 'string') return undefined;
+  return { pid: r.pid, startTime: r.startTime, logPath: r.logPath, startedAt: r.startedAt };
+}
+
+/** Pre-v5 records named their tmux runner at the top level and/or on the lease. */
+function legacyTmuxRunnerName(o: Record<string, unknown>): string | undefined {
+  const top = o.runnerTmux;
+  if (typeof top === 'string' && top.length > 0) return top;
+  const lease = o.lease as Record<string, unknown> | undefined;
+  const onLease = lease && typeof lease === 'object' ? lease.runnerTmux : undefined;
+  if (typeof onLease === 'string' && onLease.length > 0) return onLease;
+  return undefined;
 }
 
 function normalizeStepOutcome(v: unknown): import('./run-schema.ts').StepOutcome | undefined {
@@ -415,16 +497,18 @@ function normalizeAttempt(raw: unknown): StepAttempt | null {
 async function writeRunUnlocked(run: WorkflowRun): Promise<void> {
   assertValidRunId(run.id);
   const dir = runsDir();
-  await fs.mkdir(dir, { recursive: true });
+  ensurePrivateDir(dir);
   const target = runPath(run.id);
   const tmp = path.join(dir, `.run.${randomUUID()}.tmp`);
+  // The legacy tmux-runner marker is read-only: never persisted.
+  const { legacyRunnerTmux: _legacy, ...rest } = run;
   const stamped: WorkflowRun = {
-    ...run,
+    ...rest,
     schemaVersion: run.schemaVersion ?? WORKFLOW_SCHEMA_VERSION,
     revision: run.revision ?? 0,
   };
-  await Bun.write(tmp, JSON.stringify(stamped, null, 2));
-  await fs.rename(tmp, target);
+  // Owner-only: the plan holds step prompts.
+  await writePrivateFile(target, JSON.stringify(stamped, null, 2), { tmpPath: tmp });
 }
 
 export async function writeRun(run: WorkflowRun): Promise<void> {
@@ -536,7 +620,30 @@ export async function updateRunRetry(
 }
 
 /**
- * Owning-runner write. Refuses to downgrade ANY finalized status to non-final.
+ * Owner fence (two owners must never both write): the stored record's owner wins while it
+ * is alive. Stored `runner` that is a DIFFERENT live process than `run.runner` → refuse;
+ * no stored runner but a LIVE stored lease with a different ownerId → refuse. A stale
+ * owner (e.g. SIGSTOPped past its lease, then superseded by a resume) thus cannot
+ * overwrite its successor when it wakes up.
+ */
+function assertOwnerFence(current: WorkflowRun, run: WorkflowRun): void {
+  if (current.runner) {
+    if (!sameProcess(current.runner, run.runner) && isSameProcessAlive(current.runner)) {
+      throw new LiveOwnerError(run.id, current.runner.pid);
+    }
+    return;
+  }
+  const lease = current.lease;
+  if (lease && lease.ownerId !== run.lease?.ownerId && isLeaseLive(lease)) {
+    throw new LiveOwnerError(run.id, lease.pid ?? 0);
+  }
+}
+
+/**
+ * Owning-runner write. Refuses to downgrade ANY finalized status to non-final, never
+ * overwrites a `cancelled` run with another status (a runner finishing concurrently
+ * with `orc workflow cancel` must not resurrect it as done/failed), and refuses to
+ * write over a different live owner (LiveOwnerError; see assertOwnerFence).
  * Resume/retry must call `beginRunRecovery` first to explicitly reopen failed/orphaned
  * (or cancelled with allowCancelled) into a controlled running recovery state.
  */
@@ -544,12 +651,16 @@ export async function writeRunOwned(run: WorkflowRun): Promise<WorkflowRun> {
   assertValidRunId(run.id);
   return withLock(`run:${run.id}`, async () => {
     const current = await readRunUnlocked(run.id);
+    if (current?.status === 'cancelled' && run.status !== 'cancelled') {
+      throw new FinalizedRunError(run.id, current.status);
+    }
     if (current && isFinalStatus(current.status) && !isFinalStatus(run.status)) {
       const reopen =
         run.status === 'running' &&
         (current.status === 'failed' || current.status === 'orphaned');
       if (!reopen) throw new FinalizedRunError(run.id, current.status);
     }
+    if (current) assertOwnerFence(current, run);
     const rev = current ? (current.revision ?? 0) + 1 : (run.revision ?? 0);
     const stamped: WorkflowRun = { ...run, schemaVersion: WORKFLOW_SCHEMA_VERSION, revision: rev };
     await writeRunUnlocked(stamped);
@@ -567,7 +678,12 @@ export async function beginRunRecovery(
   opts?: {
     ownerId?: string;
     leaseMs?: number;
-    runnerTmux?: string;
+    /**
+     * The detached runner performing the recovery (stamped on the record; it becomes
+     * the liveness authority). Omitted ⇒ the calling process owns it via the lease and
+     * any previous (dead) runner is dropped.
+     */
+    runner?: RunnerInfo;
     reason?: 'resume' | 'retry' | string;
     allowCancelled?: boolean;
   },
@@ -596,15 +712,73 @@ export async function beginRunRecovery(
     }
     const lease = makeLease({
       ownerId: opts?.ownerId ?? current.lease?.ownerId,
-      runnerTmux: opts?.runnerTmux ?? current.runnerTmux ?? current.lease?.runnerTmux,
+      ...(opts?.runner ? { pid: opts.runner.pid, startTime: opts.runner.startTime } : {}),
       leaseMs: opts?.leaseMs ?? DEFAULT_LEASE_MS,
     });
+    const { runner: _previousRunner, ...rest } = current;
     const stamped: WorkflowRun = {
-      ...current,
+      ...rest,
+      ...(opts?.runner ? { runner: opts.runner } : {}),
       status: 'running',
       finishedAt: undefined,
       cancelledAt: undefined,
       lease,
+      schemaVersion: WORKFLOW_SCHEMA_VERSION,
+      revision: (current.revision ?? 0) + 1,
+    };
+    await writeRunUnlocked(stamped);
+    return stamped;
+  });
+}
+
+/** Same process: pids match and start times match — a null/unknown start time on either side is a wildcard. */
+function sameProcess(a: ProcessIdentity | undefined, b: ProcessIdentity | undefined): boolean {
+  if (!a || !b || a.pid !== b.pid) return false;
+  const ta = a.startTime ?? null;
+  const tb = b.startTime ?? null;
+  return ta === null || tb === null || ta === tb;
+}
+
+/**
+ * Stamp a just-spawned detached runner onto its run record — called AFTER a successful
+ * spawn (nothing to revert when spawn fails). Under the run lock:
+ * - the runner already stamped itself (same pid + start time) → no write;
+ * - `done`, or `cancelled` without `allowCancelled` → FinalizedRunError, nothing written
+ *   (the caller should terminate the runner it spawned);
+ * - `running` owned by a DIFFERENT live runner → LiveOwnerError, nothing written;
+ * - otherwise → `running` (reopening failed/orphaned[/cancelled]) with `runner` and a
+ *   fresh lease whose identity is the runner's.
+ */
+export async function stampRunner(
+  runId: string,
+  runner: RunnerInfo,
+  opts?: { allowCancelled?: boolean; leaseMs?: number },
+): Promise<WorkflowRun> {
+  assertValidRunId(runId);
+  return withLock(`run:${runId}`, async () => {
+    const current = await readRunUnlocked(runId);
+    if (!current) throw new Error(`no run found for '${runId}'`);
+    if (sameProcess(current.runner, runner)) return current;
+    if (current.status === 'done') throw new FinalizedRunError(runId, current.status);
+    if (current.status === 'cancelled' && !opts?.allowCancelled) {
+      throw new FinalizedRunError(runId, current.status);
+    }
+    if (current.status === 'running' && current.runner && isSameProcessAlive(current.runner)) {
+      throw new LiveOwnerError(runId, current.runner.pid);
+    }
+    const reopening = current.status !== 'running';
+    const stamped: WorkflowRun = {
+      ...current,
+      status: 'running',
+      finishedAt: undefined,
+      ...(reopening ? { cancelledAt: undefined } : {}),
+      runner,
+      lease: makeLease({
+        ownerId: current.lease?.ownerId,
+        pid: runner.pid,
+        startTime: runner.startTime,
+        leaseMs: opts?.leaseMs ?? DEFAULT_LEASE_MS,
+      }),
       schemaVersion: WORKFLOW_SCHEMA_VERSION,
       revision: (current.revision ?? 0) + 1,
     };
@@ -619,10 +793,17 @@ export async function withRunLock<T>(runId: string, fn: () => Promise<T>): Promi
 
 async function readRunUnlocked(runId: string): Promise<WorkflowRun | null> {
   assertValidRunId(runId);
-  const f = Bun.file(runPath(runId));
-  if (!(await f.exists())) return null;
+  // One open + read-to-EOF: always a single complete inode, even while a writer
+  // atomically renames a new version into place (Bun.file exists()+json() could pair a
+  // stale size with the new inode and parse a torn read as "no run").
+  let text: string;
   try {
-    return normalizeRun(await f.json());
+    text = await fs.readFile(runPath(runId), 'utf8');
+  } catch {
+    return null;
+  }
+  try {
+    return normalizeRun(JSON.parse(text));
   } catch {
     return null;
   }

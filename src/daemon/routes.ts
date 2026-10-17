@@ -110,7 +110,7 @@ export interface SpawnRequest {
   workspace?: string;
   worktree?: boolean | { branch?: string };
   branch?: string;
-  /** `orc spawn --no-wait`: skip the boot wait AND the initial-prompt send. */
+  /** `orc spawn --no-wait`: skip the readiness wait; an initial prompt is still queued. */
   noWait?: boolean;
 }
 
@@ -187,11 +187,14 @@ export interface SendRequest {
   messageId?: unknown;
   /** Alias accepted for clients that prefer the HTTP-style name. */
   idempotencyKey?: unknown;
+  /** false → only queue the message; do not wake a suspended session (`--no-wake`). */
+  wake?: unknown;
 }
 
 export interface MappedSendRequest {
   prompt: string;
   messageId?: string;
+  wake?: false;
 }
 
 /**
@@ -203,9 +206,13 @@ export function mapSendRequest(body: SendRequest): MappedSendRequest {
   if (typeof body.prompt !== 'string' || body.prompt.length === 0) {
     throw new Error('send requires a non-empty `prompt` string');
   }
+  if (body.wake !== undefined && typeof body.wake !== 'boolean') {
+    throw new Error('wake must be a boolean when provided');
+  }
+  const wake = body.wake === false ? { wake: false as const } : {};
   const rawKey = body.messageId ?? body.idempotencyKey;
   if (rawKey === undefined || rawKey === null) {
-    return { prompt: body.prompt };
+    return { prompt: body.prompt, ...wake };
   }
   if (typeof rawKey !== 'string' || rawKey.trim().length === 0) {
     throw new Error('messageId/idempotencyKey must be a non-empty string when provided');
@@ -213,5 +220,5 @@ export function mapSendRequest(body: SendRequest): MappedSendRequest {
   const messageId = rawKey.trim();
   // Validate early so the daemon maps invalid keys to HTTP 400 (not a late 500).
   assertValidMessageId(messageId);
-  return { prompt: body.prompt, messageId };
+  return { prompt: body.prompt, messageId, ...wake };
 }

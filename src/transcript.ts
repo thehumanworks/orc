@@ -2,8 +2,8 @@
  * Token-efficient transcript parsing. Each provider writes a JSONL message log to
  * disk; we normalize it into a flat list of `Turn`s — the conversation text plus
  * ONE-LINE tool-call summaries — dropping raw tool output, reasoning/thinking, and
- * all UI chrome. `orc read` selects from this compact view by default (the raw tmux
- * pane is the `--raw` escape hatch).
+ * all UI chrome. `orc read` selects from this compact view by default (the session
+ * journal is the `--raw` escape hatch).
  */
 import type { Provider } from './types.ts';
 
@@ -146,141 +146,17 @@ export function parseClaude(jsonl: string): Turn[] {
 }
 
 // ---------------------------------------------------------------------------
-// codex
-// ---------------------------------------------------------------------------
-
-/** One-line summary for a codex tool call (name + a short arg hint). */
-function codexToolSummary(name: string, argsRaw: string): string {
-  let parsed: unknown = {};
-  try {
-    parsed = JSON.parse(argsRaw);
-  } catch {
-    // Non-JSON arg payload — fall through to the bare name.
-  }
-  const args = asRecord(parsed);
-  let cmd = args.cmd;
-  if (cmd == null && args.command != null) {
-    cmd = Array.isArray(args.command) ? args.command.join(' ') : args.command;
-  }
-  if (typeof cmd === 'string') return `${name}: ${hint(cmd)}`;
-  for (const v of Object.values(args)) {
-    if (typeof v === 'string') return `${name}: ${hint(v)}`;
-    if (Array.isArray(v) && v.every((item) => typeof item === 'string')) {
-      return `${name}: ${hint(v.join(' '))}`;
-    }
-  }
-  return name;
-}
-
-/** codex response_item payload types that represent a tool/command call. */
-const CODEX_CALL_TYPES = new Set([
-  'function_call',
-  'custom_tool_call',
-  'local_shell_call',
-  'tool_search_call',
-  'web_search_call',
-]);
-
-function codexMessageText(payload: Record<string, unknown>): string | null {
-  const direct = nonEmptyText(payload.message);
-  if (direct) return direct;
-
-  const content = payload.content;
-  if (typeof content === 'string') return nonEmptyText(content);
-  if (!Array.isArray(content)) return null;
-
-  const parts: string[] = [];
-  for (const rawBlock of content) {
-    if (!isRecord(rawBlock)) continue;
-    const text = nonEmptyText(rawBlock.text);
-    if (text) parts.push(text);
-  }
-  return parts.length > 0 ? parts.join('\n') : null;
-}
-
-function codexEventTurn(payload: Record<string, unknown>): Turn | null {
-  if (payload.type === 'user_message') {
-    const text = nonEmptyText(payload.message);
-    return text ? { role: 'user', text } : null;
-  }
-  if (payload.type === 'agent_message') {
-    const text = nonEmptyText(payload.message);
-    return text ? { role: 'assistant', text } : null;
-  }
-  return null;
-}
-
-function turnKey(turn: Turn): string {
-  return `${turn.role}\0${turn.text}`;
-}
-
-/**
- * codex `~/.codex/sessions/Y/M/D/rollout-*.jsonl`: clean conversational turns are
- * `event_msg` lines with `payload.type` of `user_message`/`agent_message` (text in
- * `payload.message`). Tool/command activity is in `response_item` `function_call`
- * (and sibling call types) lines. We take TEXT only from `event_msg` to avoid the
- * duplicate assistant text in `response_item` `message`, and tool summaries only
- * from `response_item` calls. session_meta/turn_context/token_count/reasoning and
- * all `*_output` (result) lines are dropped.
- */
-export function parseCodex(jsonl: string): Turn[] {
-  const turns: Turn[] = [];
-  const lines = parseLines(jsonl);
-  const eventText = new Set<string>();
-
-  for (const raw of lines) {
-    if (!isRecord(raw) || raw.type !== 'event_msg') continue;
-    const event = codexEventTurn(asRecord(raw.payload));
-    if (event) eventText.add(turnKey(event));
-  }
-
-  for (const raw of lines) {
-    if (!isRecord(raw)) continue;
-    const p = asRecord(raw.payload);
-    if (Object.keys(p).length === 0) continue;
-
-    if (raw.type === 'event_msg') {
-      const event = codexEventTurn(p);
-      if (event) turns.push(event);
-      continue;
-    }
-
-    if (raw.type !== 'response_item' || typeof p.type !== 'string') continue;
-
-    if (p.type === 'message') {
-      const role = p.role === 'assistant' || p.role === 'user' ? p.role : undefined;
-      const text = codexMessageText(p);
-      if (role && text) {
-        const turn = { role, text } satisfies Turn;
-        if (!eventText.has(turnKey(turn))) turns.push(turn);
-      }
-      continue;
-    }
-
-    if (CODEX_CALL_TYPES.has(p.type)) {
-      const name = typeof p.name === 'string' ? p.name : p.type;
-      // arguments (function_call) is a JSON string; custom tools carry `input`;
-      // shell calls carry an `action`. Normalize to a JSON string for the summarizer.
-      let argsRaw = typeof p.arguments === 'string' ? p.arguments : undefined;
-      if (typeof argsRaw !== 'string') {
-        const fallback = p.input ?? p.action ?? {};
-        argsRaw = typeof fallback === 'string' ? fallback : JSON.stringify(fallback ?? {});
-      }
-      turns.push({ role: 'tool', text: codexToolSummary(name, argsRaw ?? '') });
-    }
-  }
-  return turns;
-}
-
-// ---------------------------------------------------------------------------
 // pi
 // ---------------------------------------------------------------------------
 
 /**
- * pi `<session-dir>/*_<sid>.jsonl`. UNVERIFIED: no pi transcript was available to
- * inspect, so this is a best-effort tolerant parser shaped like claude's — it reads
- * a role + string/array content and summarizes any tool_use-like block. Refine once
- * a real pi transcript can be inspected; it never throws on an unexpected shape.
+ * pi session JSONL (format v3): pi's own `<session-dir>/*_<sid>.jsonl` AND the codex
+ * harness's `~/.orc/sessions/<sid>/codex-session.jsonl` (src/codex/session-file.ts).
+ * Conversation lines are `{"type":"message","message":{role,content}}`; `content` is a
+ * string or blocks (`text`, `thinking`, pi-ai `toolCall {name, arguments}`, or a
+ * claude-style `tool_use {name, input}`). user/assistant text and one-line tool summaries
+ * are kept; system messages, tool results, thinking and non-message entries are dropped.
+ * Never throws on an unexpected shape.
  */
 export function parsePi(jsonl: string): Turn[] {
   const turns: Turn[] = [];
@@ -318,11 +194,22 @@ export function parsePi(jsonl: string): Turn[] {
       } else if (rawBlock.type === 'tool_use' && typeof rawBlock.name === 'string') {
         flush();
         turns.push({ role: 'tool', text: claudeToolSummary(rawBlock.name, rawBlock.input) });
+      } else if (rawBlock.type === 'toolCall' && typeof rawBlock.name === 'string') {
+        flush();
+        turns.push({ role: 'tool', text: piToolSummary(rawBlock.name, rawBlock.arguments) });
       }
     }
     flush();
   }
   return turns;
+}
+
+/** One-line summary for a pi-ai toolCall (pi tool names: bash/read/edit/write/ls/…). */
+function piToolSummary(name: string, input: unknown): string {
+  const args = asRecord(input);
+  if (typeof args.command === 'string') return `${name}: ${hint(args.command)}`;
+  if (typeof args.path === 'string') return `${name} ${shortenPath(args.path)}`;
+  return claudeToolSummary(name, input);
 }
 
 // ---------------------------------------------------------------------------
@@ -335,7 +222,6 @@ export function parseTranscript(provider: Provider, jsonl: string): Turn[] {
     case 'claude':
       return parseClaude(jsonl);
     case 'codex':
-      return parseCodex(jsonl);
     case 'pi':
       return parsePi(jsonl);
   }

@@ -1,13 +1,16 @@
 /**
  * Human + JSON renderers for the orc CLI.
  */
-import type { SessionRecord } from '../types.ts';
+import type { AgentState, SessionRecord, SessionStatus } from '../types.ts';
 import type { WorkflowEvent, WorkflowRun, StepResult } from '../workflow.ts';
 import { schedulingSummary } from '../workflow-scheduler.ts';
 import { aliasHandle } from '../registry.ts';
 
 export interface SessionView extends SessionRecord {
-  status?: 'running' | 'dead';
+  /** running | suspended | dead (derived from the kernel; see SessionStatus). */
+  status?: SessionStatus;
+  /** Derived agent state, when cheap to compute. */
+  state?: AgentState;
 }
 
 export function printJson(value: unknown): void {
@@ -38,7 +41,11 @@ export function renderSessionLine(rec: SessionView, opts?: { lineage?: boolean }
     if (rec.depth !== undefined) parts.push(`depth=${rec.depth}`);
     if (parts.length) lineage = ` ${parts.join(' ')}`;
   }
-  return `${rec.id}  ${rec.provider} ${status} ${rec.tmuxName}${model}${agent}${alias}  cwd=${rec.cwd}${wt}${lineage}`.trim();
+  const state = rec.state ? ` ${rec.state}` : '';
+  const legacy = rec.legacy ? ` legacy=${rec.legacy}` : '';
+  // Kept by `orc prune` (unless --taken-over): the human holds it; hand back with resume.
+  const taken = rec.stoppedBy === 'takeover' ? ` taken-over(hand back: orc resume ${rec.id})` : '';
+  return `${rec.id}  ${rec.provider} ${status}${state}${model}${agent}${alias}${legacy}${taken}  cwd=${rec.cwd}${wt}${lineage}`.trim();
 }
 
 /** Multi-line human detail of a session record. */
@@ -51,8 +58,10 @@ export function renderSessionDetail(rec: SessionView): string {
     rec.agentName ? `agentName:   ${rec.agentName}` : null,
     rec.alias ? `alias:       @${rec.alias}` : null,
     rec.alias ? `aliasKey:    ${aliasHandle(rec)}` : null,
-    `tmuxName:    ${rec.tmuxName}`,
     rec.status ? `status:      ${rec.status}` : null,
+    rec.state ? `state:       ${rec.state}` : null,
+    rec.providerSessionId ? `providerId:  ${rec.providerSessionId}` : null,
+    rec.legacy ? `legacy:      ${rec.legacy}${rec.legacyTmuxName ? ` (${rec.legacyTmuxName})` : ''}` : null,
     `cwd:         ${rec.cwd}`,
     rec.worktreePath ? `worktree:    ${rec.worktreePath}` : null,
     rec.branch ? `branch:      ${rec.branch}` : null,
@@ -144,11 +153,18 @@ export function publicRunView(run: WorkflowRun): Record<string, unknown> {
     definitionDigest: run.definitionDigest,
     maxConcurrency,
     policy: run.policy,
+    ...(run.defaultModels ? { defaultModels: run.defaultModels } : {}),
     lease: run.lease
       ? {
           ownerId: run.lease.ownerId,
           expiresAt: run.lease.expiresAt,
-          runnerTmux: run.lease.runnerTmux,
+        }
+      : undefined,
+    runner: run.runner
+      ? {
+          pid: run.runner.pid,
+          startedAt: run.runner.startedAt,
+          logPath: run.runner.logPath,
         }
       : undefined,
     steps: run.steps.map((s) => ({
@@ -199,6 +215,15 @@ export function renderRunDetail(run: WorkflowRun): string {
     run.definitionDigest ? `digest:     ${run.definitionDigest.slice(0, 16)}…` : null,
     `maxConc:    ${maxConcurrency}`,
     run.lease ? `lease:      owner=${run.lease.ownerId} exp=${run.lease.expiresAt}` : null,
+    run.runner
+      ? `runner:     pid=${run.runner.pid} started=${run.runner.startedAt} log=${run.runner.logPath}`
+      : run.legacyRunnerTmux
+        ? `runner:     legacy pre-actor runner (gone${
+            run.status === 'running' || run.status === 'orphaned' || run.status === 'failed'
+              ? '; resumable'
+              : ''
+          })`
+        : null,
     `steps:      ${run.steps.length}`,
     run.attempts?.length ? `attempts:   ${run.attempts.length}` : null,
   ].filter((l): l is string => l !== null);
@@ -240,32 +265,47 @@ export const HELP_TEXT = `orc — multi-agent orchestration CLI
 Usage:
   orc spawn  --provider <claude|codex|pi> [options]   Launch a new agent session
              aliases: agent, new
-  orc send   <id|@alias> [PROMPT | - | @file] [--idempotency-key K]  Send a prompt (multi-line safe)
-  orc read   <id|@alias> [--last|--index N|--full|--raw]  Latest parsed turn by default; --full = full transcript; --raw = full pane
-  orc state  <id|@alias>                              Classify state once: starting|running|done|waiting|failed
+  orc send   <id|@alias> [PROMPT | - | @file] [--idempotency-key K] [--no-wake]
+                                                      Send a prompt (multi-line safe; wakes a suspended session)
+  orc read   <id|@alias> [--last|--index N|--full|--raw]  Latest parsed turn by default; --full = full transcript; --raw = session journal
+  orc state  <id|@alias>                              Derived state: starting|running|done|waiting|failed
   orc wait   <id|@alias> [--for S] [--timeout SEC]    Block until the agent settles (S: done|waiting|failed|settled)
   orc list   [--workspace W | --all | --dead | --all-hosts | --run ID | --lineage]  List sessions (alias: ps)
-  orc attach <id|@alias> [--read-only]                Attach to the tmux session
-  orc kill   <id|@alias> [--worktree] [--purge]       Kill session (mark dead; --purge removes record)
-  orc prune  [--worktree]                             Drop marked-dead/gone records (+ optional worktrees)
+  orc attach <id|@alias>                              Follow the session live (read-only journal view)
+  orc kill   <id|@alias> [--worktree] [--purge]       Stop the session (sticky; record kept; --purge removes record + journal)
+  orc resume <id|@alias>                              Hand a killed/taken-over/suspended session back to an actor
+  orc takeover <id|@alias>                            Stop orc's actor and print the provider's own resume command
+  orc prune  [--worktree] [--suspended] [--taken-over] Drop dead records (+ journals; optional worktrees)
   orc workflow <run|list|status|attach|logs|resume|retry|cancel|cleanup> ...  Workflows (alias: wf)
   orc daemon [--port 8787] [--bind <ip>] [--insecure] Serve the HTTP API over tailscale
   orc remote <add|list|rm> <host> [--port P]          Manage trusted peers (~/.orc/peers.json)
+  orc login  chatgpt [--import-pi] [--no-browser]     Sign in with ChatGPT for the codex provider
+  orc login  status [--json]                          Which OpenAI credential codex sessions use
+  orc logout chatgpt                                  Remove orc's ChatGPT credential
+  orc settings [--json]                               Effective settings (ORC_HOST, settings.toml) and their sources
   orc help                                            This help
 
 spawn options:
-  --provider, -p <p>     claude | codex | pi (required)
-  --model, -m <model>    model name
+  --provider, -p <p>     claude | codex | pi (required unless settings.toml sets \`provider\`)
+  --model, -m <model>    model name (default: settings.toml [models].<provider>, unless --agent)
   --agent <name>         named agent definition (codex TOML matched by name; mutually exclusive with --system-prompt)
   --alias <name>         workspace-scoped session alias; later use @name or @workspace:name
   --system-prompt <txt>  system prompt text
   --system-prompt-mode   append (default) | replace
-  --prompt <txt | ->     initial prompt sent after boot (- reads stdin)
+  --prompt <txt|-|@f>    initial prompt sent once the provider is ready (- stdin, @f file)
   --cwd <dir>            base working directory (default: cwd)
   --workspace <w>       logical workspace key
   --worktree            create a fresh git worktree as cwd
   --branch <b>          worktree branch name
-  --no-wait             return immediately; skip boot wait AND initial prompt send
+  --no-wait             return once the session's actor has started (no readiness wait);
+                        an initial --prompt is queued and delivered when ready
+
+send options:
+  --idempotency-key K   message id: a replay with the same K returns the recorded phase
+                        (replayed) instead of sending again; K with different text is an error
+  --no-wake             only queue the message; do not wake a suspended session
+  exit: 0 acknowledged or queued, 3 unknown (cut before the provider acknowledged it;
+  never re-sent automatically), 1 failed
 
 wait options:
   --for <S>             done | waiting | failed | settled (default: settled = any of the three)
@@ -276,24 +316,28 @@ workflow subcommands:
                                       Import the file's default-exported WorkflowDef and
                                       run it, streaming step events (or --json the final WorkflowRun).
                                       Exits non-zero if the run failed. --detach runs it as a
-                                      detached tmux session (orc-wf-<runId>) and returns the runId.
+                                      detached runner process and returns the runId immediately
+                                      (--json: {runId,logPath}); its output goes to
+                                      ~/.orc/runs/<runId>/runner.log.
                                       --max-concurrency N (positive int; default 1) allows
                                       dependency-free steps to run concurrently (DAG needs[]).
-                                      immediately (--json: {runId,runnerTmux}).
   orc workflow list [--json]          List persisted runs from ~/.orc/runs/ (newest first)
   orc workflow status <runId> [--json]  Print a run record (per-step state + attempts). A \`running\`
                                       record whose owner lease/runner has died is reported \`orphaned\`.
-  orc workflow attach <runId> [--read-only]  Print the tmux attach command for a --detach run's runner
+  orc workflow attach <runId> [--json]  Follow a --detach run's runner log until the run ends
+                                      (Ctrl-C stops following); --json prints {runId,logPath,runner}.
   orc workflow logs <runId> [--step <id>] [--raw] [--json]  Per-step transcript ('### step <id>
-                                      (<provider>)'). --raw shows the live pane; --json emits
-                                      {step,turns}[] (or {step,provider,pane}[] with --raw).
-  orc workflow resume <runId> [file] [--detach] [--json]
+                                      (<provider>)'). --raw shows each step session's journal
+                                      tail; --json emits {step,turns}[] (or {step,provider,journal}[]
+                                      with --raw).
+  orc workflow resume <runId> <file> [--detach] [--json]
                                       Resume an incomplete run (skips successful attempts; adopts
-                                      live owned sessions). Requires original workflow file when
-                                      the plan used function \`done\` predicates (non-portable; prefer \`verify\`).
-  orc workflow retry <runId> [--step id] [file] [--detach] [--json]
+                                      in-flight steps whose instruction reached a still-resumable
+                                      session). <file> is the original workflow file (required
+                                      locally; over --host it defaults to the run's recorded file).
+  orc workflow retry <runId> [--step id] <file> [--detach] [--json]
                                       New attempts for failed/incomplete steps (or --step and
-                                      subsequent). Preserves attempt history.
+                                      subsequent). Preserves attempt history. <file> as for resume.
   orc workflow cancel <runId> [--cascade] [--json]
                                       Idempotent cancel; --cascade kills only sessions proven owned
                                       by this run/root (never unrelated sessions).
@@ -309,7 +353,7 @@ Durable attempts use phases: queued|spawning|dispatched|running|verifying|succee
 waiting|cancelled|abandoned. Foreground runs carry an owner lease so crashes reconcile.
 Not exactly-once across process boundaries — durable intent, adoption, and compensation.
 Token/cost budgets are not measurable and are not enforced; ExecutionPolicy supports
-maxDepth, maxSessions, maxConcurrentSessions, deadlineMs, canDelegate.
+maxDepth, maxSessions, maxConcurrentSessions (live actors), deadlineMs, canDelegate.
 
 daemon + remote (drive agents on other orc hosts over tailscale):
   orc daemon            Run Bun.serve exposing the SDK as JSON. Binds to this host's
@@ -322,34 +366,87 @@ daemon + remote (drive agents on other orc hosts over tailscale):
                         invalid credentials → 401; authenticated but missing scope → 403.
                         Scopes: sessions:read|write, workflows:read|write, admin (implies all).
                         Kill/cancel/cleanup require admin; read/list require *:read;
-                        spawn/send/wait/run/resume/retry require *:write.
+                        spawn/send/wait/run/resume/retry require *:write. Other errors:
+                        400 bad request, 403 policy violation, 404 unknown session/run,
+                        409 stopped session / idempotency conflict / legacy session / run
+                        state, 502 provider failed to start, 500 anything else.
   orc remote add <h>    Trust peer <h> (also the host list for --host / --all-hosts).
   orc --host <h> <cmd>  Run <cmd> against the daemon on <h> (host or host:port) over HTTP
                         instead of locally — list/spawn/send/read/wait/state/kill/workflow.
-                        Output (and --json) is identical to local. Sends Bearer from
-                        \$ORC_DAEMON_TOKEN and/or x-orc-secret from \$ORC_DAEMON_SECRET when set.
-                        Remote attach prints a tailscale ssh hint (tmux is host-local).
+                        Output (and --json) matches local, except: state --json is only
+                        {id,state,status,suspended,stopped}; list takes only --workspace/
+                        --all/--dead (rows have no lineage); workflow resume/retry take no
+                        --detach. Sends Bearer from \$ORC_DAEMON_TOKEN and/or x-orc-secret
+                        from \$ORC_DAEMON_SECRET when set. Remote attach / workflow attach
+                        print a \`tailscale ssh <host> orc …\` command instead of following.
   orc list --all-hosts  Fleet view: aggregate local + every trusted peer, with a host column.
+
+settings (ORC_HOST + settings.toml):
+  host = "studio"       default remote target (host or host:port, as --host)
+  provider = "claude"   default spawn --provider
+  [models]              default --model per provider (spawn, and workflow steps)
+  claude = "haiku"
+  Files: global \$ORC_HOME/settings.toml (~/.orc/settings.toml); local: the NEAREST
+  <dir>/.orc/settings.toml from the cwd up to its git toplevel (outside a repo: the cwd only).
+  Local overrides global per key ([models] per provider). Unknown keys warn on stderr; a bad
+  value or file is an error naming the file and key. An invalid ORC_HOST refuses only the
+  commands it would route (not with --local / --host).
+  host:     --local > --host > ORC_HOST (set; "" = no default host) > local > global > this host
+  provider: --provider > local > global (else spawn errors)
+  model:    --model > local [models] > global [models] > the provider's own default
+  A default host applies to list/spawn/send/read/wait/state/kill/attach/workflow (not to
+  list --all-hosts) and prints \`orc: → <host> (from <ORC_HOST|file>)\` on stderr. Host-local
+  commands ignore it. A host from a LOCAL file must be a trusted peer (orc remote add) or your
+  global settings host, else the command is refused. Inside an orc session (ORC_PARENT_SESSION_ID / ORC_DEPTH>=1 set)
+  default hosts are ignored; --host still works. ORC_HOST never reaches agent processes.
+  spawn defaults resolve here and are sent explicitly (also over --host). A local workflow
+  run fixes its [models] at start (run.defaultModels); resume/retry and detached runners use
+  that record, never settings; over --host the daemon applies no [models] (also --detach). A
+  detached runner always runs with --local. The SDK reads no settings files (loadSettings()).
+
+codex provider (orc's built-in harness; no codex CLI needed):
+  Talks to the OpenAI Responses API directly. Credentials, first match wins: \`orc login
+  chatgpt\` (~/.orc/auth/chatgpt.json), pi's ChatGPT login (~/.pi/agent/auth.json, or
+  $PI_CODING_AGENT_DIR), then OPENAI_API_KEY. Without --model a session uses the first model
+  your ChatGPT account lists (API key: the newest chat model pi-ai knows); spawn prints it.
+  Tools: read, write, edit, bash, ls. No context compaction yet: a turn that overflows the
+  model's context window fails — start a new session. \`orc takeover\` prints
+  \`pi --session <file>\` (pi's session format; pi needs its own OpenAI login).
 
 Global:
   --host <h>            Run the command against the daemon on host <h> (see above)
+  --local               Run here, ignoring --host, ORC_HOST and settings.toml \`host\`
   --json                machine-readable output; non-zero exit + {error} on failure
 
+Sessions run as detached per-session actors that drive each provider over a structured
+protocol (no terminal). Status: running (actor live) | suspended (actor gone without a
+stop — crash/reboot; the next send or \`orc resume\` wakes it) | spawning (being created
+right now) | dead (killed, taken over, pre-actor legacy, or a codex app-server session).
+\`orc list\` shows running + suspended + spawning; --dead/--all include dead. \`orc prune\`
+never removes suspended sessions unless --suspended, nor sessions taken over by
+\`orc takeover\` unless --taken-over (their dir holds the system prompt the printed provider
+resume command uses; hand back with \`orc resume <id>\`).
+
 read defaults to the latest parsed conversation turn. --full emits the full parsed
-transcript, --index N emits zero-based parsed turn N, and --raw emits the full pane.
-read --json emits the selected parsed turn array ([{role,text},...]); --raw --json emits
-{id,pane}; if no transcript exists yet it falls back to {id,fallback:true,pane}.
-state --json emits {id,state}. wait --json emits {id,state,elapsedMs,timedOut};
-exit 0 iff the requested state actually settled after debounce, non-zero on timeout.
+transcript, --index N emits zero-based parsed turn N, and --raw emits the session journal
+(JSONL; --json: {id,journal}). If no transcript exists yet it falls back to the journal
+rendered as text (--json: {id,fallback:true,journal}).
+state --json emits {id,state,status,stopped,suspended,live,pendingMessages,openTurn?,
+lastTurn?,stopReason?,legacy?}. wait --json emits {id,state,elapsedMs,timedOut}; exit 0 iff a
+requested state was reached.
+send --json emits {ok,id,phase,messageId,replayed}.
+takeover prints \`cd <cwd> && <provider resume command>\` (--json: {id,cwd,command});
+\`orc resume <id>\` hands the session back. attach --json: {id,command,journalPath}.
 
 Session aliases are active-session handles, not agent definitions. Spawn with
 \`--alias debugger\`, then address it as \`@debugger\` from the same workspace or
 \`@orc:debugger\` from outside a workspace named \`orc\`. The same alias cannot be
-used by two active sessions in one workspace, but can be reused after the old session
-is killed or pruned. Dead transcript records remain addressable by id.
+used by two active (running or suspended) sessions in one workspace, but can be reused
+after the old session is killed or pruned. Dead records remain addressable by id.
 
-State meaning: 'done' = the composer is idle and ready for YOUR input (NOT "succeeded"
-— it also covers an agent that asked a clarifying question, which is pane-identical to
-a finished turn). 'waiting' = blocked on a TUI modal (trust/approval/update). 'failed'
-= the pane is gone (crash OR clean exit like /exit — "terminated", not "errored").
+State meaning (derived from the session journal): 'done' = no open turn and nothing
+queued — ready for YOUR input (NOT "succeeded"; it also covers an agent that asked a
+clarifying question). 'running' = a turn is open or messages are queued. 'waiting' = the
+provider asked for a permission decision. 'failed' = the last turn failed or the session
+is not live (stopped, or suspended and resumable — see \`orc state --json\`).
 `;

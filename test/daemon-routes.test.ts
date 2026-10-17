@@ -164,6 +164,17 @@ describe('mapSendRequest — prompt + optional idempotency key', () => {
     ).toEqual({ prompt: 'p', messageId: 'primary' });
   });
 
+  test('wake:false maps through (--no-wake); a non-boolean wake is rejected', () => {
+    expect(mapSendRequest({ prompt: 'p', wake: false })).toEqual({ prompt: 'p', wake: false });
+    expect(mapSendRequest({ prompt: 'p', wake: true })).toEqual({ prompt: 'p' });
+    expect(mapSendRequest({ prompt: 'p', messageId: 'k', wake: false })).toEqual({
+      prompt: 'p',
+      messageId: 'k',
+      wake: false,
+    });
+    expect(() => mapSendRequest({ prompt: 'p', wake: 'no' })).toThrow(/wake must be a boolean/);
+  });
+
   test('rejects missing/empty prompt', () => {
     expect(() => mapSendRequest({})).toThrow(/non-empty `prompt`/);
     expect(() => mapSendRequest({ prompt: '' })).toThrow(/non-empty `prompt`/);
@@ -205,6 +216,14 @@ describe('extractHostFlag — peeling the global --host', () => {
   });
   test('no --host → host undefined, argv intact', () => {
     expect(extractHostFlag(['list', '--all'])).toEqual({ rest: ['list', '--all'] });
+  });
+  test('--local is peeled anywhere and reported', () => {
+    expect(extractHostFlag(['--local', 'list', '--json'])).toEqual({ local: true, rest: ['list', '--json'] });
+    expect(extractHostFlag(['spawn', '-p', 'claude', '--local', '--host', 'mini'])).toEqual({
+      host: 'mini',
+      local: true,
+      rest: ['spawn', '-p', 'claude'],
+    });
   });
 });
 

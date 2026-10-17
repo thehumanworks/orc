@@ -1,7 +1,9 @@
 # Design: orc workflows (goal-feature 2)
 
-Status: **Phase 1 + Phase 2 implemented** in the current codebase. Phase 3 (portable predicates /
-declarative plan without function `done` callbacks) is future work.
+Status: **implemented** — phase 1 (runner), phase 2 (durable execution tree), phase 3 (portable
+`verify` descriptors; function `done` predicates remain a local-only escape hatch) and phase 5 (DAG
+scheduler). Since the actor runtime (`DESIGN-runtime.md`) steps settle on journal-derived state, not
+pane heuristics.
 
 Phase 2 durable execution tree (summary of implemented semantics):
 - `schemaVersion` + monotonic `revision` with run-scoped lock and CAS writes (`src/runs.ts`)
@@ -11,7 +13,8 @@ Phase 2 durable execution tree (summary of implemented semantics):
 - Resume / retry / cancel / cleanup CLI + daemon routes; adoption refuses silent duplicates
 - Lineage via `ORC_*` env; `ExecutionPolicy` maxDepth/maxSessions/maxConcurrentSessions/deadlineMs/canDelegate
 - Not exactly-once across process/filesystem boundaries; token/cost budgets not enforced
-- Function `done` predicates require the original workflow file on resume until phase 3
+- `resume` / `retry` take the original workflow file (required by the local CLI; over `--host` the
+  daemon falls back to the run's recorded source file); the plan digest must match
 
 ---
 
@@ -21,6 +24,9 @@ the layer above the `agent` primitive that sequences multiple agents/steps to ge
 (e.g. the research→plan→code→verify→retro loop, or fan-out across files).
 
 ## What we already know works
+_(Historical: written before the actor runtime. The pane sentinel and idle heuristics below were
+replaced by journal-derived `state()` / `waitFor()`; the lessons still hold.)_
+
 `scripts/dogfood/run.ts` is, in effect, a hardcoded **one-step workflow**: spawn an agent in a
 worktree → deliver a versioned task file → watch until it _settles_ → report the branch diff. It has
 already driven two real features to merge. Feature 2 generalizes this proven pattern into a reusable,
@@ -60,13 +66,13 @@ export default defineWorkflow({
 });
 ```
 
-A step = spawn an agent (provider, prompt or taskFile, worktree/cwd) → `waitFor` it to settle _(pending
-F1)_ → evaluate its `done(ctx)` predicate. `ctx` exposes `state`, `commitsAhead`, captured output, and
-prior step results (so steps can reference `${implement.worktree}`). A failed/timed-out step stops the
-workflow (or a `onFail` branch).
+A step = spawn an agent (provider, prompt or taskFile, worktree/cwd) → `waitFor` it to settle →
+evaluate `done(ctx)` or its portable `verify`. `ctx` exposes `state`, `commitsAhead`, `capture` (the
+last assistant text + final turn, from the journal), and prior step results (so steps can reference
+`${implement.worktree}`). A failed/timed-out step stops new launches unless `continueOnFail`.
 
 ### Reliability
-- Sequencing is built on F1's `waitFor` (debounced settle detection), NOT ad-hoc pane polling.
+- Sequencing is built on `waitFor` (settles on journal-derived state), never ad-hoc polling.
 - A step's success is an explicit predicate over a **hard signal** (a commit, a written file, an
   exit), never a substring of the agent's own narration.
 - Every step has a timeout; a workflow records per-step state transitions to `~/.orc` so a crash is
@@ -81,12 +87,15 @@ would host and expose.
 
 ### CLI surface (implemented)
 ```
-orc workflow run <file> [--detach] [--json]
-orc workflow list|status|attach|logs …
-orc workflow resume <runId> [file] [--detach]
-orc workflow retry <runId> [--step id] [file] [--detach]
-orc workflow cancel <runId> [--cascade]
-orc workflow cleanup <runId> [--sessions] [--worktrees]
+orc workflow run <file> [--detach] [--json] [--max-concurrency N]
+orc workflow list [--json]
+orc workflow status <runId> [--json]
+orc workflow attach <runId> [--json]                  # follow a --detach run's runner.log
+orc workflow logs <runId> [--step id] [--raw] [--json] # --raw: step sessions' journal tails
+orc workflow resume <runId> <file> [--detach] [--json]
+orc workflow retry <runId> [--step id] <file> [--detach] [--json]
+orc workflow cancel <runId> [--cascade] [--json]
+orc workflow cleanup <runId> [--sessions] [--worktrees] [--json]
 ```
 
 Daemon mirrors control routes: `POST /workflows/runs/:id/{resume,retry,cancel,cleanup}`.

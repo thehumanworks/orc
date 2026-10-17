@@ -5,10 +5,15 @@ import os from 'node:os';
 import path from 'node:path';
 
 /** The orc home dir: $ORC_HOME or ~/.orc. */
-export function orcHome(): string {
-  const override = process.env.ORC_HOME;
+export function orcHome(env: NodeJS.ProcessEnv = process.env): string {
+  const override = env.ORC_HOME;
   if (override && override.length > 0) return path.resolve(override);
   return path.join(os.homedir(), '.orc');
+}
+
+/** The global settings file, `$ORC_HOME/settings.toml` (see settings.ts). */
+export function globalSettingsPath(env: NodeJS.ProcessEnv = process.env): string {
+  return path.join(orcHome(env), 'settings.toml');
 }
 
 export function registryPath(): string {
@@ -33,7 +38,8 @@ export function piSessionDir(sessionId: string): string {
 
 /**
  * orc-owned per-session state dir under ~/.orc/sessions/<sessionId>/ (outside any
- * worktree/repo). Used for Codex persona instruction files and similar sidecars.
+ * worktree/repo): the actor kernel's spawn/state/journal/inbox plus orc sidecars such as
+ * the system prompt file.
  */
 export function sessionStateDir(sessionId: string): string {
   const id = sessionId.trim();
@@ -44,19 +50,21 @@ export function sessionStateDir(sessionId: string): string {
 }
 
 /**
- * Absolute path for a Codex persona/system-prompt instructions file owned by orc.
- * Never written into the agent cwd / worktree (no AGENTS.md mutation).
+ * Absolute path of the orc-owned system prompt file a provider reads at launch
+ * (every provider reads its system prompt from a file; never from argv, never from the
+ * agent cwd / worktree).
  */
-export function sessionInstructionsPath(sessionId: string): string {
+export function sessionSystemPromptPath(sessionId: string): string {
+  return path.join(sessionStateDir(sessionId), 'system-prompt.md');
+}
+
+/** Pre-actor (tmux) codex persona file name; only ever removed, never written. */
+export function legacySessionInstructionsPath(sessionId: string): string {
   return path.join(sessionStateDir(sessionId), 'instructions.md');
 }
 
 export function runsDir(): string {
   return path.join(orcHome(), 'runs');
-}
-
-export function messagesDir(): string {
-  return path.join(orcHome(), 'messages');
 }
 
 export function locksDir(): string {
@@ -125,11 +133,6 @@ export function runPath(runId: string): string {
   return path.join(runsDir(), `${runId}.json`);
 }
 
-export function messagePath(messageId: string): string {
-  assertValidMessageId(messageId);
-  return path.join(messagesDir(), `${messageId}.json`);
-}
-
 /** Per-run dir (~/.orc/runs/<runId>/): instructions, artifacts, results. */
 export function runInstructionsDir(runId: string): string {
   assertValidRunId(runId);
@@ -138,6 +141,11 @@ export function runInstructionsDir(runId: string): string {
 
 export function runDir(runId: string): string {
   return runInstructionsDir(runId);
+}
+
+/** Detached workflow runner stdout/stderr log: ~/.orc/runs/<runId>/runner.log (append-only). */
+export function runnerLogPath(runId: string): string {
+  return path.join(runDir(runId), 'runner.log');
 }
 
 /** Per-attempt working dir: ~/.orc/runs/<runId>/attempts/<attemptId>/. */

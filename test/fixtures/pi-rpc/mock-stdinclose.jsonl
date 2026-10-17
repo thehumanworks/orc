@@ -1,0 +1,12 @@
+{"dir": "send", "line": "{\"id\": \"p1\", \"type\": \"prompt\", \"message\": \"SLOW close-midrun\"}"}
+{"dir": "recv", "line": "{\"id\":\"p1\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true,\"data\":{\"disposition\":\"started\"}}"}
+{"dir": "recv", "line": "{\"type\":\"agent_start\"}"}
+{"dir": "recv", "line": "{\"type\":\"turn_start\"}"}
+{"dir": "recv", "line": "{\"type\":\"message_start\",\"message\":{\"role\":\"system\",\"content\":\"\",\"sections\":{\"preamble\":\"<trimmed>\",\"tools\":\"<trimmed>\",\"rules\":\"<trimmed>\",\"docs\":\"<trimmed>\",\"cwd\":\"<trimmed>\"},\"timestamp\":1791995541306,\"toolsAdded\":[{\"name\":\"read\"},{\"name\":\"bash\"},{\"name\":\"edit\"},{\"name\":\"write\"}]}}"}
+{"dir": "recv", "line": "{\"type\":\"message_end\",\"message\":{\"role\":\"system\",\"content\":\"\",\"sections\":{\"preamble\":\"<trimmed>\",\"tools\":\"<trimmed>\",\"rules\":\"<trimmed>\",\"docs\":\"<trimmed>\",\"cwd\":\"<trimmed>\"},\"timestamp\":1791995541306,\"toolsAdded\":[{\"name\":\"read\"},{\"name\":\"bash\"},{\"name\":\"edit\"},{\"name\":\"write\"}]}}"}
+{"dir": "recv", "line": "{\"type\":\"message_start\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"SLOW close-midrun\"}],\"timestamp\":1791995541305}}"}
+{"dir": "recv", "line": "{\"type\":\"message_end\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"SLOW close-midrun\"}],\"timestamp\":1791995541305}}"}
+{"dir": "recv", "line": "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[],\"api\":\"openai-completions\",\"provider\":\"mock\",\"model\":\"mock-model\",\"usage\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":0,\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"total\":0}},\"stopReason\":\"pending\",\"timestamp\":1791995541331}}"}
+{"dir": "recv", "line": "{\"type\":\"message_update\",\"usage\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":0,\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"total\":0}},\"assistantMessageEvent\":{\"type\":\"text_start\",\"contentIndex\":0}}"}
+{"dir": "info", "line": "close-stdin"}
+{"dir": "recv", "line": "{\"type\":\"message_update\",\"usage\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":0,\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"total\":0}},\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"slow \"}}"}

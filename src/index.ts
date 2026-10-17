@@ -2,20 +2,59 @@
  * orc SDK public entry.
  */
 import fs from 'node:fs/promises';
-import { getDriver } from './drivers/driver.ts';
 import { readRegistry, findRecord, findRecordByAlias, parseAliasSelector, updateRegistry } from './registry.ts';
-import type { Driver } from './drivers/driver.ts';
 import { gitToplevel, removeWorktree } from './worktree.ts';
 import { resolveWorkspace } from './agent.ts';
 import { Session } from './session.ts';
-import { removeSessionInstructions } from './session-files.ts';
-import type { SessionRecord } from './types.ts';
+import { removeSessionDir } from './session-files.ts';
+import { isSpawnPending, kernelLiveness, sessionStatusOf } from './session-status.ts';
+import type { LivenessProbe } from './session-status.ts';
+import { initialActorState, leaseLive, readActorState, withActorLock } from './runtime/actor-state.ts';
+import { finalizeStopLocked } from './runtime/stop.ts';
+import type { ActorStateFile } from './runtime/types.ts';
+import { readSpawnSpec } from './runtime/spec.ts';
+import type { SessionRecord, SessionStatus } from './types.ts';
 
 export { agent, validateOptions } from './agent.ts';
-export { Session } from './session.ts';
-export type { WaitForOptions, SendOptions, SendResult } from './session.ts';
-export { classifyState, reduceWait, isSettled } from './state.ts';
-export type { StateMatchers, WaitTracking } from './state.ts';
+export { Session, SessionNotControllableError } from './session.ts';
+export type {
+  WaitForOptions,
+  WaitForResult,
+  SendOptions,
+  SendResult,
+  SessionStateDetail,
+  TakeoverResult,
+  AttachOptions,
+} from './session.ts';
+export { isSettled, resolveUntil } from './state.ts';
+// Settings (ORC_HOST + settings.toml): the SDK never reads them on its own; callers who want
+// the CLI's resolution call loadSettings() and pass the values explicitly.
+export {
+  loadSettings,
+  decideHost,
+  resolveSpawnDefaults,
+  defaultModelsOf,
+  hasOrcLineage,
+  isTrustedPeer,
+  parseSettingsToml,
+  SettingsError,
+  ORC_HOST_ENV,
+} from './settings.ts';
+export type {
+  Settings,
+  Setting,
+  SettingSource,
+  SettingsFileValues,
+  SettingsFs,
+  LoadSettingsOptions,
+  ConsideredFile,
+  HostDecision,
+} from './settings.ts';
+export { sessionStatusOf, countLiveSessions } from './session-status.ts';
+export type { LivenessProbe } from './session-status.ts';
+export { renderJournal, renderJournalEntry, renderCapture, lastAssistantText } from './journal-render.ts';
+export { nativeResumeCommand } from './provider-cli.ts';
+export type { JournalEntry, JournalEvent } from './runtime/types.ts';
 export { conversationTurns, parseTranscript, renderTurns, selectTurns } from './transcript.ts';
 export type { Turn, TurnRole, TurnSelection } from './transcript.ts';
 export {
@@ -30,9 +69,10 @@ export {
   interpolate,
   evaluateStep,
   stepOutcomeFromWait,
-  runnerTmuxName,
   reconcileRunStatus,
   reconcileRun,
+  runOwnerLiveness,
+  assertRecoveryAllowed,
   assembleStepLogs,
   resolveContainedWorkflowFile,
   workflowImportRoots,
@@ -42,6 +82,8 @@ export {
   digestPlanSteps,
   adoptionDecision,
   decideAdoption,
+  probeAttemptSession,
+  instructionMessageId,
   createAttempt,
   transitionAttempt,
   nextAttemptNumber,
@@ -78,11 +120,14 @@ export type {
   WorkflowEvent,
   RunWorkflowOptions,
   StepExecutor,
+  StepAdopter,
+  AdoptionProbe,
   StepAttempt,
   AttemptPhase,
   WorkflowPlan,
   PlanStep,
   RunLease,
+  RunnerInfo,
   OwnerLease,
   WorkflowRunStatus,
   ResumeOptions,
@@ -101,7 +146,22 @@ export {
   runArtifactsDir,
   runResultPath,
   runAttemptDir,
+  runnerLogPath,
 } from './paths.ts';
+export {
+  launchDetachedRun,
+  launchDetachedRecovery,
+  followRunnerLog,
+  trapRunnerTermination,
+  currentRunnerInfo,
+  RunnerSpawnError,
+} from './workflow-runner.ts';
+export type {
+  RunnerSpawner,
+  LaunchRunnerOptions,
+  DetachedLaunch,
+  FollowRunnerLogOptions,
+} from './workflow-runner.ts';
 export {
   runVerify,
   executeVerify,
@@ -160,13 +220,7 @@ export {
   commitCountVsMain,
   hasWorkingTreeChanges,
 } from './worktree.ts';
-export {
-  hashPayload,
-  evaluateDeliveryReplay,
-  readDelivery,
-  persistDelivery,
-} from './messages.ts';
-export type { DeliveryPhase, DeliveryRecord } from './messages.ts';
+export type { DeliveryPhase } from './messages.ts';
 export { withLock, acquireLock } from './lock.ts';
 export {
   writeRun,
@@ -188,8 +242,10 @@ export {
   latestAttempt,
   patchAttempt,
   classifyOwnerLiveness,
+  stampRunner,
   CasConflictError,
   FinalizedRunError,
+  LiveOwnerError,
   RUN_SCHEMA_VERSION,
   WORKFLOW_SCHEMA_VERSION,
   DEFAULT_LEASE_MS,
@@ -201,7 +257,6 @@ export type {
   SessionRecord,
   SessionStatus,
   SystemPromptMode,
-  PaneInfo,
   ExecutionPolicy,
   ExecutionLineage,
 } from './types.ts';
@@ -218,6 +273,7 @@ export async function listSessions(filter?: {
   dead?: boolean;
   runId?: string;
   rootRunId?: string;
+  liveness?: LivenessProbe;
 }): Promise<Session[]> {
   const records = await readRegistry();
   let selected: SessionRecord[] = records;
@@ -240,71 +296,115 @@ export async function listSessions(filter?: {
     selected = selected.filter((r) => r.workspace === ws);
   }
   if (!filter?.all && !filter?.dead) {
-    selected = selected.filter((r) => r.status !== 'dead');
+    // D1: running + suspended (resumable) by default; dead only with --dead/--all. A
+    // spawn in progress (record reserved, actor not created yet) is shown too.
+    const probe = filter?.liveness ?? kernelLiveness;
+    selected = selected.filter((r) => probe(r) !== 'dead' || isSpawnPending(r));
   }
   return selected.map((r) => new Session(r));
 }
 
-export async function pruneSessions(opts?: {
-  removeWorktree?: boolean;
-  driver?: Driver;
-}): Promise<string[]> {
-  const driver = opts?.driver ?? getDriver();
-  const records = await readRegistry();
-  const deadById = new Map<string, string>();
-  await Promise.all(
-    records.map(async (r) => {
-      if (r.status === 'dead') {
-        deadById.set(r.id, r.tmuxName);
-        return;
-      }
-      try {
-        if (!(await driver.isAlive(r.tmuxName))) deadById.set(r.id, r.tmuxName);
-      } catch {
-        /* ignore */
-      }
-    }),
-  );
-  const dead = await updateRegistry((current) => {
-    const toRemove = new Set<string>();
-    for (const r of current) {
-      const observedTmuxName = deadById.get(r.id);
-      if (r.status === 'dead' || observedTmuxName === r.tmuxName) toRemove.add(r.id);
-    }
-    return {
-      records: current.filter((r) => !toRemove.has(r.id)),
-      value: current.filter((r) => toRemove.has(r.id)),
-    };
-  });
-  if (dead.length === 0) return [];
-  for (const r of dead) {
-    // Drop orc-owned codex instruction sidecars for purged records (not user files).
-    await removeSessionInstructions(r).catch(() => {});
-    if (opts?.removeWorktree && r.worktreePath) {
-      await removeWorktree(r.cwd, r.worktreePath, { branch: r.branch }).catch(() => {});
-    }
+/**
+ * Remove dead records (killed / legacy / no runtime state) and their session dirs.
+ * - Suspended (resumable) sessions are NEVER removed unless `suspended: true`, which also
+ *   stops them first.
+ * - Sessions TAKEN OVER by a human (`orc takeover`) are kept unless `takenOver: true`:
+ *   their dir holds the system prompt the printed provider resume command refers to.
+ * - A young record whose spawn is still in progress is kept.
+ * Each removal re-checks the session under its actor lock and deletes the record + dir
+ * while holding it, so a concurrent `orc resume` (reopen → wake, same lock) either wins
+ * (the session is kept) or finds nothing to revive — never an actor in a deleted dir.
+ */
+/**
+ * Under the actor lock: may this session's record + dir go? Legacy, never created (no
+ * spawn.json) and `stopped` sessions may; live ones never; suspended ones only with
+ * `suspendedToo` (they are stopped first).
+ */
+async function settleForRemoval(rec: SessionRecord, suspendedToo: boolean): Promise<boolean> {
+  if (rec.legacy) return true;
+  let st: ActorStateFile | undefined;
+  try {
+    if (!readSpawnSpec(rec.sessionId)) return true;
+    st = readActorState(rec.sessionId);
+  } catch {
+    return true; // invalid id / unreadable: nothing the kernel can run
   }
-  return dead.map((r) => r.id);
+  if (leaseLive(st)) return false; // never remove a live session
+  if (st?.phase === 'stopped') return true;
+  // Not stopped: suspended — possibly reopened by a concurrent `orc resume` (reopen runs
+  // under this same lock before it un-kills the record). Kept, unless prune --suspended:
+  // then its sticky stop is finalized HERE, in the same lock section, so no wake can slip
+  // between the stop and the removal.
+  if (!suspendedToo) return false;
+  await finalizeStopLocked(rec.sessionId, st ?? initialActorState(rec.sessionId, 'suspended'), 'prune');
+  return true;
 }
 
-export async function getSession(idOrName: string): Promise<Session | null> {
+export async function pruneSessions(opts?: {
+  removeWorktree?: boolean;
+  suspended?: boolean;
+  takenOver?: boolean;
+  liveness?: LivenessProbe;
+}): Promise<string[]> {
+  const probe = opts?.liveness ?? kernelLiveness;
+  const prunable = (r: SessionRecord): SessionStatus | undefined => {
+    let status: SessionStatus;
+    try {
+      status = probe(r);
+    } catch {
+      return undefined; // liveness unknowable → keep
+    }
+    if (status === 'running' || status === 'spawning') return undefined;
+    if (status === 'suspended' && !opts?.suspended) return undefined;
+    if (status === 'dead' && isSpawnPending(r)) return undefined;
+    if (r.stoppedBy === 'takeover' && !opts?.takenOver) return undefined;
+    return status;
+  };
+  const candidates = (await readRegistry()).filter((r) => prunable(r) !== undefined);
+  const removed: SessionRecord[] = [];
+  for (const cand of candidates) {
+    const gone = await withActorLock(cand.sessionId, async () => {
+      const current = await findRecord(cand.id);
+      // Only the exact record that was judged (a replacement with the same id survives),
+      // and only if it is STILL prunable now that no resume can interleave. The kernel is
+      // authoritative here: `orc resume` reopens under this lock BEFORE it clears the
+      // record's dead marker, so a session the kernel no longer calls stopped is kept.
+      if (!current || current.sessionId !== cand.sessionId || prunable(current) === undefined) return undefined;
+      if (!(await settleForRemoval(current, opts?.suspended === true))) return undefined;
+      const taken = await updateRegistry((records) => {
+        const hit = records.find((r) => r.id === cand.id && r.sessionId === cand.sessionId);
+        return { records: hit ? records.filter((r) => r !== hit) : records, value: hit };
+      });
+      if (taken) await removeSessionDir(taken.sessionId);
+      return taken;
+    });
+    if (!gone) continue;
+    removed.push(gone);
+    if (opts?.removeWorktree && gone.worktreePath) {
+      // The branch is kept (it may hold the agent's commits); only the checkout goes.
+      await removeWorktree(gone.cwd, gone.worktreePath).catch(() => {});
+    }
+  }
+  return removed.map((r) => r.id);
+}
+
+export async function getSession(
+  idOrName: string,
+  opts?: { liveness?: LivenessProbe },
+): Promise<Session | null> {
   const alias = parseAliasSelector(idOrName);
   const rec = alias
     ? await findRecordByAlias(alias, {
         defaultWorkspace: await defaultWorkspace(),
-        driver: getDriver(),
+        ...(opts?.liveness ? { liveness: opts.liveness } : {}),
       })
     : await findRecord(idOrName);
   return rec ? new Session(rec) : null;
 }
 
-export async function statusOf(sessions: Session[]): Promise<Map<string, 'running' | 'dead'>> {
-  const driver = getDriver();
-  const out = new Map<string, 'running' | 'dead'>();
-  await Promise.all(
-    sessions.map(async (s) => {
-      out.set(s.id, (await driver.isAlive(s.tmuxName)) ? 'running' : 'dead');
-    }),
-  );
+/** Lifecycle status (running | suspended | dead) per session id. */
+export async function statusOf(sessions: Session[]): Promise<Map<string, SessionStatus>> {
+  const out = new Map<string, SessionStatus>();
+  for (const s of sessions) out.set(s.id, sessionStatusOf(s.toJSON()));
   return out;
 }

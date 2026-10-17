@@ -4,7 +4,6 @@ import path from 'node:path';
 import {
   conversationTurns,
   parseClaude,
-  parseCodex,
   parsePi,
   parseTranscript,
   renderTurns,
@@ -70,91 +69,43 @@ describe('parseClaude', () => {
   });
 });
 
-describe('parseCodex', () => {
-  const turns = parseCodex(fixture('codex-transcript.jsonl'));
+/** A codex harness session file (pi session JSONL v3, src/codex/session-file.ts). */
+const HARNESS_SESSION = [
+  { type: 'session', version: 3, id: 'sid-1', timestamp: '2026-10-15T10:00:00.000Z', cwd: '/w' },
+  { type: 'model_change', id: 'a0000001', parentId: null, timestamp: '2026-10-15T10:00:00.000Z', provider: 'openai', modelId: 'gpt-5.5' },
+  { type: 'message', id: 'a0000002', parentId: 'a0000001', timestamp: 't', message: { role: 'system', content: 'SYSTEM PROMPT DROPME', timestamp: 0 } },
+  { type: 'message', id: 'a0000003', parentId: 'a0000002', timestamp: 't', message: { role: 'user', content: [{ type: 'text', text: 'run the tests' }], timestamp: 1 } },
+  {
+    type: 'message',
+    id: 'a0000004',
+    parentId: 'a0000003',
+    timestamp: 't',
+    message: {
+      role: 'assistant',
+      content: [
+        { type: 'thinking', thinking: 'THINKING DROPME' },
+        { type: 'text', text: 'Running them.' },
+        { type: 'toolCall', id: 'c1', name: 'bash', arguments: { command: 'bun test' } },
+        { type: 'toolCall', id: 'c2', name: 'edit', arguments: { path: 'src/a.ts', edits: [] } },
+      ],
+      stopReason: 'toolUse',
+    },
+  },
+  { type: 'message', id: 'a0000005', parentId: 'a0000004', timestamp: 't', message: { role: 'toolResult', toolCallId: 'c1', toolName: 'bash', content: [{ type: 'text', text: 'TOOL OUTPUT DROPME' }], isError: false } },
+  { type: 'message', id: 'a0000006', parentId: 'a0000005', timestamp: 't', message: { role: 'assistant', content: [{ type: 'text', text: 'All green.' }], stopReason: 'stop' } },
+].map((l) => JSON.stringify(l)).join('\n');
 
-  test('takes text from event_msg and tool calls from response_item', () => {
-    expect(turns).toEqual([
-      { role: 'user', text: 'run echo HELLO_DOGFOOD' },
-      { role: 'tool', text: 'exec_command: echo HELLO_DOGFOOD' },
-      { role: 'tool', text: 'shell: bash -lc ls -la' },
-      { role: 'assistant', text: 'Done — it printed HELLO_DOGFOOD.' },
+describe('parsePi', () => {
+  test('codex harness session file: text + toolCall summaries; system/thinking/toolResult dropped', () => {
+    expect(parsePi(HARNESS_SESSION)).toEqual([
+      { role: 'user', text: 'run the tests' },
+      { role: 'assistant', text: 'Running them.' },
+      { role: 'tool', text: 'bash: bun test' },
+      { role: 'tool', text: 'edit src/a.ts' },
+      { role: 'assistant', text: 'All green.' },
     ] satisfies Turn[]);
   });
 
-  test('does not duplicate assistant text from response_item message', () => {
-    const assistantTurns = turns.filter((t) => t.role === 'assistant');
-    expect(assistantTurns).toHaveLength(1);
-  });
-
-  test('drops session_meta/turn_context/token_count/*_output/reasoning', () => {
-    const texts = turns.map((t) => t.text).join('\n');
-    expect(texts).not.toContain('gpt-5.5'); // turn_context
-    expect(texts).not.toContain('FUNCTION_CALL_OUTPUT_DROPME'); // function_call_output
-  });
-
-  test('falls back to response_item message text without duplicating event text', () => {
-    const fallbackOnly = parseCodex(
-      JSON.stringify({
-        type: 'response_item',
-        payload: {
-          type: 'message',
-          role: 'assistant',
-          content: [{ type: 'output_text', text: 'fallback answer' }],
-        },
-      }),
-    );
-    expect(fallbackOnly).toEqual([{ role: 'assistant', text: 'fallback answer' }]);
-
-    const normal = parseCodex(
-      [
-        JSON.stringify({
-          type: 'event_msg',
-          payload: { type: 'agent_message', message: 'same answer' },
-        }),
-        JSON.stringify({
-          type: 'response_item',
-          payload: {
-            type: 'message',
-            role: 'assistant',
-            content: [{ type: 'output_text', text: 'same answer' }],
-          },
-        }),
-      ].join('\n'),
-    );
-    expect(normal).toEqual([{ role: 'assistant', text: 'same answer' }]);
-  });
-
-  test('tolerates non-object tool arguments', () => {
-    expect(() =>
-      parseCodex(
-        [
-          JSON.stringify({
-            type: 'response_item',
-            payload: { type: 'function_call', name: 'fn', arguments: 'null' },
-          }),
-          JSON.stringify({
-            type: 'response_item',
-            payload: { type: 'function_call', name: 'fn', arguments: '[]' },
-          }),
-        ].join('\n'),
-      ),
-    ).not.toThrow();
-    expect(
-      parseCodex(
-        JSON.stringify({
-          type: 'response_item',
-          payload: {
-            type: 'local_shell_call',
-            action: { command: ['bash', '-lc', 'echo hi'] },
-          },
-        }),
-      ),
-    ).toEqual([{ role: 'tool', text: 'local_shell_call: bash -lc echo hi' }]);
-  });
-});
-
-describe('parsePi', () => {
   test('ignores non-object JSONL and malformed nested blocks', () => {
     expect(
       parsePi(
@@ -218,9 +169,9 @@ describe('parseTranscript dispatch + renderTurns', () => {
     expect(parseTranscript('claude', fixture('claude-transcript.jsonl'))).toEqual(
       parseClaude(fixture('claude-transcript.jsonl')),
     );
-    expect(parseTranscript('codex', fixture('codex-transcript.jsonl'))).toEqual(
-      parseCodex(fixture('codex-transcript.jsonl')),
-    );
+    // The codex harness writes pi-format sessions: codex uses the pi parser.
+    expect(parseTranscript('codex', HARNESS_SESSION)).toEqual(parsePi(HARNESS_SESSION));
+    expect(parseTranscript('pi', HARNESS_SESSION)).toEqual(parsePi(HARNESS_SESSION));
   });
 
   test('renders compact text with indented tool lines', () => {

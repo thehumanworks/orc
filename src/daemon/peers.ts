@@ -11,6 +11,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { orcHome, peersPath } from '../paths.ts';
+import { ensurePrivateDir, writePrivateFile } from '../private-fs.ts';
 
 /** The fixed default daemon port (overridable per peer and via `orc daemon --port`). */
 export const DEFAULT_DAEMON_PORT = 8787;
@@ -26,7 +27,8 @@ interface PeersFile {
   peers: PeerEntry[];
 }
 
-function normalizeHost(h: string): string {
+/** Peer host key: trimmed, lower-cased, no trailing dot (`Mini.` ≡ `mini`). */
+export function normalizeHost(h: string): string {
   return h.trim().replace(/\.$/, '').toLowerCase();
 }
 
@@ -47,15 +49,13 @@ export async function readPeers(): Promise<PeerEntry[]> {
   }
 }
 
-/** Write the peer list atomically (tmp + rename). */
+/** Write the peer list atomically (tmp + rename), owner-only. */
 export async function writePeers(peers: PeerEntry[]): Promise<void> {
   const home = orcHome();
-  await fs.mkdir(home, { recursive: true });
-  const target = peersPath();
+  ensurePrivateDir(home);
   const tmp = path.join(home, `.peers.${randomUUID()}.tmp`);
   const body: PeersFile = { peers };
-  await Bun.write(tmp, JSON.stringify(body, null, 2));
-  await fs.rename(tmp, target);
+  await writePrivateFile(peersPath(), JSON.stringify(body, null, 2), { tmpPath: tmp });
 }
 
 /**

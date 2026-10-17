@@ -2,24 +2,27 @@
 /**
  * Dogfooding harness — drives orc *through its own SDK* to implement an orc feature.
  *
- *   bun run scripts/dogfood/run.ts spawn          # spawn a claude implementer in a worktree
- *   bun run scripts/dogfood/run.ts watch <id>     # poll until DOGFOOD_COMPLETE/BLOCKED/timeout
+ *   bun scripts/dogfood/run.ts spawn <task-file> [provider]   # implementer in a fresh worktree
+ *   bun scripts/dogfood/run.ts watch <id>                     # supervise until it ends
  *
- * `spawn` reads scripts/dogfood/TASK.md and sends it as the initial prompt to a claude
- * session created in a fresh git worktree (so its edits are isolated on a branch we can
- * review + merge). `watch` is the reusable supervise-until-done loop the CLI doesn't have:
- * it tails the pane, surfaces progress, and reports the branch diff when the agent signals
- * completion. The session is left ALIVE on exit so it can be inspected / attached.
+ * `spawn` copies the task file under the repo's gitignored `.orc/` (outside the worktree, so the
+ * agent can't commit it) and sends a short pointer to it. `watch` blocks on the session's
+ * journal-derived state (`waitForResult`) and stops when:
+ *   - the branch has a commit AND the agent's last reply contains DOGFOOD_COMPLETE (done),
+ *   - the last reply contains `DOGFOOD_BLOCKED: <reason>`,
+ *   - the agent yields without either (a question or a stall: steer it with `orc send <id>`),
+ *   - the last turn failed, or the session is no longer live, or the timeout passes.
+ * Only the agent's own replies are matched (the prompt is a `turn.intent`, never assistant
+ * text), so the sentinels echoed by the task file can't false-trigger. The session is left
+ * alive for inspection (`orc read`, `orc attach`).
  */
 import path from 'node:path';
-import { agent, getSession } from '../../src/index.ts';
+import { agent, getSession, lastAssistantText } from '../../src/index.ts';
 import type { Session, Provider } from '../../src/index.ts';
 
 const REPO = path.resolve(import.meta.dir, '../..');
 const POLL_MS = 20_000;
 const TIMEOUT_MS = 45 * 60_000;
-
-const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 async function gitOut(cwd: string, args: string[]): Promise<string> {
   const p = Bun.spawn(['git', ...args], { cwd, stdout: 'pipe', stderr: 'pipe', stdin: 'ignore' });
@@ -41,25 +44,18 @@ async function doSpawn(taskFileArg: string, provider: Provider): Promise<void> {
   const taskPath = path.resolve(taskFileArg);
   const task = await Bun.file(taskPath).text();
   console.log(`spawning ${provider} implementer in a worktree for ${path.basename(taskPath)}…`);
-  // Boot WITHOUT pasting the (multi-KB) task: a large prompt scrolls its first line out of
-  // the composer, defeating send()'s verify-before-submit probe. Instead drop the task as a
-  // file OUTSIDE the worktree (under the main repo's gitignored .orc/, so the agent can't
-  // accidentally commit it) and send a SHORT pointer prompt the agent reads.
   const s = await agent({ provider, cwd: REPO, worktree: true });
   const taskFile = path.join(REPO, '.orc', `dogfood-task-${s.id}.md`);
   await Bun.write(taskFile, task);
-  await s.send(
+  const sent = await s.send(
     `Your task is fully specified in this file: ${taskFile}\n` +
       `Read it in full first, then carry it out exactly, end to end. Begin now.`,
+    { messageId: `dogfood-${s.id}` },
   );
   console.log(
-    JSON.stringify(
-      { id: s.id, tmuxName: s.tmuxName, worktree: s.worktreePath, branch: s.branch, taskFile },
-      null,
-      2,
-    ),
+    JSON.stringify({ id: s.id, worktree: s.worktreePath, branch: s.branch, taskFile, delivery: sent.phase }, null, 2),
   );
-  console.log(`\nnext: bun run scripts/dogfood/run.ts watch ${s.id}`);
+  console.log(`\nnext: bun scripts/dogfood/run.ts watch ${s.id}`);
 }
 
 /** Commits on the branch ahead of main: 0 at spawn (branch starts at main's tip), ≥1 once committed. */
@@ -69,80 +65,41 @@ async function revCount(wt: string): Promise<number> {
 }
 
 async function doWatch(id: string): Promise<void> {
+  const s = await getSession(id);
+  if (!s) {
+    console.log(`no session found for '${id}'`);
+    process.exit(1);
+  }
   const deadline = Date.now() + TIMEOUT_MS;
-  let lastTail = '';
-  let poll = 0;
-  let idleStreak = 0;
+  let lastReply = '';
   while (Date.now() < deadline) {
-    poll++;
-    const s = await getSession(id);
-    if (!s) {
-      console.log(`no session found for '${id}'`);
-      return;
-    }
-    const status = await s.status().catch(() => 'dead');
-    let pane = '';
-    try {
-      pane = await s.capture();
-    } catch {
-      /* pane may be gone */
-    }
+    const r = await s.waitForResult({ timeoutMs: Math.min(POLL_MS, deadline - Date.now()) });
     const commits = s.worktreePath ? await revCount(s.worktreePath) : 0;
-
-    // DONE requires BOTH a commit on the branch AND the agent's final sentinel in the live
-    // pane. We do NOT match the transcript: TASK.md (the prompt) itself contains the literal
-    // sentinel strings, which echo into the pane/transcript from poll 1 — so a plain string
-    // match would false-complete immediately. The commit gate defeats that echo (commits===0
-    // until the agent commits); requiring the sentinel too defeats an early WIP commit (the
-    // agent is told to emit it only when finished). By the time real work is committed, the
-    // instruction echo has scrolled out of the visible pane.
-    const done = commits >= 1 && pane.includes('DOGFOOD_COMPLETE');
-    // BLOCKED is pane-only and time-gated past the initial echo (and only when nothing's
-    // been committed). Lower-stakes: the progress tail lets us intervene with `orc send`.
-    const blocked = poll > 6 && commits === 0 ? pane.match(/DOGFOOD_BLOCKED:[^\n]*/) : null;
-    // Idle detection: claude shows "esc to interrupt" only during an active turn. When that
-    // vanishes the agent has YIELDED — either finished, or waiting on input (a stall, e.g.
-    // the nested-CLI verification). Two consecutive idle polls (≈40s) past startup, with no
-    // completion, means: wake the operator to inspect/intervene rather than block for 45m.
-    const idle = pane.length > 0 && !pane.includes('esc to interrupt');
-    idleStreak = idle ? idleStreak + 1 : 0;
-
-    const tail = pane
-      .split('\n')
-      .map((l) => l.trimEnd())
-      .filter((l) => l.length > 0)
-      .slice(-3)
-      .join(' | ');
-    if (tail && tail !== lastTail) {
-      console.log(
-        `[${new Date().toISOString()}] status=${status} commits=${commits} … ${tail.slice(0, 220)}`,
-      );
-      lastTail = tail;
+    const reply = lastAssistantText(s.journal({ tail: 500 })) ?? '';
+    if (reply && reply !== lastReply) {
+      const oneLine = reply.replace(/\s+/g, ' ').slice(0, 220);
+      console.log(`[${new Date().toISOString()}] ${r.state} commits=${commits} … ${oneLine}`);
+      lastReply = reply;
     }
+    if (!r.settled) continue; // still running: keep waiting
 
-    if (done) {
+    const d = await s.stateDetail();
+    const blocked = reply.match(/DOGFOOD_BLOCKED:[^\n]*/);
+    if (r.state === 'done' && commits >= 1 && reply.includes('DOGFOOD_COMPLETE')) {
       console.log('\n=== DOGFOOD_COMPLETE (committed + signalled) ===');
-      await report(s);
-      return;
-    }
-    if (blocked) {
+    } else if (blocked) {
       console.log(`\n=== ${blocked[0]} ===`);
-      await report(s);
-      return;
+    } else if (r.state === 'done') {
+      console.log(`\n=== AGENT YIELDED without completion (commits=${commits}) — read it and steer with \`orc send ${s.id}\` ===`);
+    } else if (r.state === 'waiting') {
+      console.log('\n=== AGENT WAITING on a permission request — read it and re-instruct ===');
+    } else if (d.stopped || d.suspended) {
+      console.log(`\n=== session ${d.stopped ? 'stopped' : 'suspended'} before signalling completion ===`);
+    } else {
+      console.log(`\n=== last turn failed: ${d.lastTurn?.error ?? 'unknown error'} ===`);
     }
-    if (poll > 2 && idleStreak >= 2) {
-      console.log(
-        `\n=== AGENT IDLE without completion (yielded after a turn; commits=${commits}) — inspect/intervene ===`,
-      );
-      await report(s);
-      return;
-    }
-    if (status === 'dead') {
-      console.log('\nsession died before signalling completion');
-      await report(s);
-      return;
-    }
-    await sleep(POLL_MS);
+    await report(s);
+    return;
   }
   console.log('\nwatch timed out');
 }
@@ -153,6 +110,6 @@ if (cmd === 'spawn' && arg) {
 } else if (cmd === 'watch' && arg) {
   await doWatch(arg);
 } else {
-  console.log('usage: run.ts spawn <task-file> [provider] | watch <id>');
+  console.log('usage: bun scripts/dogfood/run.ts spawn <task-file> [provider] | watch <id>');
   process.exit(1);
 }

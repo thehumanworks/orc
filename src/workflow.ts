@@ -8,10 +8,13 @@ import { agent } from './agent.ts';
 import { Session } from './session.ts';
 import { commitCountSince, commitCountVsMain } from './worktree.ts';
 import { validateAlias, readRegistry, findRecord } from './registry.ts';
+import { countLiveSessions, sessionStatusOf } from './session-status.ts';
+import { lastAssistantText, renderCapture } from './journal-render.ts';
+import { deliveryVerdict } from './runtime/client.ts';
+import type { DeliveryVerdict } from './runtime/client.ts';
 import {
   makeLease,
   isLeaseLive,
-  isFinalStatus,
   writeRunOwned,
   readRun,
   updateRun,
@@ -19,12 +22,12 @@ import {
   WORKFLOW_SCHEMA_VERSION,
   DEFAULT_LEASE_MS,
   FinalizedRunError,
+  LiveOwnerError,
   beginRunRecovery,
 } from './runs.ts';
 import { assertValidRunId, runInstructionsDir, runResultPath, runAttemptDir } from './paths.ts';
-import { sanitizeTmuxName } from './drivers/tmux.ts';
-import { getDriver } from './drivers/driver.ts';
-import type { Driver } from './drivers/driver.ts';
+import { ensurePrivateDir, writePrivateFile } from './private-fs.ts';
+import { isSameProcessAlive } from './runtime/process.ts';
 import type { Turn } from './transcript.ts';
 import type { AgentState, ExecutionPolicy, Provider } from './types.ts';
 import { ORC_ENV } from './types.ts';
@@ -45,6 +48,7 @@ import type {
   WorkflowRunStatus,
   OwnerLease,
   RunLease,
+  RunnerInfo,
 } from './run-schema.ts';
 import { TERMINAL_ATTEMPT_PHASES } from './run-schema.ts';
 
@@ -61,6 +65,7 @@ export type {
   WorkflowRunStatus,
   OwnerLease,
   RunLease,
+  RunnerInfo,
 } from './run-schema.ts';
 export { TERMINAL_ATTEMPT_PHASES } from './run-schema.ts';
 import type { VerifyDescriptor, VerifierObservation } from './verification.ts';
@@ -154,6 +159,12 @@ export interface WorkflowStep {
 export interface StepDoneCtx {
   state: AgentState;
   commitsAhead: number;
+  /**
+   * The step session's last assistant message, then a short rendering of its final turn
+   * (prompt, replies, outcome/error), from the session journal — bounded to 8000 chars.
+   * (Before the actor runtime this was a tmux pane capture; predicates that matched TUI
+   * chrome must match the agent's words instead.)
+   */
   capture: string;
   sessionId?: string;
   turns?: Turn[];
@@ -250,13 +261,54 @@ export type StepExecutor = (args: {
     patch?: Partial<StepAttempt>,
   ) => Promise<void> | void;
   attempt?: StepAttempt;
+  /** The run's default model for this step's provider (`defaultModels`), if any. */
+  model?: string;
 }) => Promise<StepResult>;
+
+/**
+ * Continue an in-flight attempt adopted on resume (D10). Default: wake the attempt's
+ * session if suspended and supervise it like a fresh launch (wait → verify).
+ */
+export type StepAdopter = (args: {
+  step: WorkflowStep;
+  runId: string;
+  emit: (e: WorkflowEvent) => void;
+  attempt: StepAttempt;
+  transition?: (phase: AttemptPhase, patch?: Partial<StepAttempt>) => Promise<void> | void;
+}) => Promise<StepResult>;
+
+/** Kernel facts about an in-flight attempt's session (see probeAttemptSession). */
+export type AdoptionProbe = (
+  attempt: StepAttempt,
+  runId: string,
+) => Promise<{ sessionAlive: boolean | null; verdict?: DeliveryVerdict; takenOver?: boolean }>;
 
 export interface RunWorkflowOptions {
   onEvent?: (e: WorkflowEvent) => void;
   execStep?: StepExecutor;
+  /** Adoption of in-flight attempts on resume/retry (D10). Injectable for tests. */
+  adoptStep?: StepAdopter;
+  probeAdoption?: AdoptionProbe;
+  /** Resume: relaunch an attempt whose instruction delivery is unknown (default: require retry). */
+  allowUnknownDeliveryRetry?: boolean;
   runId?: string;
-  runnerTmux?: string;
+  /**
+   * The detached runner process executing this run (the `--run-id` / `--runner`
+   * entrypoints self-report it). Persisted as `run.runner`; it becomes the liveness
+   * authority. Omitted ⇒ the calling process owns the run via the lease identity.
+   */
+  runner?: RunnerInfo;
+  /**
+   * Lease renewal period while the run is in flight (default leaseMs/3). The runner
+   * heartbeats on this timer so a long step never lets a healthy lease expire.
+   */
+  heartbeatMs?: number;
+  /**
+   * Abort the runner (e.g. on SIGTERM after `orc workflow cancel`): stop launching,
+   * clear the heartbeat and return promptly WITHOUT further record writes — a finalized
+   * status is never overwritten. In-flight steps are abandoned, not awaited.
+   */
+  signal?: AbortSignal;
   sourcePath?: string;
   resume?: boolean;
   retryFromStepId?: string;
@@ -275,6 +327,14 @@ export interface RunWorkflowOptions {
    * on resume the persisted plan value wins so scheduling semantics cannot silently change.
    */
   maxConcurrency?: number;
+  /**
+   * Default model per provider for steps (the CLI passes settings.toml `[models]` when a run
+   * starts; the SDK never reads settings files). Recorded on the run; on resume/retry the
+   * recorded map wins (the CLI passes none there), so a later settings change cannot switch
+   * models mid-run. Steps have no model of their own, so each step's session gets
+   * `defaultModels[step.provider]` (else the provider's own default).
+   */
+  defaultModels?: Partial<Record<Provider, string>>;
 }
 
 export function assertValidStepId(stepId: string, label = 'step id'): void {
@@ -537,9 +597,9 @@ export function stepOutcomeFromWait(
 async function dropInstructionFile(runId: string, stepId: string, body: string): Promise<string> {
   assertValidStepId(stepId);
   const dir = runInstructionsDir(runId);
-  await fs.mkdir(dir, { recursive: true });
+  ensurePrivateDir(dir);
   const file = path.join(dir, `${stepId}.md`);
-  await Bun.write(file, body);
+  await writePrivateFile(file, body);
   return file;
 }
 
@@ -661,6 +721,20 @@ export function createAttempt(args: {
   };
 }
 
+/** Forward order of the in-flight attempt phases (terminal phases rank last). */
+const ATTEMPT_PROGRESS: Partial<Record<AttemptPhase, number>> = {
+  queued: 0,
+  spawning: 1,
+  dispatched: 2,
+  running: 3,
+  waiting: 3,
+  verifying: 4,
+};
+
+function attemptProgress(phase: AttemptPhase): number {
+  return ATTEMPT_PROGRESS[phase] ?? 5;
+}
+
 export function transitionAttempt(
   attempt: StepAttempt,
   phase: AttemptPhase,
@@ -702,33 +776,65 @@ export function projectStepsFromAttempts(
   return out;
 }
 
+/**
+ * What to do with a step's latest attempt when a run is recovered (resume/retry, D10):
+ * - `skip_succeeded` — already succeeded
+ * - `adopt`          — in flight, its session still continuable (exists, not stopped) and
+ *                      the instruction is queued / acknowledged / completed: keep waiting
+ * - `require_retry`  — delivery `unknown` (cut before the provider acked it): never
+ *                      re-sent automatically; an explicit retry is required. Also when
+ *                      the session was TAKEN OVER by a human: a resume must never launch a
+ *                      competing agent (hand it back with `orc resume <id>` first)
+ * - `spawn_new`      — no attempt, terminal non-success, session gone/stopped, or the
+ *                      instruction failed / was never enqueued / was interrupted
+ * `verdict` is the kernel delivery verdict of the attempt's instruction message; without
+ * one, an alive session is adopted (pre-kernel behaviour).
+ */
 export function adoptionDecision(args: {
   attempt: StepAttempt | undefined;
   sessionAlive: boolean | null;
+  verdict?: DeliveryVerdict;
+  allowUnknownDeliveryRetry?: boolean;
+  /** The attempt's session was taken over (`orc takeover`): never relaunch around it. */
+  takenOver?: boolean;
 }): 'skip_succeeded' | 'adopt' | 'require_retry' | 'spawn_new' {
   const a = args.attempt;
   if (!a) return 'spawn_new';
   if (a.phase === 'succeeded') return 'skip_succeeded';
   if (a.phase === 'cancelled' || a.phase === 'abandoned') return 'spawn_new';
   if (a.phase === 'failed') return 'spawn_new';
-  if (a.deliveryPhase === 'unknown') return 'require_retry';
-  if (a.sessionId && args.sessionAlive === true) {
-    if (['dispatched', 'running', 'verifying', 'waiting', 'spawning'].includes(a.phase)) return 'adopt';
-  }
-  if (a.sessionId && args.sessionAlive === null) {
+  if (TERMINAL_ATTEMPT_PHASES.has(a.phase)) return 'spawn_new';
+  if (args.takenOver) return 'require_retry';
+  const unknown = a.deliveryPhase === 'unknown' || args.verdict === 'unknown';
+  if (unknown) return args.allowUnknownDeliveryRetry ? 'spawn_new' : 'require_retry';
+  if (!a.sessionId) return 'spawn_new';
+  if (args.sessionAlive === false) return 'spawn_new';
+  if (args.sessionAlive === null) {
     if (['dispatched', 'running', 'verifying'].includes(a.phase)) return 'require_retry';
+    return 'spawn_new';
   }
-  if (!TERMINAL_ATTEMPT_PHASES.has(a.phase)) return 'spawn_new';
-  return 'spawn_new';
+  if (!['dispatched', 'running', 'verifying', 'waiting', 'spawning'].includes(a.phase)) return 'spawn_new';
+  switch (args.verdict) {
+    case undefined:
+    case 'queued':
+    case 'acknowledged':
+    case 'completed':
+      return 'adopt';
+    default:
+      // failed | interrupted | absent → normal relaunch rules.
+      return 'spawn_new';
+  }
 }
 
 export function decideAdoption(args: {
   attempt: StepAttempt | undefined;
   sessionAlive: boolean | null;
+  verdict?: DeliveryVerdict;
+  allowUnknownDeliveryRetry?: boolean;
+  takenOver?: boolean;
 }): 'skip_succeeded' | 'adopt' | 'require_retry' | 'spawn_new' {
   return adoptionDecision(args);
 }
-
 
 export interface FinalizeStepArgs {
   step: Pick<WorkflowStep, 'done' | 'worktree' | 'allowUnverified' | 'verify' | 'id' | 'outputs'>;
@@ -796,6 +902,7 @@ const defaultExecStep: StepExecutor = async ({
   transition,
   attempt,
   emit,
+  model,
 }) => {
   const depth = lineage?.depth ?? 0;
   const rootRunId = lineage?.rootRunId ?? runId;
@@ -803,8 +910,6 @@ const defaultExecStep: StepExecutor = async ({
   const attemptId = attempt?.attemptId ?? randomUUID().slice(0, 12);
   const stepTimeout = step.timeoutMs ?? DEFAULT_STEP_TIMEOUT_MS;
   const stepDeadline = Date.now() + stepTimeout;
-  const maxTurns = step.turns?.maxTurns ?? 1;
-  const turnEvents: AttemptTurnEvent[] = [];
 
   if (policy || lineage) {
     const records = await readRegistry();
@@ -814,13 +919,15 @@ const defaultExecStep: StepExecutor = async ({
       policy,
       deadlineAt: lineage?.deadlineAt,
       rootSessions,
+      // D2: concurrency counts live actors (or spawns in progress), not "not dead".
+      liveCount: countLiveSessions(rootSessions),
       isDelegation: depth > 0,
       totalAfterSpawn: rootSessions.length + 1,
     });
   }
 
   await ensureArtifactDirs(runId);
-  await fs.mkdir(runAttemptDir(runId, attemptId), { recursive: true });
+  ensurePrivateDir(runAttemptDir(runId, attemptId));
   const resultPath = runResultPath(runId, attemptId);
 
   const spawnCwd = step.cwd ? path.resolve(step.cwd) : process.cwd();
@@ -831,6 +938,7 @@ const defaultExecStep: StepExecutor = async ({
   const session = await agent(
     applyInheritedContext({
       provider: step.provider,
+      ...(model ? { model } : {}),
       alias: step.alias,
       cwd: step.cwd,
       worktree: step.worktree ? true : undefined,
@@ -858,12 +966,15 @@ const defaultExecStep: StepExecutor = async ({
     resultPath,
   });
 
-  const messageId = `wf-${runId}-${step.id}-${attemptId}-t0`;
+  const messageId = instructionMessageId(runId, step.id, attemptId);
+  let sent: SendResult;
   try {
-    await deliverInstructions(session, step, runId, { messageId });
+    sent = await deliverInstructions(session, step, runId, { messageId });
+    if (sent.phase === 'failed') throw new Error(`step '${step.id}': instructions were rejected by the provider`);
   } catch (e) {
     await transition?.('failed', {
       sessionId: session.id,
+      messageId,
       errorCategory: 'send',
       errorMessage: (e as Error).message,
       finishedAt: new Date().toISOString(),
@@ -875,13 +986,64 @@ const defaultExecStep: StepExecutor = async ({
   await transition?.('running', {
     sessionId: session.id,
     messageId,
+    deliveryPhase: sent.phase,
     baselineSha,
     resultPath,
   });
 
+  return superviseStep({
+    session,
+    step,
+    runId,
+    attemptId,
+    baselineSha,
+    resultPath,
+    effectiveCwd,
+    stepDeadline,
+    transition,
+    emit,
+    turnEvents: [],
+    turnsDone: 0,
+  });
+};
+
+/** Deterministic idempotency key of a step attempt's instruction (turn 0) message. */
+export function instructionMessageId(runId: string, stepId: string, attemptId: string): string {
+  return `wf-${runId}-${stepId}-${attemptId}-t0`;
+}
+
+interface SuperviseArgs {
+  session: Session;
+  step: WorkflowStep;
+  runId: string;
+  attemptId: string;
+  baselineSha?: string;
+  resultPath: string;
+  effectiveCwd: string;
+  stepDeadline: number;
+  transition?: Parameters<StepExecutor>[0]['transition'];
+  emit: (e: WorkflowEvent) => void;
+  turnEvents: AttemptTurnEvent[];
+  /** Turns already settled before this supervisor took over (adoption). */
+  turnsDone: number;
+}
+
+/**
+ * Wait for the step's turns to settle (bounded multi-turn steering), collect outputs,
+ * evaluate the step's success contract and build its StepResult. Shared by a fresh
+ * launch and by adoption of an in-flight attempt on resume (D10).
+ */
+async function superviseStep(a: SuperviseArgs): Promise<StepResult> {
+  const { session, step, runId, attemptId, resultPath, effectiveCwd, stepDeadline, transition, emit } = a;
+  const baselineSha = a.baselineSha;
+  const turnEvents = a.turnEvents;
+  const maxTurns = step.turns?.maxTurns ?? 1;
+
   let wait: WaitForResult = { state: 'failed', settled: false };
-  let turn = 0;
-  while (turn < maxTurns) {
+  let turn = a.turnsDone;
+  // An adopted attempt always gets (at least) one more wait for its open turn.
+  const turnLimit = a.turnsDone > 0 ? Math.max(maxTurns, a.turnsDone + 1) : maxTurns;
+  while (turn < turnLimit) {
     const remaining = stepDeadline - Date.now();
     if (remaining <= 0) {
       wait = { state: wait.state === 'failed' ? 'failed' : 'done', settled: false };
@@ -1012,7 +1174,11 @@ const defaultExecStep: StepExecutor = async ({
     : session.worktreePath
       ? await commitCountVsMain(session.worktreePath)
       : 0;
-  const capture = await session.capture().catch(() => '');
+  // StepDoneCtx.capture: last assistant message + a short rendering of the final turn,
+  // from the session journal (see StepDoneCtx).
+  const journal = session.journal();
+  const capture = renderCapture(journal);
+  const lastText = lastAssistantText(journal);
 
   const finalized = await finalizeStepOutcome({
     step,
@@ -1023,6 +1189,7 @@ const defaultExecStep: StepExecutor = async ({
     ctx: {
       commitsAhead,
       capture,
+      ...(lastText !== undefined ? { lastAssistantText: lastText } : {}),
       sessionId: session.id,
       cwd: effectiveCwd,
       baselineSha,
@@ -1060,7 +1227,63 @@ const defaultExecStep: StepExecutor = async ({
     envelope: finalized.envelope ?? undefined,
     resultPath,
   };
+}
+
+/**
+ * Continue an adopted in-flight attempt (D10): wake its session if it is suspended, then
+ * supervise it exactly like a fresh launch (wait → verify). Never re-sends the
+ * instruction (the kernel would replay it idempotently anyway).
+ */
+const defaultAdoptStep: StepAdopter = async ({ step, runId, attempt, transition, emit }) => {
+  if (!attempt.sessionId) throw new Error(`step '${step.id}': adopted attempt has no session`);
+  const rec = await findRecord(attempt.sessionId);
+  if (!rec) throw new Error(`step '${step.id}': session ${attempt.sessionId} not found`);
+  const session = new Session(rec);
+  const detail = await session.stateDetail();
+  if (!detail.live) await session.resume();
+  const resultPath = attempt.resultPath ?? runResultPath(runId, attempt.attemptId);
+  const messageId = attempt.messageId ?? instructionMessageId(runId, step.id, attempt.attemptId);
+  await transition?.('running', { sessionId: session.id, messageId, resultPath });
+  const turns = attempt.turns ?? [];
+  return superviseStep({
+    session,
+    step,
+    runId,
+    attemptId: attempt.attemptId,
+    ...(attempt.baselineSha ? { baselineSha: attempt.baselineSha } : {}),
+    resultPath,
+    effectiveCwd: session.worktreePath ?? session.cwd,
+    stepDeadline: Date.now() + (step.timeoutMs ?? DEFAULT_STEP_TIMEOUT_MS),
+    transition,
+    emit,
+    turnEvents: [...turns],
+    turnsDone: turns.filter((t) => t.kind === 'settle' || t.kind === 'timeout').length,
+  });
 };
+
+/**
+ * What the kernel says about an in-flight attempt's session (D10): whether the session
+ * can still be continued (exists, not stopped) and the delivery verdict of the
+ * instruction message. `sessionAlive: null` = unknowable.
+ */
+export async function probeAttemptSession(
+  attempt: StepAttempt,
+  runId: string,
+): Promise<{ sessionAlive: boolean | null; verdict?: DeliveryVerdict; takenOver?: boolean }> {
+  if (!attempt.sessionId) return { sessionAlive: false };
+  const rec = await findRecord(attempt.sessionId);
+  if (!rec) return { sessionAlive: false };
+  // A human holds it (`orc takeover`): not continuable by the workflow, and not to be
+  // replaced by a competing agent either.
+  if (rec.stoppedBy === 'takeover') return { sessionAlive: false, takenOver: true };
+  if (sessionStatusOf(rec) === 'dead') return { sessionAlive: false };
+  try {
+    const messageId = attempt.messageId ?? instructionMessageId(runId, attempt.stepId, attempt.attemptId);
+    return { sessionAlive: true, verdict: deliveryVerdict(rec.sessionId, messageId) };
+  } catch {
+    return { sessionAlive: null };
+  }
+}
 
 export function runnerLineageEnv(
   run: Pick<WorkflowRun, 'id' | 'rootRunId' | 'parentRunId' | 'policy' | 'deadlineAt' | 'lease'>,
@@ -1081,7 +1304,39 @@ export function runnerLineageEnv(
   return env;
 }
 
+/** Process-level resources a run holds while it owns its record (released in `finally`). */
+interface RunLifecycle {
+  heartbeat?: ReturnType<typeof setInterval>;
+  disposers: (() => void)[];
+}
+
+function releaseLifecycle(life: RunLifecycle): void {
+  if (life.heartbeat !== undefined) clearInterval(life.heartbeat);
+  life.heartbeat = undefined;
+  for (const d of life.disposers.splice(0)) {
+    try {
+      d();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
 export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {}): Promise<WorkflowRun> {
+  const life: RunLifecycle = { disposers: [] };
+  try {
+    return await runWorkflowOwned(def, opts, life);
+  } finally {
+    // The lease heartbeat and abort listener never outlive the run (any exit path).
+    releaseLifecycle(life);
+  }
+}
+
+async function runWorkflowOwned(
+  def: WorkflowDef,
+  opts: RunWorkflowOptions,
+  life: RunLifecycle,
+): Promise<WorkflowRun> {
   // Merge CLI/daemon maxConcurrency override into the def before validation/plan.
   const defWithConc: WorkflowDef = {
     ...def,
@@ -1110,6 +1365,15 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
 
   const ownerId = opts.ownerId ?? randomUUID().slice(0, 8);
   const leaseMs = opts.leaseMs ?? DEFAULT_LEASE_MS;
+  // Lease identity = the runner when there is one, else this process (D1/D4).
+  const ownerLease = () =>
+    makeLease({
+      ownerId,
+      ...(opts.runner ? { pid: opts.runner.pid, startTime: opts.runner.startTime } : {}),
+      nowMs: nowMs(),
+      leaseMs,
+    });
+  if (opts.signal?.aborted) throw new Error(`workflow run aborted before start`);
   const existing =
     opts.continueExisting || opts.resume || opts.retryFromStepId ? await readRun(runId) : null;
   const rootRunId = opts.rootRunId ?? existing?.rootRunId ?? runId;
@@ -1122,6 +1386,8 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
   const effectivePlan = existing?.plan ?? plan;
   const effectiveDigest = existing?.definitionDigest ?? digest;
   const effectivePolicy = existing?.policy ?? policy;
+  // Recorded defaults win on resume/retry (predictable after a settings change).
+  const defaultModels = existing?.defaultModels ?? opts.defaultModels;
   // Ensure plan has normalized maxConcurrency for legacy records.
   if (effectivePlan.maxConcurrency === undefined) {
     effectivePlan.maxConcurrency = 1;
@@ -1135,9 +1401,8 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
     startedAt,
     status: 'running',
     finishedAt: undefined,
-    ...(opts.runnerTmux || existing?.runnerTmux
-      ? { runnerTmux: opts.runnerTmux ?? existing?.runnerTmux }
-      : {}),
+    // Only THIS invocation's runner: a previous (dead) runner is never inherited.
+    ...(opts.runner ? { runner: opts.runner } : {}),
     steps: opts.seedResults
       ? [...opts.seedResults]
       : existing?.steps
@@ -1153,13 +1418,10 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
       : existing?.attempts
         ? [...existing.attempts]
         : [],
-    lease: makeLease({
-      ownerId,
-      runnerTmux: opts.runnerTmux ?? existing?.runnerTmux,
-      nowMs: nowMs(),
-      leaseMs,
-    }),
+    lease: ownerLease(),
     ...(effectivePolicy ? { policy: effectivePolicy } : {}),
+    // Only a non-empty map is recorded (absent = none), keeping --json clean when unused.
+    ...(defaultModels && Object.keys(defaultModels).length > 0 ? { defaultModels: { ...defaultModels } } : {}),
     rootRunId,
     ...(parentRunId ? { parentRunId } : {}),
     ...(deadlineAt ? { deadlineAt } : {}),
@@ -1226,21 +1488,12 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
   const persist = () =>
     serialize(async () => {
       if (cancelled) return;
-      run.lease = makeLease({
-        ownerId,
-        runnerTmux: opts.runnerTmux ?? run.runnerTmux,
-        nowMs: nowMs(),
-        leaseMs,
-      });
+      run.lease = ownerLease();
       try {
         run = await writeRunOwned(run);
         emit({ type: 'lease-heartbeat', runId, expiresAt: run.lease!.expiresAt, ownerId });
       } catch (e) {
-        if (e instanceof FinalizedRunError) {
-          cancelled = true;
-          stopNewLaunches = true;
-          return;
-        }
+        if (onWriteRefused(e)) return;
         throw e;
       }
     });
@@ -1248,9 +1501,13 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
   const recordAttempt = (attempt: StepAttempt) => {
     const list = run.attempts ?? [];
     const idx = list.findIndex((a) => a.attemptId === attempt.attemptId);
+    const prevPhase = idx >= 0 ? list[idx]!.phase : undefined;
     if (idx >= 0) list[idx] = attempt;
     else list.push(attempt);
     run.attempts = list;
+    // A same-phase re-record only attaches data (e.g. baselineSha at `spawning`): it is
+    // persisted, but it is not a transition.
+    if (prevPhase === attempt.phase) return;
     emit({
       type: 'attempt-transition',
       runId,
@@ -1347,24 +1604,79 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
 
   const safeWriteOwned = async (): Promise<boolean> => {
     if (cancelled) return false;
-    run.lease = makeLease({
-      ownerId,
-      runnerTmux: opts.runnerTmux ?? run.runnerTmux,
-      nowMs: nowMs(),
-      leaseMs,
-    });
+    run.lease = ownerLease();
     try {
       run = await writeRunOwned(run);
       return true;
     } catch (e) {
-      if (e instanceof FinalizedRunError) {
-        cancelled = true;
-        stopNewLaunches = true;
-        return false;
-      }
+      if (onWriteRefused(e)) return false;
       throw e;
     }
   };
+
+  /**
+   * A write was refused. Finalized/cancelled → stop like a cancel. Another LIVE owner
+   * holds the record (we were superseded, e.g. resumed elsewhere while we were stopped
+   * past our lease) → step aside exactly like an abort: no further writes, return now.
+   */
+  const onWriteRefused = (e: unknown): boolean => {
+    if (e instanceof LiveOwnerError) {
+      stopRunner();
+      return true;
+    }
+    if (e instanceof FinalizedRunError) {
+      cancelled = true;
+      stopNewLaunches = true;
+      return true;
+    }
+    return false;
+  };
+
+  // ── Lease heartbeat (D1): renew on a timer through the serialized write path so a
+  // step blocking far longer than leaseMs never lets a healthy owner's lease expire.
+  const stopHeartbeat = () => {
+    if (life.heartbeat !== undefined) clearInterval(life.heartbeat);
+    life.heartbeat = undefined;
+  };
+  const heartbeatMs = Math.max(10, Math.floor(opts.heartbeatMs ?? leaseMs / 3));
+  const heartbeat = () =>
+    serialize(async () => {
+      if (cancelled) {
+        stopHeartbeat();
+        return;
+      }
+      try {
+        await safeWriteOwned();
+      } catch {
+        // Transient I/O (lock timeout, disk) — the next tick retries.
+      }
+      if (cancelled) stopHeartbeat();
+    });
+  // Deliberately NOT unref'd: an owning runner stays alive while it owns the record; the
+  // interval is cleared on every exit path (stopHeartbeat / releaseLifecycle).
+  life.heartbeat = setInterval(() => {
+    void heartbeat();
+  }, heartbeatMs);
+
+  // ── Abort (D5): stop launching, stop heartbeating, never write again, return promptly.
+  let aborted = false;
+  let wakeOnAbort: () => void = () => {};
+  const abortWake = new Promise<void>((resolve) => {
+    wakeOnAbort = resolve;
+  });
+  const stopRunner = () => {
+    aborted = true;
+    cancelled = true;
+    stopNewLaunches = true;
+    stopHeartbeat();
+    wakeOnAbort();
+  };
+  if (opts.signal) {
+    const onAbort = () => stopRunner();
+    opts.signal.addEventListener('abort', onAbort, { once: true });
+    life.disposers.push(() => opts.signal?.removeEventListener('abort', onAbort));
+    if (opts.signal.aborted) onAbort();
+  }
 
   const launchStep = async (stepId: string): Promise<void> => {
     const rawStep = stepsById.get(stepId);
@@ -1403,9 +1715,8 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
       await safeWriteOwned();
     });
 
-    let result: StepResult | undefined;
-    try {
-      result = await execStep({
+    await runAttempt(rawStep, attempt, (transition) =>
+      execStep({
         step,
         runId,
         emit,
@@ -1418,19 +1729,40 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
           policy: effectivePolicy,
           deadlineAt,
         },
-        transition: async (phase, patch) => {
-          await serialize(async () => {
-            attempt = transitionAttempt(attempt, phase, patch ?? {}, now());
-            recordAttempt(attempt);
-            await safeWriteOwned();
-          });
-        },
+        transition,
         attempt,
+        ...(defaultModels?.[step.provider] ? { model: defaultModels[step.provider] } : {}),
+      }),
+    );
+  };
+
+  /**
+   * Execute one attempt (fresh launch or adoption) and persist its outcome. `exec` gets
+   * the attempt's mid-flight `transition` and must return the StepResult.
+   */
+  const runAttempt = async (
+    rawStep: WorkflowStep,
+    initial: StepAttempt,
+    exec: (
+      transition: (phase: AttemptPhase, patch?: Partial<StepAttempt>) => Promise<void>,
+    ) => Promise<StepResult>,
+  ): Promise<void> => {
+    let attempt = initial;
+    let result: StepResult | undefined;
+    try {
+      result = await exec(async (phase, patch) => {
+        await serialize(async () => {
+          attempt = transitionAttempt(attempt, phase, patch ?? {}, now());
+          recordAttempt(attempt);
+          await safeWriteOwned();
+        });
       });
       const completed = result;
       await serialize(async () => {
         if (cancelled) return;
-        if (completed.sessionId) {
+        // Executors that report no mid-flight transitions still pass through
+        // dispatched → verifying; never step BACK to a phase the executor already passed.
+        if (completed.sessionId && attemptProgress(attempt.phase) < attemptProgress('dispatched')) {
           attempt = transitionAttempt(attempt, 'dispatched', { sessionId: completed.sessionId }, now());
           recordAttempt(attempt);
         }
@@ -1461,11 +1793,7 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
         await safeWriteOwned();
       });
     } catch (e) {
-      if (e instanceof FinalizedRunError) {
-        cancelled = true;
-        stopNewLaunches = true;
-        return;
-      }
+      if (onWriteRefused(e)) return;
       const msg = (e as Error).message;
       result = {
         id: rawStep.id,
@@ -1514,10 +1842,117 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
     }
   };
 
+  // ── Adoption (D10): a recovered run continues in-flight attempts whose session is
+  // still continuable and whose instruction reached it, instead of relaunching them.
+  if (opts.resume || opts.retryFromStepId !== undefined) {
+    const probe = opts.probeAdoption ?? probeAttemptSession;
+    const adoptStep = opts.adoptStep ?? defaultAdoptStep;
+    const allowUnknown = opts.retryFromStepId !== undefined || opts.allowUnknownDeliveryRetry === true;
+    let changed = false;
+    const toAdopt: StepAttempt[] = [];
+    for (const id of graph.order) {
+      const a = latestAttemptForStep(run.attempts, id);
+      if (!a || !IN_FLIGHT_PHASES.has(a.phase)) continue;
+      const facts = await probe(a, runId).catch(() => ({ sessionAlive: null }) as const);
+      const takenOver = 'takenOver' in facts && facts.takenOver === true;
+      const decision = adoptionDecision({
+        attempt: a,
+        sessionAlive: facts.sessionAlive,
+        ...('verdict' in facts && facts.verdict ? { verdict: facts.verdict } : {}),
+        allowUnknownDeliveryRetry: allowUnknown,
+        takenOver,
+      });
+      if (decision === 'adopt' && stepsById.has(id)) {
+        toAdopt.push(a);
+        continue;
+      }
+      const ts = now();
+      if (decision === 'require_retry' && takenOver) {
+        const sid = a.sessionId ?? '';
+        const failed: StepResult = {
+          id,
+          sessionId: sid,
+          provider: a.provider,
+          state: 'failed',
+          ok: false,
+          outcome: 'failed',
+          commitsAhead: 0,
+        };
+        const msg =
+          `session ${sid} was taken over (\`orc takeover\`); not relaunched — hand it back with ` +
+          `\`orc resume ${sid}\`, then \`orc workflow retry ${runId} --step ${id}\``;
+        recordAttempt(transitionAttempt(a, 'failed', { result: failed, errorCategory: 'taken_over', errorMessage: msg }, ts));
+        upsertResult(failed);
+        emit({ type: 'step-error', runId, stepId: id, error: msg });
+      } else if (decision === 'require_retry') {
+        const failed: StepResult = {
+          id,
+          sessionId: a.sessionId ?? '',
+          provider: a.provider,
+          state: 'failed',
+          ok: false,
+          outcome: 'failed',
+          commitsAhead: 0,
+        };
+        recordAttempt(
+          transitionAttempt(
+            a,
+            'failed',
+            {
+              result: failed,
+              deliveryPhase: 'unknown',
+              errorCategory: 'delivery_unknown',
+              errorMessage:
+                'instruction delivery is unknown (cut before the provider acknowledged it); ' +
+                'not re-sent automatically — use `orc workflow retry`',
+            },
+            ts,
+          ),
+        );
+        upsertResult(failed);
+        emit({ type: 'step-error', runId, stepId: id, error: 'delivery unknown: explicit retry required' });
+      } else {
+        recordAttempt(
+          transitionAttempt(
+            a,
+            'abandoned',
+            {
+              errorCategory: 'abandoned',
+              errorMessage: `previous owner died; attempt not adoptable (session ${
+                facts.sessionAlive === false ? 'gone or stopped' : 'not continuable'
+              })`,
+            },
+            ts,
+          ),
+        );
+      }
+      changed = true;
+    }
+    if (changed) await persist();
+    for (const a of toAdopt) {
+      const rawStep = stepsById.get(a.stepId)!;
+      emit({
+        type: 'attempt-adopt',
+        runId,
+        attemptId: a.attemptId,
+        stepId: a.stepId,
+        sessionId: a.sessionId ?? '',
+      });
+      const step = resolveStep(rawStep, resultsById);
+      const promise = runAttempt(rawStep, a, (transition) =>
+        adoptStep({ step, runId, emit, attempt: a, transition }),
+      ).finally(() => {
+        inFlight.delete(a.stepId);
+      });
+      inFlight.set(a.stepId, { stepId: a.stepId, attemptId: a.attemptId, promise });
+    }
+  }
+
   // ── Bounded worker / launch loop (no unbounded Promise.all) ──────────────
   const emittedBlocked = new Set<string>();
 
   while (true) {
+    if (aborted) break;
     if (await checkCancelled()) {
       // Cancel non-terminal pending attempts; in-flight settle below.
       break;
@@ -1564,13 +1999,24 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
       break;
     }
 
-    // Wait for any in-flight completion (bounded race — only currently running set).
-    await Promise.race([...inFlight.values()].map((f) => f.promise));
+    // Wait for any in-flight completion (bounded race — only currently running set), or
+    // an abort, which must not wait for a step that may block for minutes.
+    await Promise.race([...[...inFlight.values()].map((f) => f.promise), abortWake]);
   }
 
-  // Drain remaining in-flight after stop/cancel.
-  if (inFlight.size > 0) {
-    await Promise.all([...inFlight.values()].map((f) => f.promise));
+  // Drain remaining in-flight after stop/cancel — unless aborted (now or mid-drain).
+  if (!aborted && inFlight.size > 0) {
+    await Promise.race([Promise.all([...inFlight.values()].map((f) => f.promise)), abortWake]);
+  }
+
+  if (aborted) {
+    // Terminated (SIGTERM after cancel, or a plain kill) or superseded by another live
+    // owner: let an in-progress write land, then stop WITHOUT writing — a
+    // cancelled/finalized status or the new owner's record stays as written; a
+    // still-`running` record of ours reconciles to orphaned once this process is gone.
+    stopHeartbeat();
+    await persistChain;
+    return (await readRun(runId)) ?? run;
   }
 
   if (cancelled) {
@@ -1598,7 +2044,7 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
     try {
       run = await writeRunOwned(run);
     } catch (e) {
-      if (!(e instanceof FinalizedRunError)) throw e;
+      if (!(e instanceof FinalizedRunError || e instanceof LiveOwnerError)) throw e;
       const again = await readRun(runId);
       if (again) {
         emit({ type: 'run-done', runId, status: again.status, run: again });
@@ -1618,14 +2064,21 @@ export async function runWorkflow(def: WorkflowDef, opts: RunWorkflowOptions = {
   run.status = allSucceeded ? 'done' : 'failed';
   if (opts.resume && defWithConc.steps.every((s) => resultsById[s.id]?.ok)) run.status = 'done';
   run.finishedAt = now();
-  run = await writeRunOwned(run);
+  stopHeartbeat();
+  await persistChain;
+  try {
+    run = await writeRunOwned(run);
+  } catch (e) {
+    // Cancelled concurrently (after the last loop check) or superseded by another live
+    // owner: their record stands.
+    if (!(e instanceof FinalizedRunError || e instanceof LiveOwnerError)) throw e;
+    const disk = await readRun(runId);
+    if (!disk) throw e;
+    emit({ type: 'run-done', runId, status: disk.status, run: disk });
+    return disk;
+  }
   emit({ type: 'run-done', runId, status: run.status, run });
   return run;
-}
-
-export function runnerTmuxName(runId: string): string {
-  assertValidRunId(runId);
-  return `orc-wf-${sanitizeTmuxName(runId)}`;
 }
 
 export function reconcileRunStatus(
@@ -1639,30 +2092,63 @@ export function reconcileRunStatus(
   return 'running';
 }
 
-export async function reconcileRun(run: WorkflowRun, driver: Driver = getDriver()): Promise<WorkflowRun> {
-  if (run.status !== 'running') return run;
-  let runnerAlive: boolean | null = null;
-  if (run.runnerTmux) runnerAlive = await driver.isAlive(run.runnerTmux);
-  else if (run.lease?.runnerTmux) runnerAlive = await driver.isAlive(run.lease.runnerTmux);
-  const leaseLive = run.lease
-    ? isLeaseLive(run.lease, {
-        runnerAlive: run.runnerTmux || run.lease.runnerTmux ? runnerAlive : null,
-        checkPid: !run.runnerTmux,
-      })
-    : run.runnerTmux
-      ? runnerAlive === true
+/**
+ * Liveness of a `running` record's owner (design §4.6, D1): the detached `runner`
+ * process (pid + start time) when there is one — a legacy tmux runner is always dead —
+ * and the lease (not expired AND its owner alive). Null = unknowable (trusted).
+ */
+export function runOwnerLiveness(run: WorkflowRun): {
+  runnerAlive: boolean | null;
+  leaseLive: boolean | null;
+} {
+  const runnerAlive = run.runner
+    ? isSameProcessAlive(run.runner)
+    : run.legacyRunnerTmux
+      ? false
       : null;
+  const leaseLive = run.lease
+    ? isLeaseLive(run.lease, { runnerAlive, runner: run.runner ?? null })
+    : null;
+  return { runnerAlive, leaseLive };
+}
+
+/**
+ * Don't trust a stale `running`: when its owner is dead (runner gone, lease expired or
+ * its owner process gone) persist and return `orphaned` (resumable). The write is
+ * conditional on the record being unchanged since it was judged, so a live owner's
+ * concurrent write is never clobbered.
+ */
+export async function reconcileRun(run: WorkflowRun): Promise<WorkflowRun> {
+  if (run.status !== 'running') return run;
+  const { runnerAlive, leaseLive } = runOwnerLiveness(run);
   const effective = reconcileRunStatus(run.status, runnerAlive, { leaseLive });
   if (effective === run.status) return run;
-  if (isFinalStatus(run.status)) return run;
   try {
-    return await writeRunOwned({
-      ...run,
-      status: effective,
-      finishedAt: run.finishedAt ?? new Date().toISOString(),
-    });
+    const written = await updateRun(run.id, (cur) =>
+      cur && cur.status === 'running' && (cur.revision ?? 0) === (run.revision ?? 0)
+        ? { ...cur, status: effective, finishedAt: cur.finishedAt ?? new Date().toISOString() }
+        : null,
+    );
+    return written ?? run;
   } catch {
     return (await readRun(run.id)) ?? run;
+  }
+}
+
+/**
+ * Status preconditions shared by foreground and detached resume/retry (D7): a `done`
+ * run is never resurrected, a `cancelled` run can only be retried, and a `running`
+ * run must have a dead owner (pass the RECONCILED record).
+ */
+export function assertRecoveryAllowed(run: WorkflowRun, action: 'resume' | 'retry'): void {
+  if (run.status === 'done') {
+    throw new FinalizedRunError(run.id, run.status);
+  }
+  if (run.status === 'cancelled' && action === 'resume') {
+    throw new Error(`run '${run.id}' is cancelled; use retry to create new attempts`);
+  }
+  if (run.status === 'running') {
+    throw new LiveOwnerError(run.id, run.runner?.pid ?? run.lease?.pid ?? 0);
   }
 }
 
@@ -1695,12 +2181,20 @@ export async function assembleStepLogs(
 export interface ResumeOptions {
   onEvent?: (e: WorkflowEvent) => void;
   execStep?: StepExecutor;
+  /** Adoption of in-flight attempts (D10). Injectable for tests. */
+  adoptStep?: StepAdopter;
+  probeAdoption?: AdoptionProbe;
   sourcePath?: string;
   workflowSourcePath?: string;
-  runnerTmux?: string;
+  /** The detached runner performing this resume/retry (see RunWorkflowOptions.runner). */
+  runner?: RunnerInfo;
+  /** Abort the runner (see RunWorkflowOptions.signal). */
+  signal?: AbortSignal;
   leaseMs?: number;
   ownerId?: string;
   allowUnknownDeliveryRetry?: boolean;
+  /** Step default models when the run recorded none (SDK only; see RunWorkflowOptions.defaultModels). */
+  defaultModels?: Partial<Record<Provider, string>>;
 }
 
 export interface RetryOptions extends ResumeOptions {
@@ -1709,6 +2203,8 @@ export interface RetryOptions extends ResumeOptions {
 
 export interface CancelOptions {
   cascade?: boolean;
+  /** SIGTERM the run's live detached runner (default true). */
+  signalRunner?: boolean;
   onEvent?: (e: WorkflowEvent) => void;
   killSession?: (sessionId: string) => Promise<void>;
   reason?: string;
@@ -1726,6 +2222,22 @@ export async function loadWorkflowFile(file: string): Promise<{ def: WorkflowDef
   if (!mod.default) throw new Error(`workflow file '${file}' has no default export`);
   validateWorkflowDef(mod.default);
   return { def: mod.default, absPath };
+}
+
+/**
+ * Definition preconditions shared by resume/retry and their detached launchers: the
+ * definition must match the run's persisted plan digest (and supply any function `done`
+ * predicates), and a retry `stepId` must exist. Throws; nothing is written.
+ */
+export function assertRecoveryDefinition(
+  existing: WorkflowRun,
+  def: WorkflowDef,
+  opts?: { stepId?: string; sourcePath?: string },
+): void {
+  assertDigestMatches(existing, def, opts?.sourcePath ?? existing.sourcePath ?? existing.workflowSourcePath);
+  if (opts?.stepId && !def.steps.some((s) => s.id === opts.stepId)) {
+    throw new Error(`run '${existing.id}' has no step '${opts.stepId}'`);
+  }
 }
 
 function assertDigestMatches(existing: WorkflowRun, def: WorkflowDef, sourcePath?: string): void {
@@ -1775,11 +2287,13 @@ export async function resumeWorkflow(
   const sourcePath =
     opts.workflowSourcePath ?? opts.sourcePath ?? existing.sourcePath ?? existing.workflowSourcePath;
   assertDigestMatches(existing, def, sourcePath);
+  // One owner id for the recovery stamp AND the run, so the owner fence sees one owner.
+  const ownerId = opts.ownerId ?? randomUUID().slice(0, 8);
   if (existing.status === 'failed' || existing.status === 'orphaned') {
     existing = await beginRunRecovery(runId, {
-      ownerId: opts.ownerId,
+      ownerId,
       leaseMs: opts.leaseMs,
-      runnerTmux: opts.runnerTmux ?? existing.runnerTmux,
+      runner: opts.runner,
       reason: 'resume',
     });
   }
@@ -1790,10 +2304,15 @@ export async function resumeWorkflow(
     continueExisting: true,
     onEvent: opts.onEvent,
     execStep: opts.execStep,
+    adoptStep: opts.adoptStep,
+    probeAdoption: opts.probeAdoption,
+    allowUnknownDeliveryRetry: opts.allowUnknownDeliveryRetry,
     sourcePath,
-    runnerTmux: opts.runnerTmux ?? existing.runnerTmux,
+    runner: opts.runner,
+    signal: opts.signal,
     leaseMs: opts.leaseMs,
-    ownerId: opts.ownerId,
+    ownerId,
+    defaultModels: opts.defaultModels,
     rootRunId: existing.rootRunId ?? existing.id,
     parentRunId: existing.parentRunId,
   });
@@ -1814,15 +2333,16 @@ export async function retryWorkflow(
     const found = def.steps.some((s) => s.id === opts.stepId);
     if (!found) throw new Error(`run '${runId}' has no step '${opts.stepId}'`);
   }
+  const ownerId = opts.ownerId ?? randomUUID().slice(0, 8);
   if (
     existing.status === 'failed' ||
     existing.status === 'orphaned' ||
     existing.status === 'cancelled'
   ) {
     existing = await beginRunRecovery(runId, {
-      ownerId: opts.ownerId,
+      ownerId,
       leaseMs: opts.leaseMs,
-      runnerTmux: opts.runnerTmux ?? existing.runnerTmux,
+      runner: opts.runner,
       reason: 'retry',
       allowCancelled: true,
     });
@@ -1834,13 +2354,28 @@ export async function retryWorkflow(
     continueExisting: true,
     onEvent: opts.onEvent,
     execStep: opts.execStep,
+    adoptStep: opts.adoptStep,
+    probeAdoption: opts.probeAdoption,
     sourcePath,
-    runnerTmux: opts.runnerTmux ?? existing.runnerTmux,
+    runner: opts.runner,
+    signal: opts.signal,
     leaseMs: opts.leaseMs,
-    ownerId: opts.ownerId,
+    ownerId,
+    defaultModels: opts.defaultModels,
     rootRunId: existing.rootRunId ?? existing.id,
     parentRunId: existing.parentRunId,
   });
+}
+
+/** Signal a run's detached runner iff it is still that same process (never ourselves). */
+function signalRunner(runner: RunnerInfo | undefined, signal: NodeJS.Signals): boolean {
+  if (!runner || runner.pid === process.pid || !isSameProcessAlive(runner)) return false;
+  try {
+    process.kill(runner.pid, signal);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function cancelWorkflow(runId: string, opts: CancelOptions = {}): Promise<WorkflowRun> {
@@ -1852,8 +2387,10 @@ export async function cancelWorkflow(runId: string, opts: CancelOptions = {}): P
       /* ignore */
     }
   };
+  let runner: RunnerInfo | undefined;
   const run = await updateRun(runId, (cur) => {
     if (!cur) return null;
+    runner = cur.runner;
     if (cur.status === 'cancelled') return cur;
     if (cur.status === 'done' || cur.status === 'failed') return cur;
     const ts = new Date().toISOString();
@@ -1881,12 +2418,16 @@ export async function cancelWorkflow(runId: string, opts: CancelOptions = {}): P
   });
   if (!run) throw new Error(`no run found for '${runId}'`);
   emit({ type: 'run-cancel', runId, cascade: opts.cascade === true });
+  // D5: a live detached runner is told to stop now (it exits without overwriting the
+  // cancelled status) instead of noticing at its next write. The runner pid only —
+  // agent sessions are governed by --cascade.
+  if (run.status === 'cancelled' && opts.signalRunner !== false) signalRunner(runner, 'SIGTERM');
   if (opts.cascade) {
     const root = run.rootRunId ?? run.id;
     const records = await readRegistry();
     const owned = records.filter(
       (r) =>
-        r.status !== 'dead' &&
+        sessionStatusOf(r) !== 'dead' &&
         (r.rootRunId === root || r.parentRunId === runId || r.rootRunId === runId),
     );
     const kill =

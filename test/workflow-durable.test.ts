@@ -130,8 +130,8 @@ describe('attempt phase transitions', () => {
     // Mirrors defaultExecStep: SendResult uses `phase`, attempt stores `deliveryPhase`.
     const sendResult = {
       phase: 'unknown' as const,
-      attempts: 1,
       messageId: 'msg-1',
+      replayed: false,
     };
     let a = createAttempt({ stepId: 's', provider: 'claude', attemptNumber: 1 });
     a = transitionAttempt(a, 'dispatched', { sessionId: 'sid' });
@@ -503,7 +503,6 @@ describe('execution policy bounds', () => {
       id: String(i),
       sessionId: String(i),
       provider: 'claude' as const,
-      tmuxName: `t${i}`,
       cwd: '/',
       workspace: '/',
       createdAt: new Date().toISOString(),

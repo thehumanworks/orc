@@ -1,5 +1,10 @@
 # orc / orc — Research Brief (verified)
 
+> **Historical.** This is the research log for the original tmux-based runtime (pre-actor). Its
+> tmux driver decision (§F.16c) is superseded by [`DESIGN-runtime.md`](DESIGN-runtime.md); orc no
+> longer uses tmux, panes or TUI scraping. Tool versions below are those of the time. For the
+> current system see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
 Every claim below is backed by a command actually run on this machine
 (Bun 1.3.14, node v25.9.0, claude 2.1.169, codex-cli 0.137.0, pi 0.79.0,
 tmux 3.6a, git 2.50.1, macOS/darwin). Working dir: `/Users/tomasroda/projects/orc`.

@@ -29,6 +29,9 @@
 import type { AttemptPhase, PlanStep, StepAttempt, StepResult, WorkflowPlan } from './run-schema.ts';
 import type { ExecutionPolicy } from './types.ts';
 
+/** Failed-attempt categories a resume never re-opens (explicit retry only). */
+const NOT_REOPENED_ON_RESUME: ReadonlySet<string> = new Set(['delivery_unknown', 'taken_over']);
+
 /** Terminal attempt phases (including scheduler-owned blocked/skipped). */
 export const SCHEDULER_TERMINAL_PHASES: ReadonlySet<AttemptPhase> = new Set([
   'succeeded',
@@ -522,8 +525,15 @@ export function deriveSchedulerState(
     }
 
     // Resume re-opens non-success terminals so incomplete work can finish.
-    // Dependents of still-failed producers become blocked in the second pass.
-    if (opts.resume && !(opts.retrySet && opts.retrySet.size > 0)) {
+    // Dependents of still-failed producers become blocked in the second pass. NOT
+    // re-opened (only an explicit retry may relaunch them): an attempt whose instruction
+    // delivery is unknown (never proven undelivered), and one whose session a human took
+    // over (`orc takeover`: a relaunch would compete with them).
+    if (
+      opts.resume &&
+      !(opts.retrySet && opts.retrySet.size > 0) &&
+      !NOT_REOPENED_ON_RESUME.has(a?.errorCategory ?? '')
+    ) {
       if (
         a?.phase === 'blocked' ||
         a?.phase === 'skipped' ||

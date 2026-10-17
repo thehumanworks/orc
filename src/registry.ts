@@ -1,14 +1,21 @@
 /**
- * Registry: persist + reconcile session records. ~/.orc/registry.json is an array
- * of SessionRecord, written atomically (tmp + rename).
+ * Registry: persist session records. ~/.orc/registry.json is an array of SessionRecord,
+ * written atomically (tmp + rename). Liveness comes from the actor kernel
+ * (src/session-status.ts); records written by the pre-actor (tmux) orc are normalised
+ * at read time to `legacy: 'tmux'`, `status: 'dead'` (readable, prunable, never
+ * controlled).
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { Stats } from 'node:fs';
 import { registryPath, orcHome } from './paths.ts';
+import { ensurePrivateDir, writePrivateFile, PRIVATE_FILE_MODE } from './private-fs.ts';
+import { lockOwnerGone, lockOwnerRecord } from './lock.ts';
+import { isPidAlive } from './runtime/process.ts';
 import type { SessionRecord } from './types.ts';
-import type { Driver } from './drivers/driver.ts';
+import { kernelLiveness } from './session-status.ts';
+import type { LivenessProbe } from './session-status.ts';
 
 const REGISTRY_LOCK_POLL_MS = 25;
 const REGISTRY_LOCK_TIMEOUT_MS = 10_000;
@@ -23,6 +30,8 @@ interface RegistryLockOwner {
   pid?: number;
   token?: string;
   createdAt?: string;
+  /** Owner's process start time (lockOwnerRecord); absent in older lock files. */
+  startTime?: string | null;
 }
 
 export interface AliasSelector {
@@ -70,18 +79,20 @@ export function aliasHandle(rec: Pick<SessionRecord, 'alias' | 'workspace'>): st
   return `@${workspaceAlias(rec.workspace)}:${rec.alias}`;
 }
 
-async function isActiveRecord(driver: Driver, rec: SessionRecord): Promise<boolean> {
-  if (rec.status === 'dead') return false;
+/** Running or suspended (resumable): what an alias resolves to and what blocks reuse. */
+function isActiveRecord(probe: LivenessProbe, rec: SessionRecord): boolean {
+  if (rec.status === 'dead' || rec.legacy) return false;
   try {
-    return await driver.isAlive(rec.tmuxName);
+    const st = probe(rec);
+    return st === 'running' || st === 'suspended';
   } catch {
     return false;
   }
 }
 
-async function blocksAliasReservation(driver: Driver, rec: SessionRecord): Promise<boolean> {
-  if (rec.status === 'dead') return false;
-  if (await isActiveRecord(driver, rec)) return true;
+function blocksAliasReservation(probe: LivenessProbe, rec: SessionRecord): boolean {
+  if (rec.status === 'dead' || rec.legacy) return false;
+  if (isActiveRecord(probe, rec)) return true;
   if (!rec.aliasReservedAt) return false;
   const reserved = Date.parse(rec.aliasReservedAt);
   return Number.isFinite(reserved) && Date.now() - reserved < ALIAS_RESERVATION_GRACE_MS;
@@ -102,6 +113,35 @@ function aliasCandidates(
   return aliased.filter((r) => workspaceAlias(r.workspace) === selector.workspace);
 }
 
+/**
+ * Normalise one persisted record (decision D12):
+ * - pre-actor record (has `tmuxName`, no `runtime`) → `legacy: 'tmux'`, `status: 'dead'`,
+ *   `legacyTmuxName` (read-only);
+ * - `instructionsPath` (codex persona file) → `systemPromptPath`;
+ * - `transcriptSessionId` (codex id discovered from the rollout) → `providerSessionId`.
+ */
+export function normalizeRecord(raw: unknown): SessionRecord | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const r: Record<string, unknown> = { ...(raw as Record<string, unknown>) };
+  if (typeof r.tmuxName === 'string') {
+    if (r.runtime === undefined) {
+      r.legacy = 'tmux';
+      r.status = 'dead';
+      r.legacyTmuxName = r.tmuxName;
+    }
+  }
+  delete r.tmuxName;
+  if (typeof r.instructionsPath === 'string' && r.systemPromptPath === undefined) {
+    r.systemPromptPath = r.instructionsPath;
+  }
+  delete r.instructionsPath;
+  if (typeof r.transcriptSessionId === 'string' && r.providerSessionId === undefined) {
+    r.providerSessionId = r.transcriptSessionId;
+  }
+  delete r.transcriptSessionId;
+  return r as unknown as SessionRecord;
+}
+
 /** Read the registry array. Missing/corrupt file => empty. */
 async function readRegistryUnlocked(): Promise<SessionRecord[]> {
   const file = Bun.file(registryPath());
@@ -109,7 +149,7 @@ async function readRegistryUnlocked(): Promise<SessionRecord[]> {
   try {
     const data = (await file.json()) as unknown;
     if (!Array.isArray(data)) return [];
-    return data as SessionRecord[];
+    return data.map(normalizeRecord).filter((r): r is SessionRecord => r !== null);
   } catch {
     return [];
   }
@@ -119,30 +159,26 @@ export async function readRegistry(): Promise<SessionRecord[]> {
   return readRegistryUnlocked();
 }
 
-/** Write the registry array atomically (tmp + rename). */
+/** Write the registry array atomically (tmp + rename), owner-only (0600 in a 0700 home). */
 async function writeRegistryUnlocked(records: SessionRecord[]): Promise<void> {
   const home = orcHome();
-  await fs.mkdir(home, { recursive: true });
-  const target = registryPath();
+  ensurePrivateDir(home);
   const tmp = path.join(home, `.registry.${randomUUID()}.tmp`);
-  await Bun.write(tmp, JSON.stringify(records, null, 2));
-  await fs.rename(tmp, target);
+  await writePrivateFile(registryPath(), JSON.stringify(records, null, 2), { tmpPath: tmp });
 }
 
 async function acquireRegistryLock(): Promise<() => Promise<void>> {
   const home = orcHome();
-  await fs.mkdir(home, { recursive: true });
+  ensurePrivateDir(home);
   const lock = path.join(home, '.registry.lock');
   const token = randomUUID();
   const deadline = Date.now() + REGISTRY_LOCK_TIMEOUT_MS;
 
   while (true) {
     try {
-      const handle = await fs.open(lock, 'wx');
+      const handle = await fs.open(lock, 'wx', PRIVATE_FILE_MODE);
       try {
-        await handle.writeFile(
-          JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }),
-        );
+        await handle.writeFile(lockOwnerRecord(token));
       } finally {
         await handle.close();
       }
@@ -168,7 +204,9 @@ async function acquireRegistryLock(): Promise<() => Promise<void>> {
         if ((statError as { code?: string }).code === 'ENOENT') continue;
         throw statError;
       }
-      if (Date.now() - st.mtimeMs > REGISTRY_LOCK_STALE_MS) {
+      // An owner that is provably gone (dead / zombie / pid reused) is reclaimed now, not
+      // after REGISTRY_LOCK_STALE_MS (see lock.ts).
+      if (Date.now() - st.mtimeMs > REGISTRY_LOCK_STALE_MS || lockOwnerGone(await readRegistryLockOwner(lock))) {
         if (await tryRemoveStaleRegistryLock(lock)) continue;
       }
 
@@ -185,11 +223,11 @@ async function tryRemoveStaleRegistryLock(lock: string): Promise<boolean> {
   try {
     const st = await fs.stat(lock).catch(() => null);
     if (!st) return true;
-    if (Date.now() - st.mtimeMs <= REGISTRY_LOCK_STALE_MS) return false;
-
     const owner = await readRegistryLockOwner(lock);
-    if (owner.pid && processIsAlive(owner.pid)) return false;
-
+    if (!lockOwnerGone(owner)) {
+      if (Date.now() - st.mtimeMs <= REGISTRY_LOCK_STALE_MS) return false;
+      if (owner.pid && isPidAlive(owner.pid)) return false;
+    }
     await fs.rm(lock, { force: true });
     return true;
   } finally {
@@ -203,11 +241,9 @@ async function acquireRegistryCleanupLock(lock: string): Promise<() => Promise<v
 
   while (true) {
     try {
-      const handle = await fs.open(lock, 'wx');
+      const handle = await fs.open(lock, 'wx', PRIVATE_FILE_MODE);
       try {
-        await handle.writeFile(
-          JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }),
-        );
+        await handle.writeFile(lockOwnerRecord(token));
       } finally {
         await handle.close();
       }
@@ -225,6 +261,15 @@ async function acquireRegistryCleanupLock(lock: string): Promise<() => Promise<v
     } catch (e) {
       const code = (e as { code?: string }).code;
       if (code !== 'EEXIST') throw e;
+      // A cleaner that died inside its (microsecond) section: reclaim after a grace.
+      const st = await fs.stat(lock).catch(() => null);
+      if (st && Date.now() - st.mtimeMs > 2_000) {
+        const owner = await readRegistryLockOwner(lock);
+        if (lockOwnerGone(owner) && (await readRegistryLockOwner(lock)).token === owner.token) {
+          await fs.rm(lock, { force: true });
+          continue;
+        }
+      }
       if (Date.now() >= deadline) {
         throw new Error(`timed out waiting for registry lock cleanup lock: ${lock}`);
       }
@@ -238,15 +283,6 @@ async function readRegistryLockOwner(lock: string): Promise<RegistryLockOwner> {
     return JSON.parse(await Bun.file(lock).text()) as RegistryLockOwner;
   } catch {
     return {};
-  }
-}
-
-function processIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return (e as { code?: string }).code === 'EPERM';
   }
 }
 
@@ -288,13 +324,14 @@ export async function upsertRecord(rec: SessionRecord): Promise<void> {
 }
 
 /** Reserve or update a record under the registry lock, enforcing workspace alias uniqueness. */
-export async function reserveRecord(rec: SessionRecord, opts: { driver: Driver }): Promise<void> {
+export async function reserveRecord(rec: SessionRecord, opts: { liveness?: LivenessProbe } = {}): Promise<void> {
+  const probe = opts.liveness ?? kernelLiveness;
   await updateRegistry(async (records) => {
     if (rec.alias) {
       for (const existing of records) {
         if (existing.id === rec.id) continue;
         if (existing.alias !== rec.alias || existing.workspace !== rec.workspace) continue;
-        if (!(await blocksAliasReservation(opts.driver, existing))) continue;
+        if (!blocksAliasReservation(probe, existing)) continue;
         throw new Error(
           `alias '@${rec.alias}' is already in use by active session ${existing.id} in workspace '${workspaceAlias(
             rec.workspace,
@@ -319,26 +356,21 @@ export async function removeRecord(id: string): Promise<void> {
   }));
 }
 
-/** Find a record by short id, full sessionId, or tmux name. */
+/** Find a record by short id or full sessionId. */
 export async function findRecord(idOrName: string): Promise<SessionRecord | null> {
   const records = await readRegistry();
-  return (
-    records.find(
-      (r) => r.id === idOrName || r.sessionId === idOrName || r.tmuxName === idOrName,
-    ) ?? null
-  );
+  return records.find((r) => r.id === idOrName || r.sessionId === idOrName) ?? null;
 }
 
+/** Resolve `@alias` / `@workspace:alias` to its active (running or suspended) record. */
 export async function findRecordByAlias(
   selector: AliasSelector,
-  opts: { defaultWorkspace: string; driver: Driver },
+  opts: { defaultWorkspace: string; liveness?: LivenessProbe },
 ): Promise<SessionRecord | null> {
+  const probe = opts.liveness ?? kernelLiveness;
   const records = await readRegistry();
   const candidates = aliasCandidates(records, selector, opts.defaultWorkspace);
-  const active: SessionRecord[] = [];
-  for (const rec of candidates) {
-    if (await isActiveRecord(opts.driver, rec)) active.push(rec);
-  }
+  const active = candidates.filter((rec) => isActiveRecord(probe, rec));
   if (active.length === 0) return null;
   if (active.length === 1) return active[0]!;
 
@@ -352,25 +384,18 @@ export async function findRecordByAlias(
 
 export async function assertAliasAvailable(
   alias: string | undefined,
-  opts: { workspace: string; driver: Driver },
+  opts: { workspace: string; liveness?: LivenessProbe },
 ): Promise<void> {
   if (!alias) return;
+  const probe = opts.liveness ?? kernelLiveness;
   const records = await readRegistry();
   for (const rec of records) {
     if (rec.alias !== alias || rec.workspace !== opts.workspace) continue;
-    if (!(await isActiveRecord(opts.driver, rec))) continue;
+    if (!isActiveRecord(probe, rec)) continue;
     throw new Error(
       `alias '@${alias}' is already in use by active session ${rec.id} in workspace '${workspaceAlias(
         opts.workspace,
       )}'`,
     );
   }
-}
-
-/** Live status of a record reconciled against the driver. */
-export async function reconcileStatus(
-  driver: Driver,
-  rec: SessionRecord,
-): Promise<'running' | 'dead'> {
-  return (await driver.isAlive(rec.tmuxName)) ? 'running' : 'dead';
 }

@@ -4,7 +4,6 @@
  * remainder with that command's own options map (parseArgs is strict on unknowns).
  */
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
 import { parseArgs } from 'node:util';
 import type { ParseArgsConfig } from 'node:util';
 import { agent } from '../agent.ts';
@@ -17,26 +16,21 @@ import {
   retryWorkflow,
   cancelWorkflow,
   cleanupWorkflow,
-  runnerTmuxName,
   reconcileRun,
   assembleStepLogs,
   validateWorkflowDef,
-  runnerLineageEnv,
-  buildPlan,
-  planDigest,
 } from '../workflow.ts';
+import {
+  awaitRunnerHandoff,
+  currentRunnerInfo,
+  followRunnerLog,
+  launchDetachedRecovery,
+  launchDetachedRun,
+  trapRunnerTermination,
+} from '../workflow-runner.ts';
 
 import type { WorkflowDef, WorkflowEvent, WorkflowRun, StepResult } from '../workflow.ts';
-import {
-  readRun,
-  listRuns,
-  writeRun,
-  writeRunOwned,
-  WORKFLOW_SCHEMA_VERSION,
-  makeLease,
-} from '../runs.ts';
-import { getDriver } from '../drivers/driver.ts';
-import { orcHome } from '../paths.ts';
+import { readRun, listRuns } from '../runs.ts';
 import { resolveUntil } from '../state.ts';
 import { resolveBind } from '../daemon/bind.ts';
 import { tailscaleIp4 } from '../daemon/tailscale.ts';
@@ -45,8 +39,22 @@ import { loadDaemonTokensFromEnv } from '../daemon/auth.ts';
 import type { Scope } from '../daemon/auth.ts';
 import { readPeers, addPeer, removePeer, peerHosts, DEFAULT_DAEMON_PORT } from '../daemon/peers.ts';
 import { DaemonClient, parseHostArg } from '../daemon/client.ts';
-import type { RemoteTarget } from '../daemon/client.ts';
-import type { AgentOptions, AgentState, Provider, SystemPromptMode } from '../types.ts';
+import type { RemoteTarget, DetachedWorkflowLaunch } from '../daemon/client.ts';
+import {
+  decideHost,
+  defaultHostNotice,
+  defaultModelsOf,
+  loadSettings,
+  renderSettingsView,
+  resolveSpawnDefaults,
+  settingsView,
+} from '../settings.ts';
+import type { HostDecision, Settings } from '../settings.ts';
+import type { AgentOptions, Provider, SystemPromptMode } from '../types.ts';
+import type { Session, SessionStateDetail } from '../session.ts';
+import type { SendResult } from '../messages.ts';
+import { renderJournal } from '../journal-render.ts';
+import type { JournalEntry } from '../runtime/types.ts';
 import {
   printJson,
   printError,
@@ -206,7 +214,10 @@ export function readSelectionFromFlags(values: ReadFlagValues): TurnSelection {
   return { mode: 'latest' };
 }
 
-async function cmdSpawn(args: string[]): Promise<number> {
+/** No provider from --provider or settings.toml. */
+const PROVIDER_REQUIRED = '--provider is required (claude|codex|pi), or set `provider` in settings.toml';
+
+async function cmdSpawn(args: string[], settings?: Settings): Promise<number> {
   const { values } = parse(args, {
     provider: { type: 'string', short: 'p' },
     model: { type: 'string', short: 'm' },
@@ -224,9 +235,16 @@ async function cmdSpawn(args: string[]): Promise<number> {
   });
   const json = jsonFlag(values);
 
-  const provider = values.provider as Provider | undefined;
+  // --provider/--model, else the settings.toml defaults (orc settings shows them).
+  const defaults = resolveSpawnDefaults({
+    provider: values.provider as string | undefined,
+    model: values.model as string | undefined,
+    agent: values.agent as string | undefined,
+    settings,
+  });
+  const provider = defaults.provider as Provider | undefined;
   if (!provider) {
-    printError('--provider is required (claude|codex|pi)', json);
+    printError(PROVIDER_REQUIRED, json);
     return 1;
   }
 
@@ -250,7 +268,7 @@ async function cmdSpawn(args: string[]): Promise<number> {
 
   const opts: AgentOptions = {
     provider,
-    model: values.model as string | undefined,
+    model: defaults.model,
     agentName: values.agent as string | undefined,
     alias: values.alias as string | undefined,
     systemPrompt: values['system-prompt'] as string | undefined,
@@ -281,8 +299,49 @@ async function cmdSpawn(args: string[]): Promise<number> {
   }
 }
 
+/** D8: acknowledged → 0, queued → 0, unknown → 3, failed → 1. */
+export function sendExitCode(phase: SendResult['phase']): number {
+  switch (phase) {
+    case 'acknowledged':
+    case 'queued':
+      return 0;
+    case 'unknown':
+      return 3;
+    default:
+      return 1;
+  }
+}
+
+/**
+ * `orc --host … send` exit code for a phase from ANY daemon version: a v1 (pre-actor)
+ * daemon reports `submitted` for a prompt it wrote but could not yet confirm — delivered
+ * as far as v1 knew, so success like v2 `queued`. A missing phase (older v1) = acked.
+ */
+export function remoteSendExitCode(phase: string | undefined): number {
+  switch (phase) {
+    case undefined:
+    case 'submitted':
+      return 0;
+    case 'acknowledged':
+    case 'queued':
+    case 'unknown':
+    case 'failed':
+      return sendExitCode(phase);
+    default:
+      return 1;
+  }
+}
+
+function renderSendResult(id: string, r: { phase: string; messageId?: string; replayed?: boolean }): string {
+  const replay = r.replayed ? ', replayed' : '';
+  const key = r.messageId ? ` [${r.messageId}]` : '';
+  return `sent to ${id} (${r.phase}${replay})${key}\n`;
+}
+
 async function cmdSend(args: string[]): Promise<number> {
   const { values, positionals } = parse(args, {
+    'idempotency-key': { type: 'string' },
+    'no-wake': { type: 'boolean' },
     json: { type: 'boolean' },
   });
   const json = jsonFlag(values);
@@ -313,15 +372,33 @@ async function cmdSend(args: string[]): Promise<number> {
     );
     return 1;
   }
+  const key = values['idempotency-key'] as string | undefined;
+  let r: SendResult;
   try {
-    await session.send(prompt);
+    r = await session.send(prompt, {
+      ...(key !== undefined ? { messageId: key } : {}),
+      ...(values['no-wake'] === true ? { wake: false } : {}),
+    });
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
   }
-  if (json) printJson({ ok: true, id: session.id });
-  else process.stdout.write(`sent to ${session.id}\n`);
-  return 0;
+  const code = sendExitCode(r.phase);
+  if (json) printJson({ ok: code === 0, id: session.id, ...r });
+  else if (code === 0) process.stdout.write(renderSendResult(session.id, r));
+  else {
+    process.stderr.write(
+      r.phase === 'unknown'
+        ? `error: delivery to ${session.id} is unknown (cut before the provider acknowledged it); not re-sent — check \`orc read ${session.id}\` and send again with a new key\n`
+        : `error: delivery to ${session.id} failed before the provider accepted it\n`,
+    );
+  }
+  return code;
+}
+
+/** Normalized journal entries as JSONL (one entry per line). */
+function journalJsonl(entries: JournalEntry[]): string {
+  return entries.map((e) => JSON.stringify(e)).join('\n');
 }
 
 async function cmdRead(args: string[]): Promise<number> {
@@ -352,14 +429,14 @@ async function cmdRead(args: string[]): Promise<number> {
     return 1;
   }
   try {
-    // --raw: the full tmux pane (with scrollback) exactly as tmux shows it. The escape
-    // hatch for when the parsed transcript isn't enough.
+    // --raw: the session journal (normalized provider events + lifecycle facts). The
+    // escape hatch for when the parsed transcript isn't enough.
     if (values.raw === true) {
-      const pane = await session.capture({ scrollback: true });
+      const journal = session.journal();
       if (json) {
-        printJson({ id: session.id, pane });
-      } else {
-        process.stdout.write(pane.endsWith('\n') ? pane : `${pane}\n`);
+        printJson({ id: session.id, journal });
+      } else if (journal.length > 0) {
+        process.stdout.write(`${journalJsonl(journal)}\n`);
       }
       return 0;
     }
@@ -377,20 +454,27 @@ async function cmdRead(args: string[]): Promise<number> {
       return 0;
     }
 
-    // Fallback: nothing on disk yet (just booted / nothing written). Show the live
-    // pane so `read` always shows something, and flag it so callers can tell.
-    const pane = await session.capture();
+    // Fallback: no provider transcript on disk yet. Render the session journal so `read`
+    // always shows something, and flag it so callers can tell.
+    const journal = session.journal();
     if (json) {
-      printJson({ id: session.id, fallback: true, pane });
+      printJson({ id: session.id, fallback: true, journal });
     } else {
-      process.stderr.write('(no on-disk transcript yet — showing live pane; --raw for full pane)\n');
-      process.stdout.write(pane.endsWith('\n') ? pane : `${pane}\n`);
+      process.stderr.write('(no on-disk transcript yet — showing the session journal; --raw for JSONL)\n');
+      const text = renderJournal(journal);
+      process.stdout.write(text.length > 0 ? `${text}\n` : '(empty)\n');
     }
     return 0;
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
   }
+}
+
+/** Record + kernel status (D1) + derived state, for list/get views. */
+export async function sessionViewOf(s: Session): Promise<SessionView> {
+  const d = await s.stateDetail().catch(() => undefined);
+  return { ...s.toJSON(), status: d?.status ?? 'dead', ...(d ? { state: d.state } : {}) };
 }
 
 async function cmdList(args: string[]): Promise<number> {
@@ -414,12 +498,7 @@ async function cmdList(args: string[]): Promise<number> {
     dead: values.dead === true,
     runId,
   });
-  const views: SessionView[] = await Promise.all(
-    sessions.map(async (s) => {
-      const status = (await s.status().catch(() => 'dead')) as 'running' | 'dead';
-      return { ...s.toJSON(), status };
-    }),
-  );
+  const views: SessionView[] = await Promise.all(sessions.map(sessionViewOf));
   const showLineage = values.lineage === true || Boolean(runId);
   if (json) {
     printJson(
@@ -454,17 +533,14 @@ async function cmdListAllHosts(values: Parsed['values'], json: boolean): Promise
 
   const rows: HostSessionView[] = [];
   const local = await listSessions(filter);
-  for (const s of local) {
-    const status = (await s.status().catch(() => 'dead')) as 'running' | 'dead';
-    rows.push({ ...s.toJSON(), status, host: 'local' });
-  }
+  for (const s of local) rows.push({ ...(await sessionViewOf(s)), host: 'local' });
 
   const peers = await readPeers();
   for (const p of peers) {
     const client = new DaemonClient({ host: p.host, port: p.port ?? DEFAULT_DAEMON_PORT });
     try {
       const remote = await client.listSessions(filter);
-      for (const r of remote) rows.push({ ...r, host: p.host });
+      for (const r of remote) rows.push({ ...r, state: r.state as SessionView['state'], host: p.host });
     } catch (e) {
       process.stderr.write(`warning: peer ${p.host} unreachable: ${(e as Error).message}\n`);
     }
@@ -475,6 +551,12 @@ async function cmdListAllHosts(values: Parsed['values'], json: boolean): Promise
   return 0;
 }
 
+/**
+ * `orc attach <id>` — follow the session journal rendered as text (prompts, replies,
+ * outcomes, lifecycle) until the session stops/suspends or Ctrl-C. Read-only by
+ * construction (`--read-only` accepted and ignored). `--json` prints
+ * `{id, command, journalPath}` and does not follow.
+ */
 async function cmdAttach(args: string[]): Promise<number> {
   const { values, positionals } = parse(args, {
     'read-only': { type: 'boolean' },
@@ -492,13 +574,84 @@ async function cmdAttach(args: string[]): Promise<number> {
     printError(`no session found for '${idOrName}'`, json);
     return 1;
   }
-  const cmd = session.attachCommand({ readOnly: values['read-only'] === true });
   if (json) {
-    printJson({ id: session.id, command: cmd });
+    printJson({ id: session.id, command: session.attachCommand(), journalPath: session.journalPath() });
     return 0;
   }
+  const ac = new AbortController();
+  const onInt = () => ac.abort();
+  process.once('SIGINT', onInt);
   try {
-    return await session.attach({ readOnly: values['read-only'] === true });
+    return await session.attach({ signal: ac.signal });
+  } catch (e) {
+    printError((e as Error).message, false);
+    return 1;
+  } finally {
+    process.off('SIGINT', onInt);
+  }
+}
+
+/**
+ * `orc resume <id>` — hand a stopped (killed / taken-over) or suspended session back to
+ * an actor: clear the sticky stop, wake it (re-checking maxConcurrentSessions) and wait
+ * for the provider to be ready. Purged and legacy sessions cannot be resumed.
+ */
+async function cmdResume(args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, { json: { type: 'boolean' } });
+  const json = jsonFlag(values);
+  const idOrName = positionals[0];
+  if (!idOrName) {
+    printError('resume requires <id|@alias>', json);
+    return 1;
+  }
+  // @alias resolves only active (running/suspended) sessions; a killed or taken-over
+  // session is addressed by its id.
+  const session = await getSessionForCli(idOrName, json);
+  if (session === undefined) return 1;
+  if (!session) {
+    printError(`no session found for '${idOrName}'`, json);
+    return 1;
+  }
+  let d: SessionStateDetail;
+  try {
+    d = await session.resume();
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
+  if (json) printJson(d);
+  else process.stdout.write(`resumed ${session.id}: ${d.state}\n`);
+  return 0;
+}
+
+/**
+ * `orc takeover <id>` — the escape hatch: stop the actor cleanly (sticky: a send cannot
+ * wake a second writer), then print the provider's own resume command for a human.
+ * Handback: `orc resume <id>`. `--json` prints `{id, cwd, command}`.
+ */
+async function cmdTakeover(args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, { json: { type: 'boolean' } });
+  const json = jsonFlag(values);
+  const idOrName = positionals[0];
+  if (!idOrName) {
+    printError('takeover requires <id|@alias>', json);
+    return 1;
+  }
+  const session = await getSessionForCli(idOrName, json);
+  if (session === undefined) return 1;
+  if (!session) {
+    printError(`no session found for '${idOrName}'`, json);
+    return 1;
+  }
+  try {
+    const t = await session.takeover();
+    if (json) printJson({ id: t.id, cwd: t.cwd, command: t.command, ...(t.note ? { note: t.note } : {}) });
+    else {
+      process.stdout.write(
+        `# orc stopped ${t.id}; continue it yourself with:\n${t.command}\n${t.note ? `# ${t.note}\n` : ''}# hand it back with: orc resume ${t.id}\n`,
+      );
+    }
+    return 0;
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
@@ -538,18 +691,27 @@ async function cmdKill(args: string[]): Promise<number> {
 async function cmdPrune(args: string[]): Promise<number> {
   const { values } = parse(args, {
     worktree: { type: 'boolean' },
+    suspended: { type: 'boolean' },
+    'taken-over': { type: 'boolean' },
     json: { type: 'boolean' },
   });
   const json = jsonFlag(values);
   let removed: string[];
   try {
-    removed = await pruneSessions({ removeWorktree: values.worktree === true });
+    removed = await pruneSessions({
+      removeWorktree: values.worktree === true,
+      suspended: values.suspended === true,
+      takenOver: values['taken-over'] === true,
+    });
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
   }
   if (json) printJson({ ok: true, pruned: removed });
-  else process.stdout.write(`pruned ${removed.length} dead record(s)\n`);
+  else {
+    const what = values.suspended === true ? 'dead/suspended' : 'dead';
+    process.stdout.write(`pruned ${removed.length} ${what} record(s)\n`);
+  }
   return 0;
 }
 
@@ -574,15 +736,18 @@ async function cmdState(args: string[]): Promise<number> {
     printError(`no session found for '${idOrName}'`, json);
     return 1;
   }
-  let state: AgentState;
+  let d: SessionStateDetail;
   try {
-    state = await session.state();
+    d = await session.stateDetail();
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
   }
-  if (json) printJson({ id: session.id, state });
-  else process.stdout.write(`${state}\n`);
+  if (json) printJson(d);
+  else {
+    const note = d.stopped ? ' (stopped)' : d.suspended ? ' (suspended)' : '';
+    process.stdout.write(`${d.state}${note}\n`);
+  }
   return 0;
 }
 
@@ -620,7 +785,7 @@ async function cmdWait(args: string[]): Promise<number> {
     return 1;
   }
   const startedAt = Date.now();
-  let state: AgentState;
+  let state: string;
   let reached: boolean;
   try {
     const result = await session.waitForResult({ until, timeoutMs });
@@ -644,12 +809,15 @@ async function cmdWait(args: string[]): Promise<number> {
  * `orc workflow <sub>` — the only command with a sub-arg. argv[1] is the workflow
  * subcommand (run|list|status); the remainder is that sub's own args.
  */
-async function cmdWorkflow(args: string[]): Promise<number> {
+async function cmdWorkflow(args: string[], settings?: Settings): Promise<number> {
   const sub = args[0];
   const rest = args.slice(1);
+  // settings.toml `[models]`: the steps' default models, fixed when a run STARTS (recorded
+  // on the run). resume/retry — and a detached runner — use the record, never settings.
+  const defaultModels = settings ? defaultModelsOf(settings) : undefined;
   switch (sub) {
     case 'run':
-      return cmdWorkflowRun(rest);
+      return cmdWorkflowRun(rest, defaultModels);
     case 'list':
       return cmdWorkflowList(rest);
     case 'status':
@@ -692,7 +860,9 @@ function parseMaxConcurrencyFlag(
   return { ok: true, value: n };
 }
 
-async function cmdWorkflowRun(args: string[]): Promise<number> {
+type DefaultModels = Partial<Record<Provider, string>>;
+
+async function cmdWorkflowRun(args: string[], defaultModels?: DefaultModels): Promise<number> {
   const { values, positionals } = parse(args, {
     json: { type: 'boolean' },
     detach: { type: 'boolean' },
@@ -726,26 +896,38 @@ async function cmdWorkflowRun(args: string[]): Promise<number> {
   }
 
   if (values.detach === true) {
-    return cmdWorkflowRunDetached(absFile, def, json, conc.value);
+    return cmdWorkflowRunDetached(absFile, def, json, conc.value, defaultModels);
   }
 
   let run: WorkflowRun;
+  // `--run-id` is the entrypoint a detached runner executes: reuse the id minted by
+  // `--detach` and self-report this process as the run's `runner` (the runner
+  // re-persists the record from scratch, stamping its own identity on the lease).
+  const runId = values['run-id'] as string | undefined;
+  const runner = runId ? await startDetachedRunner(runId, 'run') : undefined;
+  // A detached runner runs with what its LAUNCHER recorded (absent = none) — never this
+  // host's settings: a daemon launch (over --host) applies no [models], exactly like a
+  // foreground daemon run, and a CLI launch already recorded its settings.
+  const models = runId ? (await readRun(runId))?.defaultModels : defaultModels;
+  const term = trapRunnerTermination();
   try {
     // Stream step events to stdout in human mode; --json prints only the final record.
-    // `--run-id` is the entrypoint a detached runner executes: reuse the id minted by
-    // `--detach` and re-thread runnerTmux (the runner re-persists the record from scratch).
-    const runId = values['run-id'] as string | undefined;
     run = await runWorkflow(def, {
       runId,
-      runnerTmux: runId ? runnerTmuxName(runId) : undefined,
+      runner,
+      signal: term.signal,
       sourcePath: absFile,
       maxConcurrency: conc.value,
+      defaultModels: models,
       onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
     });
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
+  } finally {
+    term.dispose();
   }
+  if (term.signal.aborted) return runnerTerminated(run);
 
   if (json) printJson(run);
   // Non-zero exit when the run failed, so callers/CI can gate on it.
@@ -753,79 +935,53 @@ async function cmdWorkflowRun(args: string[]): Promise<number> {
 }
 
 /**
- * `--detach`: run the workflow as a detached, reattachable tmux session — consistent with
- * how orc runs agents (reuse the Driver; never nohup a bare process). Mint the runId up
- * front, write an initial `running` record (so `status` resolves immediately), spawn a
- * session `orc-wf-<runId>` whose argv runs the workflow in the FOREGROUND inside it
- * (`<bun> <cli> workflow run <absFile> --run-id <runId>`), then print and exit 0. The
- * detached runner owns the record from there. cwd is THIS invocation's cwd so steps that
- * share cwd behave identically to a foreground run.
+ * A detached runner (`--run-id` / `--runner`) reports itself: a separator line in its
+ * log (resumed/retried runners append to the same file) and its `runner` identity —
+ * after waiting for the launcher's stamp, so its first owning write follows the handoff.
+ */
+async function startDetachedRunner(
+  runId: string,
+  action: string,
+): Promise<ReturnType<typeof currentRunnerInfo>> {
+  const runner = currentRunnerInfo(runId);
+  process.stdout.write(`# orc runner pid=${runner.pid} action=${action} run=${runId} at ${runner.startedAt}\n`);
+  if (!(await awaitRunnerHandoff(runId))) {
+    process.stdout.write(`# orc runner pid=${runner.pid}: launcher handoff not confirmed; proceeding\n`);
+  }
+  return runner;
+}
+
+/** SIGTERM'd runner (e.g. `orc workflow cancel`): it wrote nothing further; exit 143. */
+function runnerTerminated(run: WorkflowRun): number {
+  process.stdout.write(`# orc runner pid=${process.pid} terminated (SIGTERM); run ${run.id} ${run.status}\n`);
+  return 143;
+}
+
+/**
+ * `--detach`: run the workflow as a detached runner process. Mint the runId up front,
+ * write an initial `running` record (so `status` resolves immediately), spawn
+ * `<orc> workflow run <absFile> --run-id <runId>` fully detached (own session, no
+ * terminal, output → ~/.orc/runs/<runId>/runner.log), stamp its identity on the record,
+ * then print and exit 0. The runner owns the record from there. cwd is THIS
+ * invocation's cwd so steps that share cwd behave identically to a foreground run.
  */
 async function cmdWorkflowRunDetached(
   absFile: string,
   def: WorkflowDef,
   json: boolean,
   maxConcurrency?: number,
+  defaultModels?: DefaultModels,
 ): Promise<number> {
-  // The parent doesn't call runWorkflow, so validate the def here — a malformed workflow
-  // must fail cleanly now, not spawn a doomed runner and hand back a self-orphaning runId.
-  const defForPlan: WorkflowDef =
-    maxConcurrency !== undefined ? { ...def, maxConcurrency } : def;
   try {
-    validateWorkflowDef(defForPlan);
+    const launch = await launchDetachedRun(def, absFile, { maxConcurrency, defaultModels });
+    if (json) printJson({ runId: launch.runId, logPath: launch.logPath });
+    else process.stdout.write(`${launch.runId}\n`);
+    return 0;
   } catch (e) {
-    printError((e as Error).message, json);
+    const msg = (e as Error).message;
+    printError((e as { code?: string }).code === 'RUNNER_SPAWN_FAILED' ? `failed to launch detached runner: ${msg}` : msg, json);
     return 1;
   }
-
-  const runId = randomUUID().slice(0, 8);
-  const runnerTmux = runnerTmuxName(runId);
-
-  const plan = buildPlan(defForPlan);
-  const run: WorkflowRun = {
-    schemaVersion: WORKFLOW_SCHEMA_VERSION,
-    revision: 0,
-    id: runId,
-    name: def.name,
-    startedAt: new Date().toISOString(),
-    status: 'running',
-    runnerTmux,
-    steps: [],
-    plan,
-    definitionDigest: planDigest(plan),
-    sourcePath: absFile,
-    attempts: [],
-    lease: makeLease({ runnerTmux }),
-    rootRunId: runId,
-  };
-  await writeRunOwned(run);
-
-  // process.execPath = the exact bun binary running us → no reliance on the tmux server's
-  // PATH resolving `bun`. Thread ORC_HOME so the runner persists to the same runs dir
-  // (a new tmux session inherits the server env, not ours).
-  const argv = [process.execPath, import.meta.path, 'workflow', 'run', absFile, '--run-id', runId];
-  if (maxConcurrency !== undefined) {
-    argv.push('--max-concurrency', String(maxConcurrency));
-  }
-  try {
-    await getDriver().spawn({
-      name: runnerTmux,
-      cwd: process.cwd(),
-      argv,
-      env: { ORC_HOME: orcHome(), ...runnerLineageEnv(run) },
-    });
-  } catch (e) {
-    // Spawn failed → finalize the record we wrote so it doesn't linger as a phantom run.
-    run.status = 'failed';
-    run.finishedAt = new Date().toISOString();
-    await writeRun(run).catch(() => {});
-    printError(`failed to launch detached runner: ${(e as Error).message}`, json);
-    return 1;
-  }
-
-  if (json) printJson({ runId, runnerTmux });
-  else process.stdout.write(`${runId}\n`);
-  return 0;
 }
 
 async function cmdWorkflowList(args: string[]): Promise<number> {
@@ -859,6 +1015,12 @@ async function cmdWorkflowStatus(args: string[]): Promise<number> {
   return 0;
 }
 
+/**
+ * `orc workflow attach <runId>` — follow a detached run's runner log in-process: print
+ * what is there, then tail it until the run is finalized and its runner is gone (or
+ * Ctrl-C). `--json` prints `{ runId, logPath, runner }` and does not follow.
+ * `--read-only` is accepted and ignored (following is read-only by construction).
+ */
 async function cmdWorkflowAttach(args: string[]): Promise<number> {
   const { values, positionals } = parse(args, {
     'read-only': { type: 'boolean' },
@@ -875,21 +1037,43 @@ async function cmdWorkflowAttach(args: string[]): Promise<number> {
     printError(`no run found for '${runId}'`, json);
     return 1;
   }
-  if (!run.runnerTmux) {
-    printError(`run '${runId}' has no runner session to attach (it was not run with --detach)`, json);
+  if (!run.runner) {
+    printError(
+      run.legacyRunnerTmux
+        ? `run '${runId}' was started by a legacy (pre-actor) runner; it has no runner log`
+        : `run '${runId}' has no runner log (it was not run with --detach)`,
+      json,
+    );
     return 1;
   }
-  const cmd = getDriver().attachCommand(run.runnerTmux, { readOnly: values['read-only'] === true });
-  if (json) printJson({ runId, command: cmd });
-  else process.stdout.write(`${cmd}\n`);
-  return 0;
+  if (json) {
+    printJson({ runId, logPath: run.runner.logPath, runner: run.runner });
+    return 0;
+  }
+  const ac = new AbortController();
+  const onInt = () => ac.abort();
+  process.once('SIGINT', onInt);
+  try {
+    const last = await followRunnerLog(runId, { signal: ac.signal });
+    if (!ac.signal.aborted && last) process.stderr.write(`# run ${runId} ${last.status}\n`);
+    return 0;
+  } catch (e) {
+    printError((e as Error).message, false);
+    return 1;
+  } finally {
+    process.off('SIGINT', onInt);
+  }
 }
+
+/** Journal entries per step shown by `workflow logs --raw`. */
+const RAW_JOURNAL_TAIL = 200;
 
 /**
  * `orc workflow logs <runId> [--step <id>] [--raw]` — read the actual work each step's
  * agent did. Default: the full token-efficient parsed transcript per step (the same
- * parsed format as `orc read --full`), labeled `### step <id> (<provider>)`. `--raw` shows the live pane capture
- * instead. `--json` emits `{ step, turns }[]` (parsed) or `{ step, provider, pane }[]` (raw).
+ * parsed format as `orc read --full`), labeled `### step <id> (<provider>)`. `--raw` shows
+ * each step session's journal tail instead. `--json` emits `{ step, turns }[]` (parsed)
+ * or `{ step, provider, journal }[]` (raw).
  */
 async function cmdWorkflowLogs(args: string[]): Promise<number> {
   const { values, positionals } = parse(args, {
@@ -923,22 +1107,22 @@ async function cmdWorkflowLogs(args: string[]): Promise<number> {
 
   try {
     if (values.raw === true) {
-      // Raw: the live tmux pane (with scrollback) of each step's still-alive session.
-      const panes: { step: string; provider: StepResult['provider']; pane: string }[] = [];
+      // Raw: each step session's journal tail (normalized provider events + lifecycle).
+      const logs: { step: string; provider: StepResult['provider']; journal: JournalEntry[] }[] = [];
       for (const s of selected) {
-        let pane = '';
+        let journal: JournalEntry[] = [];
         if (s.sessionId) {
           const session = await getSession(s.sessionId);
-          if (session) pane = await session.capture({ scrollback: true }).catch(() => '');
+          if (session) journal = session.journal({ tail: RAW_JOURNAL_TAIL });
         }
-        panes.push({ step: s.id, provider: s.provider, pane });
+        logs.push({ step: s.id, provider: s.provider, journal });
       }
       if (json) {
-        printJson(panes);
+        printJson(logs);
       } else {
         process.stdout.write(
-          `${panes
-            .map((p) => `### step ${p.step} (${p.provider})\n${p.pane.trimEnd() || '(no pane — session gone)'}`)
+          `${logs
+            .map((l) => `### step ${l.step} (${l.provider})\n${renderJournal(l.journal) || '(no journal — session gone)'}`)
             .join('\n\n')}\n`,
         );
       }
@@ -980,38 +1164,28 @@ async function cmdWorkflowLogs(args: string[]): Promise<number> {
  * unless `--insecure`. The process blocks here serving forever (Ctrl-C / SIGTERM stops it).
  */
 
-/** Detach a resume/retry control action into a named runner tmux session. */
+/** Detach a resume/retry into a detached runner process (spawn first, then stamp). */
 async function detachWorkflowControl(
   action: 'resume' | 'retry',
   runId: string,
+  def: WorkflowDef,
   absFile: string,
   json: boolean,
-  extraArgs: string[] = [],
+  stepId?: string,
 ): Promise<number> {
-  const runnerTmux = runnerTmuxName(runId);
-  const argv = [
-    process.execPath,
-    import.meta.path,
-    'workflow',
-    action,
-    runId,
-    absFile,
-    ...extraArgs,
-  ];
   try {
-    await getDriver().spawn({
-      name: runnerTmux,
-      cwd: process.cwd(),
-      argv,
-      env: { ORC_HOME: orcHome() },
-    });
+    const launch = await launchDetachedRecovery(action, runId, def, absFile, { stepId });
+    if (json) printJson({ runId, logPath: launch.logPath, action });
+    else process.stdout.write(`${runId}\n`);
+    return 0;
   } catch (e) {
-    printError(`failed to launch detached ${action}: ${(e as Error).message}`, json);
+    const msg = (e as Error).message;
+    printError(
+      (e as { code?: string }).code === 'RUNNER_SPAWN_FAILED' ? `failed to launch detached ${action}: ${msg}` : msg,
+      json,
+    );
     return 1;
   }
-  if (json) printJson({ runId, runnerTmux, action });
-  else process.stdout.write(`${runId}\n`);
-  return 0;
 }
 
 async function loadWorkflowDefFromFile(file: string): Promise<{ def: WorkflowDef; absPath: string }> {
@@ -1024,15 +1198,24 @@ async function loadWorkflowDefFromFile(file: string): Promise<{ def: WorkflowDef
 
 /** `orc workflow resume <runId> [workflowFile] [--detach]` */
 
-/** Refuse resume/retry when reconcile still reports running (owner not proven dead). */
-async function assertNoLiveOwner(runId: string, json: boolean): Promise<WorkflowRun | null> {
+/**
+ * Refuse resume/retry when reconcile still reports running (owner not proven dead).
+ * A detached runner (`--runner`) whose own identity was stamped by its parent is the
+ * live owner itself, which is allowed.
+ */
+async function assertNoLiveOwner(
+  runId: string,
+  json: boolean,
+  opts?: { asRunner?: boolean },
+): Promise<WorkflowRun | null> {
   const existing = await readRun(runId);
   if (!existing) {
     printError(`no run found for '${runId}'`, json);
     return null;
   }
   const live = await reconcileRun(existing);
-  if (live.status === 'running') {
+  const isSelf = opts?.asRunner === true && live.runner?.pid === process.pid;
+  if (live.status === 'running' && !isSelf) {
     printError(
       `run '${runId}' still has a live owner; wait for it to finish/expire or cancel first`,
       json,
@@ -1046,6 +1229,7 @@ async function cmdWorkflowResume(args: string[]): Promise<number> {
   const { values, positionals } = parse(args, {
     json: { type: 'boolean' },
     detach: { type: 'boolean' },
+    runner: { type: 'boolean' },
   });
   const json = jsonFlag(values);
   const runId = positionals[0];
@@ -1054,7 +1238,9 @@ async function cmdWorkflowResume(args: string[]): Promise<number> {
     printError('workflow resume requires <runId> [workflowFile]', json);
     return 1;
   }
-  if (!(await assertNoLiveOwner(runId, json))) return 1;
+  const asRunner = values.runner === true;
+  const runner = asRunner ? await startDetachedRunner(runId, 'resume') : undefined;
+  if (!(await assertNoLiveOwner(runId, json, { asRunner }))) return 1;
   if (!file) {
     printError(
       'workflow resume requires the original workflow file (function predicates remain non-portable; prefer verify descriptors)',
@@ -1065,14 +1251,22 @@ async function cmdWorkflowResume(args: string[]): Promise<number> {
   try {
     const { def, absPath } = await loadWorkflowDefFromFile(file);
     if (values.detach === true) {
-      return detachWorkflowControl('resume', runId, absPath, json);
+      return detachWorkflowControl('resume', runId, def, absPath, json);
     }
-    const run = await resumeWorkflow(runId, def, {
-      sourcePath: absPath,
-      onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
-    });
-    if (json) printJson(run);
-    return run.status === 'done' ? 0 : 1;
+    const term = trapRunnerTermination();
+    try {
+      const run = await resumeWorkflow(runId, def, {
+        sourcePath: absPath,
+        runner,
+        signal: term.signal,
+        onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
+      });
+      if (term.signal.aborted) return runnerTerminated(run);
+      if (json) printJson(run);
+      return run.status === 'done' ? 0 : 1;
+    } finally {
+      term.dispose();
+    }
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
@@ -1085,6 +1279,7 @@ async function cmdWorkflowRetry(args: string[]): Promise<number> {
     json: { type: 'boolean' },
     detach: { type: 'boolean' },
     step: { type: 'string' },
+    runner: { type: 'boolean' },
   });
   const json = jsonFlag(values);
   const runId = positionals[0];
@@ -1093,7 +1288,9 @@ async function cmdWorkflowRetry(args: string[]): Promise<number> {
     printError('workflow retry requires <runId> [--step <id>] [workflowFile]', json);
     return 1;
   }
-  if (!(await assertNoLiveOwner(runId, json))) return 1;
+  const asRunner = values.runner === true;
+  const runner = asRunner ? await startDetachedRunner(runId, 'retry') : undefined;
+  if (!(await assertNoLiveOwner(runId, json, { asRunner }))) return 1;
   if (!file) {
     printError(
       'workflow retry requires the original workflow file (function predicates remain non-portable; prefer verify descriptors)',
@@ -1105,15 +1302,23 @@ async function cmdWorkflowRetry(args: string[]): Promise<number> {
     const { def, absPath } = await loadWorkflowDefFromFile(file);
     const stepId = values.step as string | undefined;
     if (values.detach === true) {
-      return detachWorkflowControl('retry', runId, absPath, json, stepId ? ['--step', stepId] : []);
+      return detachWorkflowControl('retry', runId, def, absPath, json, stepId);
     }
-    const run = await retryWorkflow(runId, def, {
-      sourcePath: absPath,
-      stepId,
-      onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
-    });
-    if (json) printJson(run);
-    return run.status === 'done' ? 0 : 1;
+    const term = trapRunnerTermination();
+    try {
+      const run = await retryWorkflow(runId, def, {
+        sourcePath: absPath,
+        stepId,
+        runner,
+        signal: term.signal,
+        onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e)),
+      });
+      if (term.signal.aborted) return runnerTerminated(run);
+      if (json) printJson(run);
+      return run.status === 'done' ? 0 : 1;
+    } finally {
+      term.dispose();
+    }
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
@@ -1265,6 +1470,43 @@ async function cmdDaemon(args: string[]): Promise<number> {
 }
 
 /** `orc remote add|list|rm <host>` — manage the trusted-peer file (~/.orc/peers.json). */
+/**
+ * `orc login chatgpt [--import-pi] [--no-browser]` | `orc login status [--json]` — the codex
+ * harness's OpenAI credentials (src/codex/login.ts; loaded lazily: it pulls in pi-ai).
+ */
+async function cmdLogin(args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, {
+    'import-pi': { type: 'boolean' },
+    'no-browser': { type: 'boolean' },
+    json: { type: 'boolean' },
+  });
+  const json = jsonFlag(values);
+  const what = positionals[0];
+  const login = await import('../codex/login.ts');
+  if (what === 'status') {
+    const s = await login.loginStatus();
+    if (json) printJson(s);
+    else process.stdout.write(`${login.renderLoginStatus(s)}\n`);
+    return s.active === 'error' ? 1 : 0;
+  }
+  if (what === 'chatgpt') {
+    return login.loginChatGPT({ importPi: values['import-pi'] === true, noBrowser: values['no-browser'] === true });
+  }
+  printError(`usage: orc login chatgpt [--import-pi] [--no-browser] | orc login status [--json]`, json);
+  return 1;
+}
+
+/** `orc logout chatgpt` — remove orc's ChatGPT credential (pi's login is never touched). */
+async function cmdLogout(args: string[]): Promise<number> {
+  const { values, positionals } = parse(args, { json: { type: 'boolean' } });
+  const json = jsonFlag(values);
+  if (positionals[0] !== 'chatgpt') {
+    printError('usage: orc logout chatgpt', json);
+    return 1;
+  }
+  return (await import('../codex/login.ts')).logoutChatGPT();
+}
+
 async function cmdRemoteAdmin(args: string[]): Promise<number> {
   const sub = args[0];
   const rest = args.slice(1);
@@ -1334,14 +1576,20 @@ async function cmdRemoteAdmin(args: string[]): Promise<number> {
 }
 
 /**
- * Strip a global `--host <h>` / `--host=<h>` flag from argv (it may appear before the
- * subcommand). Returns the host (if any) and the remaining argv. Pure + unit-testable.
+ * Strip the global `--host <h>` / `--host=<h>` and `--local` flags from argv (they may
+ * appear before the subcommand). Returns the host (if any), `local: true` when `--local`
+ * was given, and the remaining argv. Pure + unit-testable.
  */
-export function extractHostFlag(argv: string[]): { host?: string; rest: string[] } {
+export function extractHostFlag(argv: string[]): { host?: string; local?: true; rest: string[] } {
   const rest: string[] = [];
   let host: string | undefined;
+  let local = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
+    if (a === '--local') {
+      local = true;
+      continue;
+    }
     if (a === '--host') {
       host = argv[i + 1];
       i++;
@@ -1353,18 +1601,39 @@ export function extractHostFlag(argv: string[]): { host?: string; rest: string[]
     }
     rest.push(a);
   }
-  return { ...(host !== undefined ? { host } : {}), rest };
+  return { ...(host !== undefined ? { host } : {}), ...(local ? { local: true as const } : {}), rest };
+}
+
+/**
+ * `orc settings [--json]` — the effective settings per key with their source (flag / env /
+ * local file / global file / default), the files considered and any warnings. Host-local.
+ */
+async function cmdSettings(args: string[], opts: { local: boolean }): Promise<number> {
+  const { values } = parse(args, { json: { type: 'boolean' } });
+  const json = jsonFlag(values);
+  let settings: Settings;
+  try {
+    settings = loadSettings();
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
+  const peers = settings.host?.source === 'local' ? await readPeers() : [];
+  const view = settingsView(settings, { local: opts.local, peers });
+  if (json) printJson(view);
+  else process.stdout.write(`${renderSettingsView(view)}\n`);
+  return 0;
 }
 
 /** Dispatch a command to its remote (HTTP) implementation when `--host` is present. */
-async function cmdRemote(command: string, host: string, rest: string[]): Promise<number> {
+async function cmdRemote(command: string, host: string, rest: string[], settings?: Settings): Promise<number> {
   const target = parseHostArg(host);
   const client = new DaemonClient(target);
   switch (command) {
     case 'list':
       return remoteList(client, rest, target);
     case 'spawn':
-      return remoteSpawn(client, rest);
+      return remoteSpawn(client, rest, settings);
     case 'send':
       return remoteSend(client, rest);
     case 'read':
@@ -1400,7 +1669,7 @@ async function remoteList(client: DaemonClient, args: string[], target: RemoteTa
       dead: values.dead === true,
     });
     if (json) printJson(views);
-    else process.stdout.write(`${renderSessionList(views as SessionView[])}\n`);
+    else process.stdout.write(`${renderSessionList(views.map((v) => ({ ...v, state: v.state as SessionView['state'] })))}\n`);
     return 0;
   } catch (e) {
     void target;
@@ -1409,7 +1678,7 @@ async function remoteList(client: DaemonClient, args: string[], target: RemoteTa
   }
 }
 
-async function remoteSpawn(client: DaemonClient, args: string[]): Promise<number> {
+async function remoteSpawn(client: DaemonClient, args: string[], settings?: Settings): Promise<number> {
   const { values } = parse(args, {
     provider: { type: 'string', short: 'p' },
     model: { type: 'string', short: 'm' },
@@ -1426,9 +1695,16 @@ async function remoteSpawn(client: DaemonClient, args: string[]): Promise<number
     json: { type: 'boolean' },
   });
   const json = jsonFlag(values);
-  const provider = values.provider as string | undefined;
+  // Defaults resolve on THIS (client) side and are sent explicitly.
+  const defaults = resolveSpawnDefaults({
+    provider: values.provider as string | undefined,
+    model: values.model as string | undefined,
+    agent: values.agent as string | undefined,
+    settings,
+  });
+  const provider = defaults.provider;
   if (!provider) {
-    printError('--provider is required (claude|codex|pi)', json);
+    printError(PROVIDER_REQUIRED, json);
     return 1;
   }
   let prompt: string | undefined;
@@ -1445,7 +1721,7 @@ async function remoteSpawn(client: DaemonClient, args: string[]): Promise<number
   }
   const body = {
     provider,
-    model: values.model,
+    model: defaults.model,
     agent: values.agent,
     alias: values.alias,
     systemPrompt: values['system-prompt'],
@@ -1469,7 +1745,11 @@ async function remoteSpawn(client: DaemonClient, args: string[]): Promise<number
 }
 
 async function remoteSend(client: DaemonClient, args: string[]): Promise<number> {
-  const { values, positionals } = parse(args, { json: { type: 'boolean' } });
+  const { values, positionals } = parse(args, {
+    'idempotency-key': { type: 'string' },
+    'no-wake': { type: 'boolean' },
+    json: { type: 'boolean' },
+  });
   const json = jsonFlag(values);
   const id = positionals[0];
   if (!id) {
@@ -1488,10 +1768,17 @@ async function remoteSend(client: DaemonClient, args: string[]): Promise<number>
     return 1;
   }
   try {
-    const r = await client.send(id, prompt);
+    const key = values['idempotency-key'] as string | undefined;
+    const r = await client.send(id, prompt, {
+      ...(key !== undefined ? { messageId: key } : {}),
+      ...(values['no-wake'] === true ? { wake: false } : {}),
+    });
+    const phase = r.phase ?? 'acknowledged';
+    const code = remoteSendExitCode(r.phase);
     if (json) printJson(r);
-    else process.stdout.write(`sent to ${r.id}\n`);
-    return 0;
+    else if (code === 0) process.stdout.write(renderSendResult(r.id, { ...r, phase }));
+    else process.stderr.write(`error: delivery to ${r.id} ${phase}\n`);
+    return code;
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
@@ -1521,22 +1808,29 @@ async function remoteRead(client: DaemonClient, args: string[]): Promise<number>
   }
   try {
     const res = await client.read(id, { raw: values.raw === true, selection });
-    if (res.kind === 'raw') {
-      if (json) printJson({ id: res.id, pane: res.pane });
-      else process.stdout.write(res.pane.endsWith('\n') ? res.pane : `${res.pane}\n`);
-      return 0;
-    }
     if (res.kind === 'parsed') {
       if (json) printJson(res.turns);
       else process.stdout.write(`${renderTurns(res.turns)}\n`);
       return 0;
     }
-    // fallback: nothing on disk yet — the daemon returned the live pane.
+    if ('pane' in res) {
+      // A pre-actor (v1) daemon: it still answers raw/fallback reads with a pane.
+      if (json) printJson({ id: res.id, ...(res.kind === 'fallback' ? { fallback: true } : {}), pane: res.pane });
+      else process.stdout.write(res.pane.endsWith('\n') ? res.pane : `${res.pane}\n`);
+      return 0;
+    }
+    if (res.kind === 'raw') {
+      if (json) printJson({ id: res.id, journal: res.journal });
+      else if (res.journal.length > 0) process.stdout.write(`${journalJsonl(res.journal)}\n`);
+      return 0;
+    }
+    // fallback: no transcript on disk yet — the daemon returned the session journal.
     if (json) {
-      printJson({ id: res.id, fallback: true, pane: res.pane });
+      printJson({ id: res.id, fallback: true, journal: res.journal });
     } else {
-      process.stderr.write('(no on-disk transcript yet — showing live pane; --raw for full pane)\n');
-      process.stdout.write(res.pane.endsWith('\n') ? res.pane : `${res.pane}\n`);
+      process.stderr.write('(no on-disk transcript yet — showing the session journal; --raw for JSONL)\n');
+      const text = renderJournal(res.journal);
+      process.stdout.write(text.length > 0 ? `${text}\n` : '(empty)\n');
     }
     return 0;
   } catch (e) {
@@ -1592,8 +1886,18 @@ async function remoteState(client: DaemonClient, args: string[]): Promise<number
   }
   try {
     const rec = await client.getSession(id);
-    if (json) printJson({ id: rec.id, state: rec.state });
-    else process.stdout.write(`${rec.state}\n`);
+    if (json) {
+      printJson({
+        id: rec.id,
+        state: rec.state,
+        ...(rec.status !== undefined ? { status: rec.status } : {}),
+        ...(rec.suspended !== undefined ? { suspended: rec.suspended } : {}),
+        ...(rec.stopped !== undefined ? { stopped: rec.stopped } : {}),
+      });
+    } else {
+      const note = rec.stopped ? ' (stopped)' : rec.suspended ? ' (suspended)' : '';
+      process.stdout.write(`${rec.state}${note}\n`);
+    }
     return 0;
   } catch (e) {
     printError((e as Error).message, json);
@@ -1626,9 +1930,8 @@ async function remoteKill(client: DaemonClient, args: string[]): Promise<number>
 }
 
 /**
- * Remote attach is HOST-LOCAL: the tmux session lives on the remote host, so a local
- * `tmux attach` is useless. Print the host + a `tailscale ssh <host>` hint (and the exact
- * `tmux attach` to run once there).
+ * Remote attach is HOST-LOCAL: the session journal lives on the remote host. Print the
+ * `tailscale ssh <host> orc attach <id>` command that follows it there.
  */
 async function remoteAttach(
   client: DaemonClient,
@@ -1645,32 +1948,25 @@ async function remoteAttach(
     printError('attach requires <id|@alias>', json);
     return 1;
   }
-  let tmuxName: string | undefined;
+  let resolved = id;
   try {
-    const rec = await client.getSession(id);
-    tmuxName = rec.tmuxName;
+    resolved = (await client.getSession(id)).id;
   } catch {
     /* still give the ssh hint even if the lookup failed */
   }
-  const ssh = `tailscale ssh ${target.host}`;
-  const ro = values['read-only'] === true ? ' -r' : '';
-  const remoteTmux = `tmux attach${ro} -t ${tmuxName ?? '<tmux-session>'}`;
+  const command = `tailscale ssh ${target.host} orc attach ${resolved}`;
   if (json) {
-    printJson({ id, host: target.host, ssh, command: remoteTmux });
+    printJson({ id: resolved, host: target.host, command });
   } else {
-    process.stdout.write(
-      `# session ${id} lives on ${target.host}; reattach over tailscale:\n` +
-        `${ssh}\n# then on ${target.host}:\n${remoteTmux}\n`,
-    );
+    process.stdout.write(`# session ${resolved} lives on ${target.host}; follow it over tailscale:\n${command}\n`);
   }
   return 0;
 }
 
-
-/** Type guard: detach launch returns {runId,runnerTmux}; foreground returns WorkflowRun. */
+/** Type guard: detach launch returns {runId,logPath}; foreground returns WorkflowRun. */
 function isDetachedWorkflowLaunch(
-  res: WorkflowRun | { runId: string; runnerTmux: string },
-): res is { runId: string; runnerTmux: string } {
+  res: WorkflowRun | DetachedWorkflowLaunch,
+): res is DetachedWorkflowLaunch {
   return (
     typeof res === 'object' &&
     res !== null &&
@@ -1805,7 +2101,11 @@ async function remoteWorkflowLogs(client: DaemonClient, args: string[]): Promise
       } else {
         process.stdout.write(
           `${res.logs
-            .map((p) => `### step ${p.step} (${p.provider})\n${p.pane.trimEnd() || '(no pane — session gone)'}`)
+            .map((l) => {
+              const body =
+                'journal' in l ? renderJournal(l.journal) : (l as { pane?: string }).pane?.trimEnd() ?? '';
+              return `### step ${l.step} (${l.provider})\n${body || '(no journal — session gone)'}`;
+            })
             .join('\n\n')}\n`,
         );
       }
@@ -1842,28 +2142,24 @@ async function remoteWorkflowAttach(
     printError('workflow attach requires <runId>', json);
     return 1;
   }
-  let runnerTmux: string | undefined;
+  let hasRunner = false;
   try {
     const run = await client.getRun(runId);
-    runnerTmux = run.runnerTmux;
+    hasRunner = !!run.runner;
   } catch (e) {
     printError((e as Error).message, json);
     return 1;
   }
-  if (!runnerTmux) {
-    printError(`run '${runId}' has no runner session to attach (it was not run with --detach)`, json);
+  if (!hasRunner) {
+    printError(`run '${runId}' has no runner log (it was not run with --detach)`, json);
     return 1;
   }
-  const ssh = `tailscale ssh ${target.host}`;
-  const ro = values['read-only'] === true ? ' -r' : '';
-  const remoteTmux = `tmux attach${ro} -t ${runnerTmux}`;
+  // The runner log is host-local: follow it ON the host (`--read-only` is moot).
+  const command = `tailscale ssh ${target.host} orc workflow attach ${runId}`;
   if (json) {
-    printJson({ runId, host: target.host, ssh, command: remoteTmux });
+    printJson({ runId, host: target.host, command });
   } else {
-    process.stdout.write(
-      `# run ${runId} runs on ${target.host}; reattach over tailscale:\n` +
-        `${ssh}\n# then on ${target.host}:\n${remoteTmux}\n`,
-    );
+    process.stdout.write(`# run ${runId} runs on ${target.host}; follow its runner log over tailscale:\n${command}\n`);
   }
   return 0;
 }
@@ -1888,7 +2184,7 @@ async function remoteWorkflowResume(client: DaemonClient, args: string[]): Promi
       else process.stdout.write(`${renderRunDetail(res)}\n`);
       return res.status === 'done' ? 0 : 1;
     }
-    // Detached: { runId, runnerTmux }
+    // Detached: { runId, logPath, action }
     if (json) printJson(res);
     else process.stdout.write(`${res.runId}\n`);
     return 0;
@@ -2004,6 +2300,10 @@ export function resolveCommand(raw: string | undefined): string {
       return 'attach';
     case 'kill':
       return 'kill';
+    case 'resume':
+      return 'resume';
+    case 'takeover':
+      return 'takeover';
     case 'prune':
       return 'prune';
     case 'workflow':
@@ -2013,6 +2313,12 @@ export function resolveCommand(raw: string | undefined): string {
       return 'daemon';
     case 'remote':
       return 'remote';
+    case 'login':
+      return 'login';
+    case 'logout':
+      return 'logout';
+    case 'settings':
+      return 'settings';
     case 'help':
     case '--help':
     case '-h':
@@ -2023,21 +2329,85 @@ export function resolveCommand(raw: string | undefined): string {
   }
 }
 
+/**
+ * Commands that run against a daemon over `--host` — and therefore follow a DEFAULT host
+ * (ORC_HOST / settings.toml). Everything else is host-local and ignores default hosts.
+ */
+const REMOTE_CAPABLE: ReadonlySet<string> = new Set([
+  'list',
+  'spawn',
+  'send',
+  'read',
+  'wait',
+  'state',
+  'kill',
+  'attach',
+  'workflow',
+]);
+
 async function main(): Promise<number> {
-  // Peel a global `--host <h>` (it may precede the subcommand) BEFORE per-command parsing,
-  // which is strict on unknown options. When present, the command runs over HTTP.
-  const { host, rest: argv } = extractHostFlag(process.argv.slice(2));
+  // Hidden: the detached per-session actor (src/runtime/actor-main.ts). Not a user command.
+  if (process.argv[2] === '__actor') return (await import('../runtime/actor-main.ts')).runActorMain(process.argv.slice(3));
+  // Hidden: the codex harness child the codex runtime spawns (src/codex/harness.ts), and its
+  // offline `--self-test` (used to check a compiled binary).
+  if (process.argv[2] === '__codex-harness') {
+    return (await import('../codex/harness.ts')).runCodexHarnessMain(process.argv.slice(3));
+  }
+  // Peel the global `--host <h>` / `--local` (they may precede the subcommand) BEFORE
+  // per-command parsing, which is strict on unknown options.
+  const { host, local: localFlag, rest: argv } = extractHostFlag(process.argv.slice(2));
+  const local = localFlag === true;
   const sub = argv[0];
   const rest = argv.slice(1);
   const command = resolveCommand(sub);
 
-  if (host !== undefined) {
-    return cmdRemote(command, host, rest);
+  if (!REMOTE_CAPABLE.has(command)) {
+    // Host-local: default hosts never apply (nor error); an explicit --host keeps the
+    // "not supported over --host" error unless --local overrides it.
+    if (host !== undefined && !local) return cmdRemote(command, host, rest);
+    return runLocal(command, sub, rest, { local });
   }
 
+  // Remote-capable: settings give the default host and spawn/workflow defaults.
+  const json = rest.includes('--json');
+  let settings: Settings;
+  try {
+    settings = loadSettings();
+  } catch (e) {
+    printError((e as Error).message, json);
+    return 1;
+  }
+  for (const w of settings.warnings) process.stderr.write(`orc: warning: ${w}\n`);
+
+  // `list --all-hosts` is the fleet view from here: never redirected by a default host.
+  const allHosts = command === 'list' && host === undefined && rest.includes('--all-hosts');
+  const peerCheck = !local && host === undefined && !allHosts && settings.host?.source === 'local';
+  const decision: HostDecision = allHosts
+    ? { kind: 'local', why: 'none' }
+    : decideHost({ local, host, settings, peers: peerCheck ? await readPeers() : [] });
+  switch (decision.kind) {
+    case 'refused':
+      printError(decision.message, json);
+      return 1;
+    case 'remote':
+      // stderr even with --json: stdout stays machine-clean.
+      if (!decision.explicit) process.stderr.write(defaultHostNotice(decision.host, decision.from));
+      return cmdRemote(command, decision.host, rest, settings);
+    case 'local':
+      return runLocal(command, sub, rest, { local, settings });
+  }
+}
+
+/** Run a command on THIS host (`settings` is loaded for remote-capable commands). */
+async function runLocal(
+  command: string,
+  sub: string | undefined,
+  rest: string[],
+  ctx: { local: boolean; settings?: Settings },
+): Promise<number> {
   switch (command) {
     case 'spawn':
-      return cmdSpawn(rest);
+      return cmdSpawn(rest, ctx.settings);
     case 'send':
       return cmdSend(rest);
     case 'read':
@@ -2052,14 +2422,24 @@ async function main(): Promise<number> {
       return cmdAttach(rest);
     case 'kill':
       return cmdKill(rest);
+    case 'resume':
+      return cmdResume(rest);
+    case 'takeover':
+      return cmdTakeover(rest);
     case 'prune':
       return cmdPrune(rest);
     case 'workflow':
-      return cmdWorkflow(rest);
+      return cmdWorkflow(rest, ctx.settings);
     case 'daemon':
       return cmdDaemon(rest);
     case 'remote':
       return cmdRemoteAdmin(rest);
+    case 'login':
+      return cmdLogin(rest);
+    case 'logout':
+      return cmdLogout(rest);
+    case 'settings':
+      return cmdSettings(rest, { local: ctx.local });
     case 'help':
       process.stdout.write(HELP_TEXT);
       return 0;

@@ -1,5 +1,5 @@
 import { describe, test, expect, afterAll } from 'bun:test';
-import { PiAdapter } from '../src/providers/pi.ts';
+import { resolveTranscriptPath } from '../src/provider-cli.ts';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -22,7 +22,6 @@ function rec(over: Partial<SessionRecord>): SessionRecord {
     id: 'abcd1234',
     sessionId: 'abcd1234-0000-0000-0000-000000000000',
     provider: 'pi',
-    tmuxName: 'orc-pi-abcd1234',
     cwd: '/tmp/work',
     workspace: '/tmp/work',
     createdAt: new Date().toISOString(),
@@ -30,7 +29,7 @@ function rec(over: Partial<SessionRecord>): SessionRecord {
   };
 }
 
-describe('pi resolveTranscript', () => {
+describe('pi transcript resolution', () => {
   test('globs <dir>/*_<sid>.jsonl', async () => {
     const dir = await mkTmp();
     const sid = 'abcd1234-0000-0000-0000-000000000000';
@@ -39,21 +38,55 @@ describe('pi resolveTranscript', () => {
     // a decoy with a different sid
     await fs.writeFile(path.join(dir, '2026-06-09T11-00-00-000Z_other.jsonl'), 'x');
 
-    const a = new PiAdapter();
-    const resolved = await a.resolveTranscript(rec({ sessionDir: dir, sessionId: sid }));
+    const resolved = resolveTranscriptPath(rec({ sessionDir: dir, sessionId: sid }));
     expect(resolved).toBe(file);
   });
 
   test('returns null when no sessionDir', async () => {
-    const a = new PiAdapter();
-    const resolved = await a.resolveTranscript(rec({ sessionDir: undefined }));
+    const resolved = resolveTranscriptPath(rec({ sessionDir: undefined }));
     expect(resolved).toBeNull();
   });
 
   test('returns null when no match', async () => {
     const dir = await mkTmp();
-    const a = new PiAdapter();
-    const resolved = await a.resolveTranscript(rec({ sessionDir: dir }));
+    const resolved = resolveTranscriptPath(rec({ sessionDir: dir }));
     expect(resolved).toBeNull();
+  });
+});
+
+describe('codex transcript resolution (the harness session file only)', () => {
+  test('uses the harness session file the runtime recorded (spawn.json / record transcriptPath)', async () => {
+    const dir = await mkTmp();
+    const file = path.join(dir, 'codex-session.jsonl');
+    await fs.writeFile(file, '{"type":"session","version":3,"id":"x","timestamp":"t","cwd":"/w"}\n');
+    const r = rec({ provider: 'codex', cwd: dir, workspace: dir });
+    expect(
+      resolveTranscriptPath(r, {
+        version: 1,
+        sessionId: r.sessionId,
+        provider: 'codex',
+        cwd: dir,
+        env: {},
+        transcriptPath: file,
+        createdAt: new Date().toISOString(),
+      }),
+    ).toBe(file);
+    // A path persisted on the record (kill/takeover) wins too.
+    expect(resolveTranscriptPath({ ...r, transcriptPath: file })).toBe(file);
+  });
+
+  test('a legacy app-server rollout path is not a transcript (dropped support)', async () => {
+    const dir = await mkTmp();
+    const rollout = path.join(dir, 'rollout-2026-10-15T00-00-00-11111111-2222-3333-4444-555555555555.jsonl');
+    await fs.writeFile(rollout, '{"type":"session_meta"}\n');
+    expect(resolveTranscriptPath(rec({ provider: 'codex', transcriptPath: rollout }))).toBeNull();
+  });
+
+  test('no recorded path and no session file → null', () => {
+    expect(resolveTranscriptPath(rec({ provider: 'codex' }))).toBeNull();
+  });
+
+  test('a recorded path that no longer exists is ignored', () => {
+    expect(resolveTranscriptPath(rec({ provider: 'codex', transcriptPath: '/nonexistent/codex-session.jsonl' }))).toBeNull();
   });
 });
