@@ -9,8 +9,8 @@ import type { AgentState, SessionRecord, SessionStatus } from '../types.ts';
 import type { WorkflowEvent, WorkflowRun, StepResult } from '../workflow.ts';
 import { schedulingSummary } from '../workflow-scheduler.ts';
 import { aliasHandle } from '../registry.ts';
-import { PLAIN, TONE_STYLES, resolveStyle, sgr, toneOf } from '../style.ts';
-import type { Attr, Style } from '../style.ts';
+import { PLAIN, resolveStyle, sgr } from '../style.ts';
+import type { Style } from '../style.ts';
 import { TerminalSanitizer } from '../terminal-text.ts';
 
 export interface SessionView extends SessionRecord {
@@ -217,21 +217,13 @@ const RUN_CANCEL_RE = /^= cancel (\S+)( \(cascade\))?$/;
  */
 export function styleWorkflowLine(line: string, st: Style): string {
   if (!st.color) return line;
-  const p = (s: string, ...attrs: Attr[]) => sgr(s, attrs);
-  const toned = (word: string, s: string = word) => {
-    const t = toneOf(word);
-    return t ? sgr(s, TONE_STYLES[t].attrs) : s;
-  };
-  const glyphed = (word: string) => {
-    const t = toneOf(word);
-    return t ? sgr(`${TONE_STYLES[t].glyph} ${word}`, TONE_STYLES[t].attrs) : word;
-  };
+  const p = st.paint;
   let m: RegExpExecArray | null;
   if ((m = STEP_RESULT_RE.exec(line))) {
     const [, mark, id, provider, state, ahead, unverified, session, , wt] = m;
     return (
-      `  ${p(`${TONE_STYLES[mark === 'ok' ? 'success' : 'danger'].glyph} ${mark}`, mark === 'ok' ? 'green' : 'red')}` +
-      ` ${p(id!, 'bold')} ${p(`(${provider})`, 'dim')} ${p('state=', 'dim')}${toned(state!)}` +
+      `  ${st.status(mark!)}` +
+      ` ${p(id!, 'bold')} ${p(`(${provider})`, 'dim')} ${p('state=', 'dim')}${st.tone(state!)}` +
       ` ${p('commitsAhead=', 'dim')}${ahead}${unverified ? ` ${p('UNVERIFIED', 'bold', 'yellow')}` : ''}` +
       `  ${p(`session=${session}`, 'dim')}${wt !== undefined ? ` ${p(`worktree=${wt}`, 'dim')}` : ''}`
     );
@@ -247,14 +239,14 @@ export function styleWorkflowLine(line: string, st: Style): string {
     return `${p('>', 'bold', 'cyan')} ${p('run', 'bold')} ${p(m[1]!, 'bold')} '${m[2]}' ${p(`(${m[3]})`, 'dim')}`;
   }
   if ((m = RUN_RESUME_RE.exec(line))) {
-    return `${p('>', 'bold', 'cyan')} ${p('resume', 'bold')} ${p(m[1]!, 'bold')} ${p('(from ', 'dim')}${toned(m[2]!)}${p(')', 'dim')}`;
+    return `${p('>', 'bold', 'cyan')} ${p('resume', 'bold')} ${p(m[1]!, 'bold')} ${p('(from ', 'dim')}${st.tone(m[2]!)}${p(')', 'dim')}`;
   }
   if ((m = RUN_RETRY_RE.exec(line))) {
     return `${p('>', 'bold', 'cyan')} ${p('retry', 'bold')} ${p(m[1]!, 'bold')}${m[2] ? ` ${p('step', 'dim')} ${p(m[3]!, 'bold')}` : ''}`;
   }
-  if ((m = RUN_DONE_RE.exec(line))) return `${p('= run', 'bold')} ${p(m[1]!, 'bold')} ${glyphed(m[2]!)}`;
+  if ((m = RUN_DONE_RE.exec(line))) return `${p('= run', 'bold')} ${p(m[1]!, 'bold')} ${st.status(m[2]!)}`;
   if ((m = RUN_CANCEL_RE.exec(line))) {
-    return `${p('=', 'bold')} ${toned('cancelled', 'cancel')} ${p(m[1]!, 'bold')}${m[2] ? p(m[2], 'dim') : ''}`;
+    return `${p('=', 'bold')} ${st.tone('cancelled', 'cancel')} ${p(m[1]!, 'bold')}${m[2] ? p(m[2], 'dim') : ''}`;
   }
   if (line.startsWith('# ')) return p(line, 'dim');
   return line;

@@ -1583,7 +1583,7 @@ async function cmdRemoteAdmin(args: string[]): Promise<number> {
         process.stdout.write(
           peers.length > 0
             ? `${peers.map((p) => out().text(`${p.host}${p.port ? `:${p.port}` : ''}`)).join('\n')}\n`
-            : '(no peers)\n',
+            : `${out().muted('(no peers)')}\n`,
         );
       }
       return 0;

@@ -102,8 +102,6 @@ describe('PLAIN and Style roles', () => {
   const roles = [
     'text',
     'bold',
-    'dim',
-    'italic',
     'heading',
     'id',
     'alias',
@@ -195,6 +193,27 @@ describe('PLAIN and Style roles', () => {
     expect(createStyle({ color: false, sanitize: false })).toBe(PLAIN);
     expect(createStyle({ color: true }).color).toBe(true);
     expect(createStyle({ sanitize: true }).sanitize).toBe(true);
+  });
+});
+
+describe('SDK entry (src/index.ts)', () => {
+  test('exports the style API; the renderers it re-exports stay plain by default', async () => {
+    const sdk = await import('../src/index.ts');
+    expect(sdk.PLAIN).toBe(PLAIN);
+    expect(sdk.Style).toBe(Style);
+    expect(sdk.createStyle).toBe(createStyle);
+    const opts: import('../src/index.ts').StyleOptions = { color: true };
+    const attr: import('../src/index.ts').StyleAttr = 'bold';
+    const coloured = sdk.createStyle(opts);
+    expect(coloured).toBeInstanceOf(sdk.Style);
+    expect(coloured.paint('x', attr)).toBe('\x1b[1mx\x1b[22m');
+    const turns = [{ role: 'user' as const, text: 'hi' }];
+    expect(sdk.renderTurns(turns)).toBe('<user> hi');
+    expect(sdk.renderTurns(turns, sdk.PLAIN)).toBe('<user> hi');
+    expect(sdk.renderTurns(turns, coloured)).toBe('\x1b[1;36m<user>\x1b[22;39m hi');
+    expect(sdk.renderJournal(journal)).not.toContain('\x1b');
+    expect(sdk.renderJournal(journal, coloured)).toContain('\x1b[');
+    expect(sdk.renderCapture(journal)).not.toContain('\x1b');
   });
 });
 

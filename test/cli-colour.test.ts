@@ -267,6 +267,15 @@ describe('--json is never styled', () => {
     expect(human.out).toBe(`${ESC}[2m(no sessions)${ESC}[22m\n`);
   }, T);
 
+  test('empty states are dim when coloured, unchanged when not', async () => {
+    const empty = { ORC_HOME: path.join(root, 'empty-home') }; // independent of test order
+    expect((await orc(['remote', 'list'], { ...empty, FORCE_COLOR: '1' })).out).toBe(`${ESC}[2m(no peers)${ESC}[22m\n`);
+    expect((await orc(['remote', 'list'], empty)).out).toBe('(no peers)\n');
+    expect((await orc(['workflow', 'list'], { ...empty, FORCE_COLOR: '1' })).out).toBe(`${ESC}[2m(no runs)${ESC}[22m\n`);
+    expect((await orc(['workflow', 'list'], empty)).out).toBe('(no runs)\n');
+    expect((await orc(['list', '--all'], { ...empty, FORCE_COLOR: '1' })).out).toBe(`${ESC}[2m(no sessions)${ESC}[22m\n`);
+  }, T);
+
   test('the hidden codex harness is untouched: its stdout stays pure JSON', async () => {
     const r = await orc(['__codex-harness', '--self-test'], { FORCE_COLOR: '1', CLICOLOR_FORCE: '1' });
     expect(r.out).not.toContain(ESC);

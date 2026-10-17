@@ -57,6 +57,11 @@ export { nativeResumeCommand } from './provider-cli.ts';
 export type { JournalEntry, JournalEvent } from './runtime/types.ts';
 export { conversationTurns, parseTranscript, renderTurns, selectTurns } from './transcript.ts';
 export type { Turn, TurnRole, TurnSelection } from './transcript.ts';
+// Styling for the human renderers (renderTurns, renderJournal, renderJournalEntry and
+// Session.attach's `style`): they default to PLAIN (plain text, no ANSI); pass e.g.
+// createStyle({ color: true }) for colour, or { sanitize: true } for terminal-safe text.
+export { Style, PLAIN, createStyle } from './style.ts';
+export type { StyleOptions, Attr as StyleAttr } from './style.ts';
 export {
   defineWorkflow,
   runWorkflow,
