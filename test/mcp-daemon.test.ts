@@ -7,6 +7,7 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { serveDaemon } from '../src/daemon/server.ts';
@@ -114,6 +115,30 @@ describe('daemon /mcp: authentication and the Host/Origin guard', () => {
     expect((await post({ origin: 'http://evil.example' })).status).toBe(403);
     const same = await post({ authorization: 'Bearer root', origin: `http://localhost:${server.port}` });
     expect(same.status).toBe(200);
+  }, T);
+
+  test('a malformed Host is a JSON 400, never an exception page (on /mcp and on REST routes)', async () => {
+    /** One raw HTTP/1.1 request: fetch() refuses to send these Host values. */
+    const raw = (host: string, reqPath: string): Promise<string> =>
+      new Promise((resolve) => {
+        const sock = net.connect(server.port!, '127.0.0.1', () => {
+          sock.write(`POST ${reqPath} HTTP/1.1\r\nHost: ${host}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}`);
+        });
+        let buf = '';
+        sock.on('data', (d) => (buf += d.toString()));
+        sock.on('end', () => resolve(buf));
+        sock.on('error', (e) => resolve(`ERROR ${e.message}`));
+      });
+    for (const host of ['::1', 'localhost@evil.example', '127.0.0.1/mcp', '127.0.0.1 evil', 'ⓛocalhost']) {
+      for (const reqPath of ['/mcp', '/sessions']) {
+        const res = await raw(host, reqPath);
+        const [head, body] = res.split('\r\n\r\n');
+        expect([host, reqPath, head!.split('\r\n')[0]]).toEqual([host, reqPath, 'HTTP/1.1 400 Bad Request']);
+        expect(head!.toLowerCase()).toContain('content-type: application/json');
+        expect(JSON.parse(body!)).toEqual({ error: 'invalid request URL' });
+        expect(res).not.toContain('<html');
+      }
+    }
   }, T);
 
   test('an oversized body → 413', async () => {
