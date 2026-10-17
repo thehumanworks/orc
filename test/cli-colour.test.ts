@@ -14,7 +14,7 @@ import { HELP_TEXT, renderWorkflowEvent, runnerLogWriter } from '../src/cli/outp
 import { serveDaemon } from '../src/daemon/server.ts';
 import { readRegistry } from '../src/registry.ts';
 import { Style, stripAnsi } from '../src/style.ts';
-import { killSessionProcesses, mkTmp } from './runtime-helpers.ts';
+import { killSessionProcesses, mkTmp, TEARDOWN_TIMEOUT_MS } from './runtime-helpers.ts';
 import { workflowEvents } from './fixtures/render-fixtures.ts';
 
 const CLI = path.join(import.meta.dir, '..', 'src', 'cli', 'index.ts');
@@ -56,7 +56,7 @@ afterAll(async () => {
   if (prevHome === undefined) delete process.env.ORC_HOME;
   else process.env.ORC_HOME = prevHome;
   fs.rmSync(root, { recursive: true, force: true });
-});
+}, TEARDOWN_TIMEOUT_MS);
 
 /** process.env without ORC_* and without any colour variable, plus this suite's ORC_HOME. */
 function env(extra: Record<string, string> = {}): Record<string, string> {
