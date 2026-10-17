@@ -4,3 +4,6 @@ node_modules/
 .DS_Store
 dist/
 verify-results.json
+# nix build output links (root only: an unanchored result-* would match src/result-envelope.ts)
+/result
+/result-*

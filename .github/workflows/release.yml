@@ -1,0 +1,103 @@
+# Push a tag vX.Y.Z (= package.json version) to publish a GitHub release: verify the tag,
+# build + smoke-test the four binaries (build.yml), write SHA256SUMS, attest build provenance,
+# create the release with every asset attached. Re-run it for an existing tag whose run failed
+# before publishing: gh workflow run release.yml --ref vX.Y.Z
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per tag, never cancelled.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify:
+    name: verify tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require a v* tag
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          case "$REF" in
+            refs/tags/v*) ;;
+            *)
+              echo "::error title=not a tag::release runs on a v* tag, not $REF (dispatch it on the tag: gh workflow run release.yml --ref vX.Y.Z)"
+              exit 1
+              ;;
+          esac
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Tag matches package.json version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(jq -r .version package.json)"
+          if [ "${TAG#v}" != "$version" ]; then
+            echo "::error file=package.json,title=tag does not match package.json::tag $TAG but package.json version is $version (expected tag v$version)"
+            exit 1
+          fi
+          echo "tag $TAG matches package.json version $version"
+
+  build:
+    needs: verify
+    uses: ./.github/workflows/build.yml
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # create the release and upload its assets
+      id-token: write # Sigstore signing certificate for the attestation
+      attestations: write # store the attestation
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: orc-*
+          path: dist
+          merge-multiple: true
+
+      - name: Prepare assets
+        working-directory: dist
+        run: |
+          for f in orc-darwin-arm64 orc-darwin-x64 orc-linux-arm64 orc-linux-x64; do
+            [ -f "$f" ] || { echo "::error::missing release binary $f"; exit 1; }
+          done
+          chmod +x orc-* # artifact zips drop the executable bit
+          sha256sum orc-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/orc-*
+
+      # Every asset goes in the one create call (immutable releases lock assets at publish).
+      - name: Create GitHub release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -- --verify-tag --generate-notes --title "orc $TAG"
+          case "$TAG" in *-*) set -- "$@" --prerelease ;; esac # semver pre-release, e.g. v0.2.0-rc.1
+          gh release create "$TAG" orc-* SHA256SUMS --repo "$GITHUB_REPOSITORY" "$@"

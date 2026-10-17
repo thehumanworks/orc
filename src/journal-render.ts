@@ -1,9 +1,13 @@
 /**
  * Human renderings of a session journal (src/runtime/journal.ts): `orc attach`, the
  * `orc read` fallback (no provider transcript yet) and workflow `StepDoneCtx.capture`.
- * Pure: entries in, text out.
+ * Pure: entries in, text out. The optional Style (default PLAIN = plain text) colours the
+ * markers by meaning: `·` lifecycle dim, `>` prompt cyan, `!` failure red / interrupt
+ * yellow, `?` permission yellow, a completed turn green.
  */
 import type { JournalEntry } from './runtime/types.ts';
+import { resolveStyle } from './style.ts';
+import type { Style } from './style.ts';
 
 function indent(text: string, prefix: string): string {
   return text
@@ -14,43 +18,47 @@ function indent(text: string, prefix: string): string {
 }
 
 /** One journal entry as readable text, or null for bookkeeping entries. */
-export function renderJournalEntry(e: JournalEntry): string | null {
+export function renderJournalEntry(e: JournalEntry, style?: Style): string | null {
+  const st = resolveStyle(style);
   switch (e.type) {
     case 'actor.started':
-      return `· actor started (pid ${e.pid}, ${e.mode})`;
+      return st.muted(`· actor started (pid ${e.pid}, ${e.mode})`);
     case 'provider.ready':
-      return `· provider ready (session ${e.providerSessionId})`;
+      return st.muted(`· provider ready (session ${e.providerSessionId})`);
     case 'turn.intent':
-      return `> ${indent(e.text, '  ')}`;
+      return `${st.paint('>', 'bold', 'cyan')} ${indent(st.text(e.text), '  ')}`;
     case 'assistant.text':
-      return indent(e.text, '');
+      return indent(st.text(e.text), '');
     case 'turn.completed': {
       const cost = e.costUsd !== undefined ? ` $${e.costUsd.toFixed(4)}` : '';
-      return `· turn completed${cost}`;
+      return st.success(`· turn completed${cost}`);
     }
     case 'turn.failed':
-      return `! turn failed: ${e.error}`;
+      return `${st.paint('! turn failed:', 'red')} ${st.text(e.error)}`;
     case 'turn.interrupted':
-      return `! turn interrupted (${e.reason})`;
+      return st.warning(`! turn interrupted (${e.reason})`);
     case 'interrupt.requested':
-      return '· interrupt requested';
+      return st.muted('· interrupt requested');
     case 'permission.requested':
-      return '? permission requested (denied: orc runs providers without approvals)';
+      return `${st.warning('? permission requested')} ${st.muted('(denied: orc runs providers without approvals)')}`;
     case 'provider.exited':
-      return `· provider exited (code=${e.code} signal=${e.signal})`;
-    case 'actor.stopped':
-      return `· actor stopped (${e.reason}${e.error ? `: ${e.error}` : ''})`;
+      return st.muted(`· provider exited (code=${e.code} signal=${e.signal})`);
+    case 'actor.stopped': {
+      const text = `· actor stopped (${e.reason}${e.error ? `: ${e.error}` : ''})`;
+      return e.error ? st.danger(text) : st.muted(text);
+    }
     case 'actor.reopened':
-      return '· session reopened';
+      return st.muted('· session reopened');
     default:
       return null;
   }
 }
 
 /** Render a run of entries (bookkeeping skipped), one block per line. */
-export function renderJournal(entries: JournalEntry[]): string {
+export function renderJournal(entries: JournalEntry[], style?: Style): string {
+  const st = resolveStyle(style);
   return entries
-    .map(renderJournalEntry)
+    .map((e) => renderJournalEntry(e, st))
     .filter((l): l is string => l !== null)
     .join('\n');
 }

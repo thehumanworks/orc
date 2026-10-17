@@ -54,6 +54,12 @@ orc workflow run <file.ts> [--detach] [--max-concurrency N]; orc workflow logs <
 Prefer `--json` everywhere (you're a machine consumer). `orc spawn --json` returns the record so
 you can immediately `orc send` / `orc wait` by id.
 
+**Or drive orc as MCP tools.** `orc mcp` serves the same commands as MCP tools over stdio (`spawn`,
+`send`, `wait`, `read`, … `workflow_*`, plus a `guide` playbook), and `orc daemon` serves them at
+`/mcp`. Same semantics as the CLI (each tool runs `orc <cmd> --json`); `spawn` never blocks and
+`wait` is bounded (call it again while agents run). If your session has these tools, use them
+instead of shelling out.
+
 **Check where commands go: `orc settings`.** The user may have a default host (`ORC_HOST`, or
 `host` in `~/.orc/settings.toml` / the project's `.orc/settings.toml`) — then `spawn`, `list`,
 `wait`, … run on that host and each prints `orc: → <host> (from …)` on stderr. Pass `--local` to

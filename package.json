@@ -13,22 +13,25 @@
     ".": "./src/index.ts"
   },
   "engines": {
-    "bun": ">=1.3.0"
+    "bun": ">=1.3.3"
   },
   "scripts": {
     "test": "bun test",
     "typecheck": "bun x tsc --noEmit",
     "verify:live": "bun scripts/verify-runtime/all.ts",
-    "compile:cli": "bun build --compile ./src/cli/index.ts --outfile dist/orc",
+    "compile:cli": "bun build --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig ./src/cli/index.ts --outfile dist/orc",
     "install:cli": "bun run compile:cli && mv dist/orc ~/.local/bin/orc",
-    "check:compile": "bun build --compile ./src/cli/index.ts --outfile dist/orc && ./dist/orc __codex-harness --self-test"
+    "check:compile": "bun run compile:cli && ./dist/orc --version && ./dist/orc __codex-harness --self-test"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "2.3.1",
     "@types/bun": "latest",
     "typescript": "^5"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "1.2.0",
-    "@earendil-works/pi-ai": "1.2.0"
+    "@earendil-works/pi-ai": "1.2.0",
+    "@modelcontextprotocol/server": "2.3.1",
+    "zod": "4.6.5"
   }
 }

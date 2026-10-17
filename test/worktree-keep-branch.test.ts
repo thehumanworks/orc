@@ -6,6 +6,7 @@ import { createWorktree } from '../src/worktree.ts';
 import { upsertRecord, readRegistry } from '../src/registry.ts';
 import { pruneSessions } from '../src/index.ts';
 import type { SessionRecord } from '../src/types.ts';
+import { plainCliEnv } from './runtime-helpers.ts';
 
 /**
  * `orc kill --worktree` and `orc prune --worktree` remove the session's checkout but KEEP its
@@ -66,7 +67,7 @@ describe('worktree removal keeps the branch', () => {
     const head = (await branchHead(repo, rec.branch!)).trim();
     const p = Bun.spawn([process.execPath, CLI, 'kill', rec.id, '--worktree', '--json'], {
       cwd: repo,
-      env: { ...process.env, ORC_HOME: process.env.ORC_HOME },
+      env: plainCliEnv({ ...process.env, ORC_HOME: process.env.ORC_HOME }),
       stdout: 'pipe',
       stderr: 'pipe',
     });

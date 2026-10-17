@@ -1,0 +1,123 @@
+# Reusable: compile orc into single-file executables (`bun build --compile`), natively on
+# each platform, smoke-test every binary on the runner that built it, and upload it as the
+# artifact orc-<os>-<arch>. Called by ci.yml (pull requests, main) and release.yml (tags).
+name: build
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  binary:
+    name: orc-${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, arch: x64, runner: ubuntu-24.04 }
+          - { os: linux, arch: arm64, runner: ubuntu-24.04-arm }
+          - { os: darwin, arch: x64, runner: macos-15-intel }
+          - { os: darwin, arch: arm64, runner: macos-15 }
+    env:
+      TARGET: ${{ matrix.os }}-${{ matrix.arch }}
+      BIN: dist/orc-${{ matrix.os }}-${{ matrix.arch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: .bun-version
+
+      # setup-bun only warns about a missing or empty version file (then falls back to the
+      # engines.bun range): make the pin binding for release binaries.
+      - name: Check Bun pin
+        run: |
+          pin="$(tr -d '[:space:]' < .bun-version)"
+          pin="${pin#v}"
+          [ "$(bun --version)" = "$pin" ] || { echo "::error::bun $(bun --version) is not the .bun-version pin ($pin)"; exit 1; }
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      # Native build (no --target) with the same script as local builds (package.json
+      # compile:cli), so release binaries cannot drift from dev builds.
+      - name: Compile
+        run: |
+          bun run compile:cli
+          mv dist/orc "$BIN"
+          ls -l "$BIN"
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          fail() { echo "::error title=smoke test ($TARGET)::$*"; exit 1; }
+          bin="$GITHUB_WORKSPACE/$BIN"
+          want="$(jq -r .version package.json)"
+
+          # A native executable for this target.
+          desc="$(file -b "$bin")"
+          echo "file: $desc"
+          case "$TARGET" in
+            linux-x64) pattern='^ELF 64-bit LSB .*x86-64' ;;
+            linux-arm64) pattern='^ELF 64-bit LSB .*aarch64' ;;
+            darwin-x64) pattern='^Mach-O 64-bit .*x86_64' ;;
+            darwin-arm64) pattern='^Mach-O 64-bit .*arm64' ;;
+            *) fail "unknown target $TARGET" ;;
+          esac
+          [[ $desc =~ $pattern ]] || fail "$BIN is not a $TARGET executable: $desc"
+
+          # Everything below runs in an empty directory outside the checkout.
+          work="$RUNNER_TEMP/smoke-$TARGET"
+          mkdir -p "$work/orc-home"
+          cd "$work"
+          export ORC_HOME="$work/orc-home"
+
+          # --version: the package.json version, embedded at compile time.
+          got="$("$bin" --version)" || fail "--version exited non-zero"
+          echo "--version: $got"
+          [ "$got" = "orc $want" ] || fail "--version printed '$got', want 'orc $want'"
+          "$bin" --version --json > version.json || fail "--version --json exited non-zero"
+          jq -e --arg v "$want" '.version == $v' version.json > /dev/null || fail "--version --json printed $(cat version.json)"
+
+          # --help: exit 0 with the usage text.
+          "$bin" --help > help.txt || fail "--help exited non-zero"
+          grep -q '^Usage:' help.txt || fail "--help printed no usage"
+
+          # The embedded codex harness passes its offline self-test (no network, no provider CLI).
+          "$bin" __codex-harness --self-test > self-test.json || { cat self-test.json; fail "codex harness self-test exited non-zero"; }
+          jq -r '.checks[] | "  \(.check): \(if .ok then "ok" else "FAILED" end)"' self-test.json ||
+            { cat self-test.json; fail "codex harness self-test printed unexpected JSON"; }
+          jq -e '.ok == true and (.checks | length) > 0 and all(.checks[]; .ok == true)' self-test.json > /dev/null ||
+            { cat self-test.json; fail "codex harness self-test failed"; }
+
+          # No cwd autoload: a broken bunfig.toml would abort startup, a .env would set ORC_HOST.
+          mkdir autoload
+          cd autoload
+          printf 'ORC_HOST=from-dotenv\n' > .env
+          printf '[[[ not toml\n' > bunfig.toml
+          env -u ORC_HOST "$bin" settings --json > settings.json || fail "a bunfig.toml in the cwd broke startup (autoload on?)"
+          jq -e '.host.source == "default"' settings.json > /dev/null ||
+            { cat settings.json; fail "a .env in the cwd was loaded (host is not the default)"; }
+
+          echo "smoke test passed: $TARGET, orc $want"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: orc-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ env.BIN }}
+          if-no-files-found: error
+          overwrite: true # a re-run replaces the earlier attempt's artifact (same commit)
+          retention-days: 14

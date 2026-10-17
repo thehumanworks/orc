@@ -4,6 +4,7 @@
  * session journal/raw run logs/kill, over a live loopback socket and the fake provider.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { TEARDOWN_TIMEOUT_MS } from './runtime-helpers.ts';
 import fs from 'node:fs';
 import path from 'node:path';
 import { httpStatusFor, serveDaemon } from '../src/daemon/server.ts';
@@ -14,7 +15,7 @@ import { remoteSendExitCode } from '../src/cli/index.ts';
 import { DaemonClient } from '../src/daemon/client.ts';
 import { FAKE_PROVIDER_ENV } from '../src/agent.ts';
 import { writeRun, WORKFLOW_SCHEMA_VERSION } from '../src/runs.ts';
-import { killSessionProcesses, mkTmp } from './runtime-helpers.ts';
+import { killSessionProcesses, mkTmp, plainCliEnv } from './runtime-helpers.ts';
 
 const CLI = path.join(import.meta.dir, '..', 'src', 'cli', 'index.ts');
 const T = 45_000;
@@ -52,7 +53,7 @@ afterAll(async () => {
   if (prevFake === undefined) delete process.env[FAKE_PROVIDER_ENV];
   else process.env[FAKE_PROVIDER_ENV] = prevFake;
   fs.rmSync(root, { recursive: true, force: true });
-});
+}, TEARDOWN_TIMEOUT_MS);
 
 async function call(method: string, p: string, body?: unknown): Promise<{ status: number; json: any }> {
   const res = await fetch(`${base}${p}`, {
@@ -66,7 +67,7 @@ async function call(method: string, p: string, body?: unknown): Promise<{ status
 async function orcRemote(args: string[], port = server.port): Promise<{ code: number; out: string; err: string }> {
   const proc = Bun.spawn([process.execPath, CLI, '--host', `127.0.0.1:${port}`, ...args], {
     cwd: work,
-    env: { ...process.env, ORC_DAEMON_SECRET: 's3cret' },
+    env: plainCliEnv({ ...process.env, ORC_DAEMON_SECRET: 's3cret' }),
     stdout: 'pipe',
     stderr: 'pipe',
   });

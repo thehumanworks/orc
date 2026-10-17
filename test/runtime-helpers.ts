@@ -9,8 +9,31 @@ import type { JournalEntry, SpawnSpec } from '../src/runtime/types.ts';
 import type { FakeScript } from '../src/runtime/providers/fake.ts';
 import { readJournal } from '../src/runtime/journal.ts';
 import { readActorState } from '../src/runtime/actor-state.ts';
+import { processStartTime } from '../src/runtime/process.ts';
 
 export const LAUNCHER = path.join(import.meta.dir, 'fixtures', 'runtime-launcher.ts');
+
+/**
+ * The env for a spawned `orc` CLI whose output a test matches exactly: colour can never
+ * apply (NO_COLOR=1, FORCE_COLOR / CLICOLOR_FORCE removed), whatever the developer's shell
+ * exports. A backstop only: piped stdio already means no colour.
+ */
+export function plainCliEnv<T extends Record<string, string | undefined>>(env: T): T {
+  const { FORCE_COLOR: _force, CLICOLOR_FORCE: _cliForce, ...rest } = env;
+  return { ...rest, NO_COLOR: '1' } as unknown as T;
+}
+
+/**
+ * A start-time token that does NOT match this live process, from the SAME source as its
+ * real one (`proc:` with procfs, `ps:` elsewhere, e.g. macOS). isSameProcessAlive treats
+ * tokens from different sources as not comparable and falls back to pid liveness, so a
+ * pid-reuse test must mismatch within the source this host produces.
+ */
+export function mismatchedStartTime(): string {
+  const own = processStartTime(process.pid);
+  if (own === null) throw new Error(`cannot read this process's start time (pid ${process.pid})`);
+  return own.startsWith('proc:') ? 'proc:1' : 'ps:Thu Jan  1 00:00:00 1970';
+}
 
 export function mkTmp(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -78,13 +101,11 @@ interface ProcRow {
   cmd: string;
 }
 
-/**
- * Live (non-zombie) processes whose command line contains `needle`. A child that was
- * forked but has not exec'd yet still shows its parent's command line, so matches whose
- * parent also matches are dropped.
- */
-export function liveProcs(needle: string): ProcRow[] {
-  const rows: Array<ProcRow & { ppid: number }> = [];
+type ProcTable = Array<ProcRow & { ppid: number }>;
+
+/** One snapshot of the live (non-zombie) processes: a /proc scan on Linux, one `ps` elsewhere. */
+function processTable(): ProcTable {
+  const rows: ProcTable = [];
   if (fs.existsSync('/proc/self/stat')) {
     for (const name of fs.readdirSync('/proc')) {
       if (!/^\d+$/.test(name)) continue;
@@ -93,7 +114,7 @@ export function liveProcs(needle: string): ProcRow[] {
         const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
         if (fields[0] === 'Z' || fields[0] === 'X') continue;
         const cmd = fs.readFileSync(`/proc/${name}/cmdline`, 'utf8').split('\0').join(' ').trim();
-        if (cmd.includes(needle)) rows.push({ pid: Number(name), ppid: Number(fields[1]), cmd });
+        rows.push({ pid: Number(name), ppid: Number(fields[1]), cmd });
       } catch {
         /* raced with exit */
       }
@@ -103,38 +124,57 @@ export function liveProcs(needle: string): ProcRow[] {
     for (const line of r.stdout.toString().split('\n')) {
       const m = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line);
       if (!m || m[3]!.startsWith('Z')) continue;
-      if (m[4]!.includes(needle)) rows.push({ pid: Number(m[1]), ppid: Number(m[2]), cmd: m[4]! });
+      rows.push({ pid: Number(m[1]), ppid: Number(m[2]), cmd: m[4]! });
     }
   }
+  return rows;
+}
+
+/**
+ * Live (non-zombie) processes whose command line contains `needle`, from `table` (default: a
+ * fresh snapshot). A child that was forked but has not exec'd yet still shows its parent's
+ * command line, so matches whose parent also matches are dropped.
+ */
+export function liveProcs(needle: string, table: ProcTable = processTable()): ProcRow[] {
+  const rows = table.filter((r) => r.cmd.includes(needle));
   const pids = new Set(rows.map((r) => r.pid));
   return rows.filter((r) => !pids.has(r.ppid)).map(({ pid, cmd }) => ({ pid, cmd }));
 }
 
-export const fakeProviderPids = (sid: string) =>
-  liveProcs(`fake-child.ts --orc-session ${sid}`).map((r) => r.pid);
-export const actorPids = (sid: string) => liveProcs(`__actor ${sid}`).map((r) => r.pid);
+const providerNeedle = (sid: string) => `fake-child.ts --orc-session ${sid}`;
+const actorNeedle = (sid: string) => `__actor ${sid}`;
+export const fakeProviderPids = (sid: string) => liveProcs(providerNeedle(sid)).map((r) => r.pid);
+export const actorPids = (sid: string) => liveProcs(actorNeedle(sid)).map((r) => r.pid);
+
+/**
+ * Timeout for a hook that calls killSessionProcesses: `afterAll(fn, TEARDOWN_TIMEOUT_MS)`.
+ * bun:test's default hook timeout (5 s) equals the helper's own wait for the processes to
+ * exit, so a slow teardown (many sessions, `ps` probes on macOS) would time the hook out.
+ */
+export const TEARDOWN_TIMEOUT_MS = 30_000;
 
 /** SIGKILL every actor/provider process (and its group) belonging to these sessions. */
 export async function killSessionProcesses(sids: string[]): Promise<void> {
-  for (const sid of sids) {
-    for (const pid of [...actorPids(sid), ...fakeProviderPids(sid)]) {
-      try {
-        process.kill(-pid, 'SIGKILL');
-      } catch {
-        /* not a group leader / gone */
-      }
-      try {
-        process.kill(pid, 'SIGKILL');
-      } catch {
-        /* gone */
-      }
+  // One process-table snapshot per pass, not two per session (each one is a `ps` on macOS).
+  const sessionPids = (): number[] => {
+    const table = processTable();
+    return sids.flatMap((sid) =>
+      [...liveProcs(actorNeedle(sid), table), ...liveProcs(providerNeedle(sid), table)].map((r) => r.pid),
+    );
+  };
+  for (const pid of sessionPids()) {
+    try {
+      process.kill(-pid, 'SIGKILL');
+    } catch {
+      /* not a group leader / gone */
+    }
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      /* gone */
     }
   }
-  await waitFor(
-    () => sids.every((s) => actorPids(s).length === 0 && fakeProviderPids(s).length === 0),
-    'session processes to exit',
-    5_000,
-  ).catch(() => undefined);
+  await waitFor(() => sessionPids().length === 0, 'session processes to exit', 5_000).catch(() => undefined);
 }
 
 /** Run the launcher fixture to completion: returns parsed stdout JSON. */

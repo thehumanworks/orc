@@ -8,6 +8,9 @@
  * by `resolveBind` (never `0.0.0.0` by default). The handler is factored out of
  * `Bun.serve` (`createFetch`) so it can be exercised over a live loopback socket in
  * tests with an injectable whois.
+ *
+ * `/mcp` serves the orc MCP tools (src/mcp/http.ts) behind the same authentication, a
+ * Host/Origin guard, and per-tool scopes (each tool needs the scope of its REST route).
  */
 import path from 'node:path';
 import os from 'node:os';
@@ -33,6 +36,7 @@ import type { RunnerSpawner } from '../workflow-runner.ts';
 import { selectTurns } from '../transcript.ts';
 import type { TurnSelection } from '../transcript.ts';
 import type { JournalEntry } from '../runtime/types.ts';
+import { VERSION } from '../version.ts';
 import { DAEMON_API_VERSION } from './client.ts';
 
 /** Journal entries per step returned by raw run logs. */
@@ -51,6 +55,9 @@ import { whoisIdentity } from './tailscale.ts';
 import { peerHosts } from './peers.ts';
 import { matchRoute, mapSpawnRequest, mapWaitRequest, mapSendRequest } from './routes.ts';
 import type { RouteName } from './routes.ts';
+// The MCP endpoint itself (src/mcp/http.ts) is imported lazily: only hosts.ts (no SDK) here.
+import { MCP_PATH, mcpAllowedHosts } from '../mcp/hosts.ts';
+import type { DaemonMcp } from '../mcp/http.ts';
 
 /**
  * Daemon list/get projection: expose concurrency + scheduling state without
@@ -109,17 +116,6 @@ function publicWorkflowRunView(run: WorkflowRun): Record<string, unknown> {
   };
 }
 
-/** orc version, for `/health`. Read from package.json (best-effort; informational). */
-async function readVersion(): Promise<string> {
-  try {
-    const pkgPath = path.resolve(import.meta.dir, '../../package.json');
-    const pkg = (await Bun.file(pkgPath).json()) as { version?: string };
-    return pkg.version ?? '0.0.0';
-  } catch {
-    return '0.0.0';
-  }
-}
-
 export interface DaemonOptions {
   /** Resolved bind address (from `resolveBind`). */
   hostname: string;
@@ -143,7 +139,7 @@ export interface DaemonOptions {
   allowlist?: string[];
   /** This host's identity for `/health` + `/whoami` (defaults to os.hostname()). */
   hostName?: string;
-  /** orc version string for `/health` (defaults to package.json). */
+  /** orc version string for `/health` (defaults to VERSION: package.json, embedded at build). */
   version?: string;
   /** Resolve a request's source IP. Default uses `server.requestIP`. Injectable for tests. */
   resolveIp?: (req: Request, server: Bun.Server<undefined>) => string | null;
@@ -151,6 +147,24 @@ export interface DaemonOptions {
   whois?: (ip: string | null) => Promise<Identity | null>;
   /** Spawner for detached workflow runners. Default `spawnDetached`. Injectable for tests. */
   spawnRunner?: RunnerSpawner;
+  /** The MCP endpoint (`/mcp`). */
+  mcp?: DaemonMcpConfig;
+}
+
+/** Options of the daemon's `/mcp` endpoint. */
+export interface DaemonMcpConfig {
+  /**
+   * Host names (no port) `/mcp` accepts in `Host` (and `Origin`): the DNS-rebinding guard.
+   * Default: derived from `hostname` alone (`mcpAllowedHosts`); `orc daemon` adds this
+   * node's tailnet names and `--mcp-allow-host` entries.
+   */
+  allowedHosts?: readonly string[];
+  /** `wait`'s default timeout in seconds (default 45). */
+  waitTimeoutSec?: number;
+  /** argv prefix of the orc CLI the tools run (default: this build). Tests. */
+  cliArgv?: readonly string[];
+  /** Base env of the tools' CLI children (default: the daemon's, minus daemon credentials). */
+  env?: Record<string, string | undefined>;
 }
 
 /** A handler error carrying an HTTP status; the outer catch maps it to a JSON response. */
@@ -219,24 +233,13 @@ export function createFetch(opts: DaemonOptions): (req: Request, server: Bun.Ser
   const hostName = opts.hostName ?? os.hostname();
   const configuredSecret = opts.secret && opts.secret.length > 0 ? opts.secret : null;
   const tokens: ReadonlyMap<string, readonly Scope[]> = opts.tokens ?? new Map();
-  const versionPromise = opts.version ? Promise.resolve(opts.version) : readVersion();
+  const version = opts.version || VERSION;
 
   const getAllowlist = async (): Promise<string[]> =>
     opts.allowlist !== undefined ? opts.allowlist : await peerHosts();
 
-  return async function fetch(req: Request, server: Bun.Server<undefined>): Promise<Response> {
-    const url = new URL(req.url);
-    const match = matchRoute(req.method, url.pathname);
-    if (!match) return jsonError(404, `no route for ${req.method} ${url.pathname}`);
-
-    const authReq = routeAuth(match.name);
-
-    // /health is the ONLY unauthenticated route (liveness).
-    if (authReq.type === 'public' || match.name === 'health') {
-      return json({ ok: true, version: await versionPromise, host: hostName, api: DAEMON_API_VERSION });
-    }
-
-    // ---- Authn + authz (fail closed) — every other route. ----
+  /** Authenticate a request (fail closed): tailnet identity, bearer token, legacy secret. */
+  const authRequest = async (req: Request, server: Bun.Server<undefined>) => {
     const ip = resolveIp(req, server);
     const identity = await whois(ip).catch(() => null);
     const presentedSecret = req.headers.get('x-orc-secret');
@@ -250,6 +253,67 @@ export function createFetch(opts: DaemonOptions): (req: Request, server: Bun.Ser
       presentedBearer,
       tokens,
     });
+    return { authn, identity, allowlist };
+  };
+
+  // The MCP endpoint, created on its first request (the MCP SDK loads only then).
+  const mcpHosts = opts.mcp?.allowedHosts ?? mcpAllowedHosts({ bind: opts.hostname });
+  let mcp: Promise<DaemonMcp> | undefined;
+  const loadMcp = (): Promise<DaemonMcp> =>
+    (mcp ??= import('../mcp/http.ts')
+      .then((m) =>
+        m.createDaemonMcp({
+          allowedHosts: mcpHosts,
+          waitTimeoutSec: opts.mcp?.waitTimeoutSec,
+          cliArgv: opts.mcp?.cliArgv,
+          env: opts.mcp?.env,
+        }),
+      )
+      .catch((e: unknown) => {
+        mcp = undefined;
+        throw e;
+      }));
+
+  /**
+   * `/mcp`: the Host/Origin guard first (403: a DNS-rebound browser may carry an allowlisted
+   * peer's tailnet identity), then the same authentication as every REST route (401), then
+   * the MCP handler, which authorizes each tool by the principal's scopes.
+   */
+  const serveMcp = async (req: Request, server: Bun.Server<undefined>): Promise<Response> => {
+    try {
+      const endpoint = await loadMcp();
+      const rejected = endpoint.guard(req);
+      if (rejected) return rejected;
+      const { authn } = await authRequest(req, server);
+      if (!authn.ok) return jsonError(authn.status, authn.message);
+      return await endpoint.serve(req, authn.principal);
+    } catch (e) {
+      return jsonError(500, (e as Error).message);
+    }
+  };
+
+  return async function fetch(req: Request, server: Bun.Server<undefined>): Promise<Response> {
+    // A malformed Host (`::1`, `a@b`, `h/x`, spaces, non-ASCII…) leaves Bun a request URL
+    // that does not parse: a 400, not an exception.
+    let url: URL;
+    try {
+      url = new URL(req.url);
+    } catch {
+      return jsonError(400, 'invalid request URL');
+    }
+    if (url.pathname === MCP_PATH) return serveMcp(req, server);
+    const match = matchRoute(req.method, url.pathname);
+    if (!match) return jsonError(404, `no route for ${req.method} ${url.pathname}`);
+
+    const authReq = routeAuth(match.name);
+
+    // /health is the ONLY unauthenticated route (liveness).
+    if (authReq.type === 'public' || match.name === 'health') {
+      return json({ ok: true, version, host: hostName, api: DAEMON_API_VERSION, mcp: MCP_PATH });
+    }
+
+    // ---- Authn + authz (fail closed) — every other route. ----
+    const { authn, identity, allowlist } = await authRequest(req, server);
     if (!authn.ok) {
       return jsonError(authn.status, authn.message);
     }
@@ -264,7 +328,7 @@ export function createFetch(opts: DaemonOptions): (req: Request, server: Bun.Ser
         identity,
         allowlist,
         principal: authn.principal,
-        versionPromise,
+        version,
         spawnRunner: opts.spawnRunner,
       });
     } catch (e) {
@@ -306,7 +370,7 @@ interface DispatchCtx {
   identity: Identity | null;
   allowlist: string[];
   principal: Principal;
-  versionPromise: Promise<string>;
+  version: string;
   spawnRunner?: RunnerSpawner;
 }
 
@@ -320,7 +384,7 @@ async function dispatch(
 ): Promise<Response> {
   switch (name) {
     case 'health':
-      return json({ ok: true, version: await ctx.versionPromise, host: ctx.hostName, api: DAEMON_API_VERSION });
+      return json({ ok: true, version: ctx.version, host: ctx.hostName, api: DAEMON_API_VERSION, mcp: MCP_PATH });
 
     case 'whoami':
       return json({
@@ -755,15 +819,20 @@ async function detachWorkflowControl(
 }
 
 /**
- * Start the daemon with `Bun.serve`. CRITICAL: `idleTimeout: 0` — a long-poll `wait` or a
- * foreground `workflow run` holds the connection open with no bytes crossing the socket
- * for minutes; Bun's default ~10s idle timeout would reset the connection mid-wait.
+ * Start the daemon with `Bun.serve`. CRITICAL: `idleTimeout: 0` — a long-poll `wait` (REST,
+ * or the MCP `wait` tool on `/mcp`) or a foreground `workflow run` holds the connection open
+ * with no bytes crossing the socket for minutes; Bun's default ~10s idle timeout would
+ * reset the connection mid-wait.
  */
 export function serveDaemon(opts: DaemonOptions): Bun.Server<undefined> {
   return Bun.serve({
     hostname: opts.hostname,
     port: opts.port,
     idleTimeout: 0,
+    // Never Bun's development error page (it shows source and paths): an error that escapes
+    // the handler is a plain JSON 500.
+    development: false,
+    error: () => jsonError(500, 'internal error'),
     fetch: createFetch(opts),
   });
 }

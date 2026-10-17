@@ -4,6 +4,7 @@
  * provider; plus a detached run followed with `orc workflow attach` from the CLI.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { TEARDOWN_TIMEOUT_MS } from './runtime-helpers.ts';
 import fs from 'node:fs';
 import path from 'node:path';
 import { FAKE_PROVIDER_ENV } from '../src/agent.ts';
@@ -11,7 +12,7 @@ import { runWorkflow } from '../src/workflow.ts';
 import type { StepDoneCtx, WorkflowDef, WorkflowEvent } from '../src/workflow.ts';
 import { readRegistry } from '../src/registry.ts';
 import { readRun } from '../src/runs.ts';
-import { killSessionProcesses, mkTmp } from './runtime-helpers.ts';
+import { killSessionProcesses, mkTmp, plainCliEnv } from './runtime-helpers.ts';
 
 const CLI = path.join(import.meta.dir, '..', 'src', 'cli', 'index.ts');
 const T = 60_000;
@@ -35,7 +36,7 @@ afterAll(async () => {
   if (prevFake === undefined) delete process.env[FAKE_PROVIDER_ENV];
   else process.env[FAKE_PROVIDER_ENV] = prevFake;
   fs.rmSync(root, { recursive: true, force: true });
-});
+}, TEARDOWN_TIMEOUT_MS);
 
 /** attempt-transition phases per step, in emission order. */
 function phasesByStep(events: WorkflowEvent[]): Record<string, string[]> {
@@ -164,7 +165,7 @@ describe('detached workflow from the CLI', () => {
   ],
 };\n`,
       );
-      const env = { ...process.env, ORC_HOME: home };
+      const env = plainCliEnv({ ...process.env, ORC_HOME: home });
       const launch = Bun.spawn([process.execPath, CLI, 'workflow', 'run', file, '--detach', '--json'], {
         cwd: work,
         env,

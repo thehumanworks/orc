@@ -6,6 +6,7 @@
  * spawn and workflow steps pick provider/model defaults; a detached runner stays local.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { TEARDOWN_TIMEOUT_MS } from './runtime-helpers.ts';
 import fs from 'node:fs';
 import path from 'node:path';
 import { serveDaemon } from '../src/daemon/server.ts';
@@ -13,7 +14,7 @@ import { FAKE_PROVIDER_ENV } from '../src/agent.ts';
 import { readRegistry } from '../src/registry.ts';
 import { readRun } from '../src/runs.ts';
 import { WORKFLOW_ROOTS_ENV } from '../src/workflow.ts';
-import { killSessionProcesses, mkTmp } from './runtime-helpers.ts';
+import { killSessionProcesses, mkTmp, plainCliEnv } from './runtime-helpers.ts';
 
 const CLI = path.join(import.meta.dir, '..', 'src', 'cli', 'index.ts');
 const T = 60_000;
@@ -59,7 +60,7 @@ afterAll(async () => {
   if (prevRoots === undefined) delete process.env[WORKFLOW_ROOTS_ENV];
   else process.env[WORKFLOW_ROOTS_ENV] = prevRoots;
   fs.rmSync(root, { recursive: true, force: true });
-});
+}, TEARDOWN_TIMEOUT_MS);
 
 let n = 0;
 /** A client: its own ORC_HOME and cwd (outside any git repo). */
@@ -86,7 +87,7 @@ async function orc(
 ): Promise<{ code: number; out: string; err: string }> {
   const proc = Bun.spawn([process.execPath, CLI, ...args], {
     cwd: c.cwd,
-    env: { ...cleanEnv(), ORC_HOME: c.home, ORC_DAEMON_SECRET: 's3cret', [FAKE_PROVIDER_ENV]: '1', ...extraEnv },
+    env: plainCliEnv({ ...cleanEnv(), ORC_HOME: c.home, ORC_DAEMON_SECRET: 's3cret', [FAKE_PROVIDER_ENV]: '1', ...extraEnv }),
     stdin: 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',

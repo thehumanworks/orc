@@ -14,10 +14,11 @@ historical (tmux-era) research log.
 
 ## Stack
 
-- Bun (TypeScript, ESM), `engines.bun >= 1.3`. Ships from source or as one binary
-  (`bun build --compile`). The kernel uses `Bun.spawn` pipes, `node:fs`, `util.parseArgs`. The only
-  runtime dependencies, for the codex harness, are `@earendil-works/pi-ai` and
-  `@earendil-works/pi-agent-core`, pinned to exactly 1.2.0.
+- Bun (TypeScript, ESM), `engines.bun >= 1.3.3`. Ships from source or as one binary
+  (`bun build --compile`). The kernel uses `Bun.spawn` pipes, `node:fs`, `util.parseArgs`. Runtime
+  dependencies, all pinned exactly: `@earendil-works/pi-ai` and `@earendil-works/pi-agent-core`
+  1.2.0 for the codex harness, and `@modelcontextprotocol/server` 2.3.1 + `zod` 4 for `orc mcp` /
+  the daemon's `/mcp` (loaded lazily, so other commands and actors never import them).
 - The only external executables are the claude and pi CLIs (plus `git` for worktrees and
   `tailscale` for the daemon). codex needs none: the harness is this binary re-executed.
 - macOS and Linux. Process identity is pid + start time (Linux `/proc/<pid>/stat`, macOS
@@ -183,6 +184,17 @@ claude strips inherited `CLAUDE_CODE_*` variables except auth/backend settings
   `ORC_MESSAGE_CONFLICT` / `ORC_SESSION_LEGACY` / run state, 502 `ORC_SESSION_START_FAILED`,
   else 500. The `--host` client still reads v1 (`pane`, `submitted`) answers. Details:
   `DESIGN-daemon.md`.
+- **MCP** (`src/mcp/`): `orc mcp` (stdio) and the daemon's `/mcp` (Streamable HTTP, stateless)
+  serve orc's agent-facing commands as MCP tools. Each tool call re-runs this binary as
+  `orc … --json` (argv only, never a shell; at most 32 at once), so the CLI's `--json` output is the
+  tool contract. On the daemon every call runs `--local`, tools are filtered by the caller's
+  scopes, `Host`/`Origin` must name the daemon, and daemon credentials never reach the children.
+  The lead-agent instructions and the `guide` playbook live in `src/mcp/instructions.ts` and
+  `src/mcp/guide.ts`.
+- **Human output** (`src/style.ts`, `src/terminal-text.ts`): renderers are pure string builders
+  that take an optional style (plain by default, so SDK and MCP text never carry ANSI). The CLI
+  colours a stream only when it is a TTY (`--color`, `NO_COLOR`, `FORCE_COLOR` override), never
+  with `--json`, and strips terminal control sequences from agent text written to a TTY.
 
 ## Workflows
 

@@ -19,7 +19,7 @@ Design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (the current system) and
 
 | need | version / notes |
 | --- | --- |
-| [Bun](https://bun.sh) | ≥ 1.3 (`engines.bun`); developed on 1.4.2 |
+| [Bun](https://bun.sh) | ≥ 1.3.3 (`engines.bun`); developed on 1.4.2 |
 | OS | macOS or Linux (POSIX process groups; macOS also needs `ps`). No Windows. |
 | at least one provider | see below; other CLI versions are not refused |
 | `claude` CLI | for `--provider claude`: on `PATH` (or `ORC_CLAUDE_BIN`), signed in. Verified: 2.1.300 |
@@ -32,12 +32,38 @@ tmux is **not** used.
 
 ## Install
 
+**Prebuilt binary** (no Bun needed; from the first tagged release on): each
+[GitHub release](https://github.com/thehumanworks/orc/releases) attaches single-file executables built with `bun build --compile` (`orc-darwin-arm64`,
+`orc-darwin-x64`, `orc-linux-x64`, `orc-linux-arm64`; the Linux ones need glibc), a `SHA256SUMS`
+file and a build-provenance attestation. The x64 binaries embed Bun's default (non-baseline) x64
+runtime, so they need a CPU with AVX2 (Intel Haswell / AMD Excavator or newer).
+
+```sh
+TAG=v0.1.0 ASSET=orc-darwin-arm64          # orc-<darwin|linux>-<arm64|x64>
+gh release download "$TAG" --repo thehumanworks/orc --pattern "$ASSET" --pattern SHA256SUMS
+grep " $ASSET\$" SHA256SUMS | shasum -a 256 -c -          # orc-darwin-arm64: OK
+gh attestation verify "$ASSET" --repo thehumanworks/orc   # built by this repo's release workflow
+chmod +x "$ASSET" && mkdir -p ~/.local/bin && mv "$ASSET" ~/.local/bin/orc
+orc --version                                             # orc 0.1.0
+```
+
+With every binary downloaded next to it, `shasum -a 256 -c SHA256SUMS` checks them all. On Linux,
+`sha256sum -c` can stand in for `shasum -a 256 -c` in both commands. On macOS,
+a binary downloaded with a browser is quarantined and Gatekeeper refuses to start it: clear the
+flag with `xattr -d com.apple.quarantine ~/.local/bin/orc` (`gh` and `curl` downloads are not
+quarantined).
+
+**From source** (Bun ≥ 1.3.3):
+
 ```sh
 bun install
 bun link                                 # `orc` on PATH, runs from source
 bun run install:cli                      # or: compile a standalone binary to ~/.local/bin/orc
 bun run src/cli/index.ts <command> ...   # or: run it directly
 ```
+
+**With Nix** (Linux, Apple-silicon macOS): `nix run github:thehumanworks/orc -- --version` (once
+the flake is on `main`), or `nix build` in a checkout; see [Nix](#nix).
 
 ## Quick start
 
@@ -109,12 +135,26 @@ orc login  chatgpt [--import-pi] [--no-browser]     Sign in with ChatGPT (codex)
 orc login  status [--json]                          Which OpenAI credential codex uses
 orc logout chatgpt                                  Remove orc's ChatGPT credential
 orc settings [--json]                               Effective settings and where each value comes from
+orc mcp    [--wait-timeout SEC]                     Serve these commands as MCP tools over stdio (see MCP)
 orc --host <h> <command>                            Run a command against a peer's daemon
 orc --local <command>                               Run here, ignoring ORC_HOST / settings `host`
+orc --version [--json]                              This binary's version (alias: -V)
+orc --color[=WHEN] <command>                        auto (default) | always | never; --no-color = never
 ```
 
 `orc help` prints the full reference. A session is addressed by short id, full session id,
 `@alias` (current workspace) or `@workspace:alias`.
+
+Output to a terminal is coloured. A status word has the same colour everywhere (running
+cyan, done green, failed red, waiting yellow, suspended magenta, dead dim). Where a status
+stands on its own (`orc state`/`wait`, detail views, a list row's lifecycle tag, a step's
+ok/FAIL, a run's result) it also gets a glyph: `● running`, `✓ done`, `✗ failed`,
+`! waiting`, `◌ suspended`, `○ dead`. Secondary statuses inside dense rows (a list row's
+agent state, `state=` in step lines, settings file states) are colour only. Ids are bold,
+secondary detail dim. `--no-color` or `NO_COLOR=1` turns colour off, `--color=always` or
+`FORCE_COLOR=1` forces it (the flags win). Piped/redirected output is plain text and
+`--json` is never coloured. Agent text printed to a terminal has escape sequences and
+control characters stripped.
 
 ### spawn options
 
@@ -378,8 +418,9 @@ orc list --all-hosts               # fleet view with a host column
   execution policy forbids a spawn or wake; 404 unknown session or run; 409 a stopped session
   (`orc resume` first), an idempotency-key conflict, a legacy session, or a run in the wrong state
   (cancelled, live owner); 502 the provider failed to start; 500 anything else.
-- `GET /health` reports `api: 2` (raw reads return `journal`). `--host` still works against a v1
-  (pre-actor) daemon: its `submitted` send phase counts as success and `pane` reads render.
+- `GET /health` reports `api: 2` (raw reads return `journal`) and `mcp: "/mcp"`. `--host` still
+  works against a v1 (pre-actor) daemon: its `submitted` send phase counts as success and `pane`
+  reads render.
 - `--host` covers `list`, `spawn`, `send`, `read`, `wait`, `state`, `kill` and `workflow`, with the
   local output except: `state --json` is only `{id, state, status, suspended, stopped}`; `list`
   takes only `--workspace`/`--all`/`--dead` (rows have no `lineage`); `workflow resume`/`retry`
@@ -390,7 +431,118 @@ orc list --all-hosts               # fleet view with a host column
   `ORC_DAEMON_TOKEN`); or legacy `x-orc-secret` = `ORC_DAEMON_SECRET` (all scopes). Missing or
   invalid → 401; missing scope → 403. Scopes: `sessions:read|write`, `workflows:read|write`,
   `admin` (implies all; needed for kill/cancel/cleanup). Tokens are never logged or returned.
-- Daemon workflow file imports are confined to `ORC_WORKFLOW_ROOTS` (default: the daemon's cwd).
+- REST workflow file imports (`/workflows/run`, `resume`, `retry`) are meant to be confined to
+  `ORC_WORKFLOW_ROOTS` (default: the daemon's cwd), but a path outside the roots that names an
+  existing file is still accepted (a known gap). The MCP tools on `/mcp` (`workflow_run`,
+  `workflow_resume`, `workflow_retry`) run `orc --local workflow … <absolute file>` and have no
+  containment: they import any workflow file the daemon's user can read.
+- The daemon also serves the MCP tools at `/mcp`, behind the same auth (see
+  [MCP](#mcp-orc-as-tools-for-a-lead-agent)).
+
+## MCP (orc as tools for a lead agent)
+
+`orc mcp` serves orc's commands as [MCP](https://modelcontextprotocol.io) tools over stdio, and
+`orc daemon` serves the same tools at `/mcp` (Streamable HTTP). Point a lead agent (Claude Code,
+Codex, any MCP client) at it and it runs a team of agents through tool calls.
+
+- **Every tool runs the CLI**: `orc <cmd> … --json` (this build, as a child process: argv only,
+  prompts on stdin) and returns that JSON as `structuredContent` (arrays wrapped, e.g.
+  `{sessions: […]}`) plus compact text for the model (`guide` is text only). The CLI's `--json`
+  output is the contract; nothing is re-implemented. CLI errors become `isError` results with the
+  message and a hint. Arguments are validated strictly: an unknown or misspelled one (e.g.
+  `idempotencyKey` for `idempotency_key`) is an error, never silently ignored.
+- **The lead is taught the method.** The server's `instructions` and the `guide` tool (also the
+  `orc://guide` resource; `orchestrate` is a prompt) carry the team method: split the work into
+  vertical slices that can each be verified on their own; per slice a context gatherer (a fast,
+  cheap model), an implementor (the strongest model) and a judge (a strong model, ideally another
+  provider) who reviews before the lead accepts; worktrees for overlapping code; parallel waits;
+  cleanup. Model-neutral: `settings` shows the configured defaults.
+- Supported protocol revisions: 2026-07-28 (`server/discover`) and the 2025 ones (`initialize`),
+  via the official MCP TypeScript SDK.
+
+| tool | runs | daemon scope |
+| --- | --- | --- |
+| `guide` | — (the playbook; `topic` for one section) | any |
+| `spawn` | `spawn … --no-wait` (returns at once; the prompt is queued) | `sessions:write` |
+| `send` | `send <id> - [--idempotency-key K] [--no-wake]` | `sessions:write` |
+| `wait` | one `wait <id> --for … --timeout …` per id, concurrently (`ids`, `mode: all\|any`) | `sessions:read` |
+| `read` | `read <id> [--index N\|--full\|--raw]`, bounded by `max_chars` (the end is kept) | `sessions:read` |
+| `state`, `list` | `state <id>`, `list […]` | `sessions:read` |
+| `settings` | `settings` (in `cwd`) | `sessions:read` |
+| `kill`, `prune` | `kill <id> […]`, `prune […]` | `admin` |
+| `resume` | `resume <id>` | `sessions:write` |
+| `workflow_run` | `workflow run <file> --detach` (in `cwd`) | `workflows:write` |
+| `workflow_resume`, `workflow_retry` | `workflow resume\|retry <runId> <file> … --detach` (in `cwd`) | `workflows:write` |
+| `workflow_list`, `workflow_status`, `workflow_logs` | `workflow list\|status\|logs …` | `workflows:read` |
+| `workflow_cancel`, `workflow_cleanup` | `workflow cancel\|cleanup <runId> …` | `admin` |
+
+Not exposed, on purpose: `attach` and `workflow attach` (live streams for a human; use `read` /
+`workflow_logs`), `takeover` (hands a session to a human: the lead keeps the reins), `login` /
+`logout` (credentials), `daemon` and `remote` (serving and trust configuration), `mcp`, `help`.
+
+**stdio** (the lead's machine). Add the server to the lead's client:
+
+```sh
+claude mcp add --transport stdio orc -- orc mcp     # Claude Code (--scope user: every project)
+codex mcp add orc -- orc mcp                         # Codex CLI
+```
+
+```toml
+# Codex: ~/.codex/config.toml
+[mcp_servers.orc]
+command = "orc"
+args = ["mcp"]
+```
+
+From source, the command is `bun` with args `["<repo>/src/cli/index.ts", "mcp"]`. The server runs
+orc in its own working directory (clients start it in the session's directory) with the client's
+environment, so `ORC_HOME`, settings and default hosts apply as for `orc` itself. On the
+remote-capable tools (`spawn`, `send`, `wait`, `read`, `state`, `list`, `kill`, `workflow_run`,
+`workflow_list|status|logs|cancel|cleanup`), `host` sends that call to a peer's daemon
+(`orc --host`); the others run here only.
+
+**HTTP** (any daemon). `orc daemon` serves `/mcp` on its bind address, the tailscale IP by default:
+exposing the daemon on the tailnet exposes MCP too. The startup line prints the URL.
+
+```sh
+claude mcp add --transport http orc-mini http://mini:8787/mcp --header "Authorization: Bearer $ORC_DAEMON_TOKEN"
+```
+
+```toml
+# Codex: ~/.codex/config.toml
+[mcp_servers.orc-mini]
+url = "http://mini:8787/mcp"
+bearer_token_env_var = "ORC_DAEMON_TOKEN"
+```
+
+- **Auth** is the daemon's: an allowlisted tailnet identity (all scopes, no header needed), a
+  bearer token from `ORC_DAEMON_TOKENS`, or the legacy `x-orc-secret`; anything else is 401.
+- **Scopes**: each tool needs the scope of its REST route (table above; `wait` is an observation,
+  so `sessions:read`). `tools/list` shows only the tools the caller may call; calling another one
+  returns an error result that names the missing scope.
+- **Host/Origin guard** (DNS rebinding): `/mcp` answers only requests whose `Host` names the
+  daemon (the bound address; loopback names on loopback; this node's MagicDNS name, short name
+  and tailnet IPs on the tailnet) and whose `Origin`, if any, names it too (CLI and agent
+  clients send none); otherwise 403. Ports are not compared. `orc daemon --mcp-allow-host H`
+  (repeatable) adds a name, e.g. a DNS alias or a proxy.
+- Everything runs **on the daemon host** (`orc --local …`, whatever its settings say): `spawn`,
+  `workflow_run`, `workflow_resume` and `workflow_retry` need an absolute, existing `cwd` (a
+  workflow step without its own `cwd` runs there), paths must be absolute, and an `@alias` resolves
+  against the daemon's own directory (use ids). There is no `host` parameter. Workflow files are
+  not confined to `ORC_WORKFLOW_ROOTS` here (see Daemon).
+- Stateless: no MCP session; sessions and runs are addressed by their orc ids.
+
+**Timeouts and limits.** `wait` returns within 45 s by default even when agents are still running
+(the result says which are pending; the lead calls it again): Codex times out a tool call after
+60 s (`tool_timeout_sec`). Change it with `orc mcp --wait-timeout SEC` (stdio), or per call with
+`timeout_seconds` (≤ 600). `wait` takes up to 16 ids; `read` and `workflow_logs` return at most
+`max_chars` (16000 by default). At most 32 CLI children run at once per server process (each
+`wait` id is one); further calls queue, and a cancelled call leaves the queue. The daemon
+credentials `ORC_DAEMON_SECRET`, `ORC_DAEMON_TOKENS` and `ORC_DAEMON_TOKEN` are never passed to
+the CLI children (so never to agents), except that an explicit `host` call keeps the client
+credentials (`ORC_DAEMON_TOKEN`, `ORC_DAEMON_SECRET`) it authenticates with. Calls without `host`
+that follow a default host carry none: when that peer needs a token, pass `host` explicitly (an
+`unauthorized` error on such a call says so).
 
 ## Settings (`ORC_HOST` and `settings.toml`)
 
@@ -494,7 +646,7 @@ delete a session's dir.
 | `ORC_CODEX_BOOT_TIMEOUT_MS` | codex harness ready timeout (default 60000) |
 | `ORC_CLAUDE_READY_TIMEOUT_MS` | claude initialize timeout (default 60000) |
 | `ORC_ACTOR_READY_TIMEOUT_MS` | the actor's provider-ready timeout (default 120000) |
-| `ORC_WORKFLOW_ROOTS` | daemon workflow import allowlist (`path.delimiter`-separated) |
+| `ORC_WORKFLOW_ROOTS` | daemon REST workflow import allowlist (`path.delimiter`-separated; see Daemon for its limits) |
 | `ORC_DAEMON_TOKENS`, `ORC_DAEMON_TOKEN`, `ORC_DAEMON_SECRET` | daemon auth (server, client, legacy) |
 | `CODEX_HOME` | codex agent/prompt lookup |
 
@@ -507,6 +659,9 @@ bun run check:compile                      # compile orc; run the codex harness'
 bun run verify:live --claude-model haiku   # live end-to-end on an authenticated host
 ```
 
+With Nix, `nix develop` provides the toolchain and `nix flake check` builds, smoke-tests and
+typechecks orc in the sandbox: see [Nix](#nix).
+
 `verify:live` runs `scripts/verify-runtime/all.ts`: per-provider runtime gates; CLI end-to-end
 (spawn, idempotent send, SIGKILL the actor → `suspended` → wake, takeover/resume, kill/prune); a
 detached workflow; and a check that `tmux` is never invoked. A missing provider is SKIP; any FAIL
@@ -515,7 +670,7 @@ the per-provider gates: [`scripts/verify-runtime/README.md`](scripts/verify-runt
 
 ### Live verification on a Mac
 
-You need Bun ≥ 1.3, git and a signed-in `claude`. `pi` (for the pi rows) and an OpenAI credential
+You need Bun ≥ 1.3.3, git and a signed-in `claude`. `pi` (for the pi rows) and an OpenAI credential
 (for the codex rows) are optional: a provider you don't have is reported SKIP.
 
 ```sh
@@ -543,6 +698,61 @@ Dogfooding: `bun scripts/dogfood/run.ts spawn <task.md> [provider]` starts an im
 worktree of this repo; `bun scripts/dogfood/run.ts watch <id>` supervises it until it reports
 `DOGFOOD_COMPLETE` (with a commit), `DOGFOOD_BLOCKED: …`, or yields (example specs in
 `scripts/dogfood/tasks/`).
+
+### CI & releases
+
+`.github/workflows/ci.yml` runs on every pull request and push to `main`: typecheck + `bun test`
+on Linux and macOS, and `build.yml`, which builds `orc-<os>-<arch>` natively on four runners
+(linux/darwin × x64/arm64) with `bun run compile:cli`, the same script as local builds, and the Bun
+pinned in `.bun-version` (1.4.2). It smoke-tests each binary on the runner that built it
+(`--version` matches `package.json`, `--help`, the codex harness self-test, no `.env` /
+`bunfig.toml` autoload from the cwd) and uploads it as a workflow artifact. `nix.yml` checks the
+[Nix](#nix) flake on the same events.
+
+To cut a release, bump `version` in `package.json`, merge to `main`, then tag that commit:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0   # must be v<package.json version>
+```
+
+`release.yml` checks the tag against `package.json`, builds and smoke-tests the four binaries,
+writes `SHA256SUMS`, attests build provenance and publishes the GitHub release with generated
+notes and every asset (a tag with a `-`, e.g. `v0.2.0-rc.1`, is marked pre-release). If the run
+fails before publishing, re-run it from the Actions tab or with `gh workflow run release.yml --ref v0.2.0`.
+
+## Nix
+
+Optional: `flake.nix` adds a dev shell and a pure build. Without Nix nothing changes: `bun install`,
+`compile:cli` and the release binaries never use it. Systems: `x86_64-linux`, `aarch64-linux`,
+`aarch64-darwin`. nixpkgs-unstable no longer supports `x86_64-darwin`, so on an Intel Mac use the
+`orc-darwin-x64` [release binary](#install) or the Bun build.
+
+```sh
+nix develop               # bun (nixpkgs; 1.4.2 at this lock), git, jq, bash, nixfmt; procps on Linux
+nix build                 # ./result/bin/orc, built by package.json's compile:cli
+nix run . -- --version    # or from anywhere: nix run github:thehumanworks/orc -- --version
+nix flake check           # orc, a smoke test (--version, --help, codex self-test), the typecheck
+nix fmt                   # nixfmt (RFC style) on the .nix files
+```
+
+`flake.lock` pins nixpkgs; the only network access is a fixed-output `bun install --frozen-lockfile`
+of `bun.lock` (the same `node_modules` as a plain `bun install`), whose hash is in
+`nix/hashes.json`. The binary embeds nixpkgs' bun (on x86_64-linux its baseline build), so it is
+not byte-identical to a release binary. `overlays.default` adds `pkgs.orc`. Nix takes bun from the
+locked nixpkgs while CI uses `.bun-version`; both are 1.4.2 today, but nothing ties them together,
+so after a `nix flake update` that moves bun, bump `.bun-version` to match (or pin it back).
+
+**When `bun.lock` changes** (or a `nix flake update` brings a bun that installs differently), Nix
+builds fail with `hash mismatch in fixed-output derivation` until the hash is refreshed. One hash
+covers every system:
+
+```sh
+nix run .#update-deps-hash   # builds the dependencies and writes nix/hashes.json; commit it
+```
+
+Without Nix, copy the `got: sha256-…` value from the failing `nix` workflow into
+`nix/hashes.json`. `.github/workflows/nix.yml` runs `nix flake check`, `nix build`, the binary and
+the dev shell on Linux x64/arm64 and macOS arm64.
 
 ## Upgrading from the tmux runtime
 

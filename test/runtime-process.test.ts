@@ -15,6 +15,7 @@ import {
   terminateGroup,
   terminateProcessGroup,
 } from '../src/runtime/process.ts';
+import { mismatchedStartTime } from './runtime-helpers.ts';
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'orc-proc-'));
 
@@ -44,7 +45,7 @@ describe('runtime/process', () => {
 
   test('isSameProcessAlive rejects a mismatched start time (pid reuse guard)', () => {
     expect(isSameProcessAlive({ pid: process.pid, startTime: processStartTime(process.pid) })).toBe(true);
-    expect(isSameProcessAlive({ pid: process.pid, startTime: 'proc:1' })).toBe(false);
+    expect(isSameProcessAlive({ pid: process.pid, startTime: mismatchedStartTime() })).toBe(false);
     expect(isSameProcessAlive({ pid: process.pid, startTime: null })).toBe(true);
     expect(isSameProcessAlive(null)).toBe(false);
     // A token from the other source (proc vs ps) is not comparable → pid liveness wins.
