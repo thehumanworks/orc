@@ -12,6 +12,7 @@ import { runWorkflow } from '../src/workflow.ts';
 import type { StepDoneCtx, WorkflowDef, WorkflowEvent } from '../src/workflow.ts';
 import { readRegistry } from '../src/registry.ts';
 import { readRun } from '../src/runs.ts';
+import { readSpawnSpec } from '../src/runtime/spec.ts';
 import { killSessionProcesses, mkTmp, plainCliEnv } from './runtime-helpers.ts';
 
 const CLI = path.join(import.meta.dir, '..', 'src', 'cli', 'index.ts');
@@ -46,6 +47,19 @@ function phasesByStep(events: WorkflowEvent[]): Record<string, string[]> {
 }
 
 describe('runWorkflow with the default executor', () => {
+  test('step execution selections reach the persisted actor spawn spec', async () => {
+    const run = await runWorkflow({
+      name: 'explicit-selection',
+      steps: [{ id: 'selected', provider: 'pi', model: 'openai/gpt-6.1-sol',
+        reasoningEffort: 'medium', cwd: work, prompt: 'check selection', allowUnverified: true }],
+    }, { runId: 'wfselection', defaultModels: { pi: 'openai/fallback' } });
+    expect(run.status).toBe('done');
+    const record = (await readRegistry()).find((r) => r.id === run.steps[0]!.sessionId)!;
+    const spec = readSpawnSpec(record.sessionId);
+    expect(spec?.model).toBe('openai/gpt-6.1-sol');
+    expect(spec?.reasoningEffort).toBe('medium');
+  }, T);
+
   test(
     'attempt transitions are emitted once each, strictly forward (no duplicate spawning, no step back)',
     async () => {

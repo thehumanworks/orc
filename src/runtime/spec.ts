@@ -4,7 +4,7 @@ import { RUNTIME_SCHEMA_VERSION } from './types.ts';
 import type { RuntimeProvider, SpawnSpec } from './types.ts';
 import { sessionPaths } from './layout.ts';
 import { assertValidSessionId, readJsonFile, writeFileAtomic } from './fsutil.ts';
-import { assertProvider, validateModel } from '../providers.ts';
+import { assertProvider, validateModel, validateReasoningEffort } from '../providers.ts';
 import { legacyCodexSessionError } from '../legacy-codex.ts';
 
 /** Historical specs can be read and stopped, but never launched or sent new work. */
@@ -20,7 +20,10 @@ export function validateSpawnSpec(spec: SpawnSpec): void {
   }
   assertValidSessionId(spec.sessionId);
   assertExecutableSpec(spec);
-  if (spec.provider !== 'fake') validateModel(spec.provider, spec.model);
+  if (spec.provider !== 'fake') {
+    validateModel(spec.provider, spec.model);
+    validateReasoningEffort(spec.provider, spec.reasoningEffort);
+  }
   if (typeof spec.cwd !== 'string' || !path.isAbsolute(spec.cwd)) {
     throw new Error(`spawn spec cwd must be an absolute path (got '${String(spec.cwd)}')`);
   }

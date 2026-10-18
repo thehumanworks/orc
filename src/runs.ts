@@ -314,6 +314,9 @@ export function normalizeRun(raw: unknown): WorkflowRun | null {
         const ps = s as Record<string, unknown>;
         if (typeof ps.id !== 'string' || typeof ps.provider !== 'string') continue;
         const step: PlanStep = { id: ps.id, provider: ps.provider as StoredProvider };
+        // Preserve explicit selections for execution validation, including malformed values.
+        if (ps.model !== undefined) step.model = ps.model as PlanStep['model'];
+        if (ps.reasoningEffort !== undefined) step.reasoningEffort = ps.reasoningEffort as PlanStep['reasoningEffort'];
         if (typeof ps.alias === 'string') step.alias = ps.alias;
         if (typeof ps.taskFile === 'string') step.taskFile = ps.taskFile;
         if (typeof ps.prompt === 'string') step.prompt = ps.prompt;

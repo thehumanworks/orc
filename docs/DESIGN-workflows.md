@@ -75,6 +75,25 @@ evaluate `done(ctx)` or its portable `verify`. `ctx` exposes `state`, `commitsAh
 last assistant text + final turn, from the journal), and prior step results (so steps can reference
 `${implement.worktree}`). A failed/timed-out step stops new launches unless `continueOnFail`.
 
+### Model and reasoning effort
+
+Each step can set `model` and `reasoningEffort` explicitly:
+
+```ts
+{ id: 'plan', provider: 'pi', model: 'openai/gpt-6.1-sol',
+  reasoningEffort: 'medium', prompt: 'Write a plan to plan.md',
+  verify: { file: { path: 'plan.md' } } }
+```
+
+Model precedence is step `model` → run `defaultModels[provider]` (CLI settings `[models]`)
+→ provider default. Omitted `reasoningEffort` leaves the provider default unchanged.
+Pi accepts `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` (passed as `--thinking`);
+Claude accepts `low`, `medium`, `high`, `xhigh`, `max` (passed as `--effort`).
+The selected provider/model determines actual effort support. ORC validates provider-level
+values without maintaining a model catalog. Both fields are saved in the plan and included
+in its digest; changing either requires a new run, rather than resuming/retrying an old one.
+Existing definitions without these fields retain their previous behavior.
+
 ### Reliability
 - Sequencing is built on `waitFor` (settles on journal-derived state), never ad-hoc polling.
 - A step's success is an explicit predicate over a **hard signal** (a commit, a written file, an

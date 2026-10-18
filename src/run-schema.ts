@@ -5,7 +5,7 @@
  * Uses structural / local types for phase-3 fields to avoid circular type imports
  * with verification/artifacts modules (callers re-export richer types from workflow).
  */
-import type { AgentState, Provider, StoredProvider, ExecutionPolicy } from './types.ts';
+import type { AgentState, Provider, StoredProvider, ExecutionPolicy, ReasoningEffort } from './types.ts';
 import type { DeliveryPhase } from './messages.ts';
 import type { ProcessIdentity } from './runtime/types.ts';
 
@@ -184,6 +184,8 @@ export interface StepAttempt {
 export interface PlanStep {
   id: string;
   provider: StoredProvider;
+  model?: string;
+  reasoningEffort?: ReasoningEffort;
   alias?: string;
   taskFile?: string;
   prompt?: string;

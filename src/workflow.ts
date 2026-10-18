@@ -1,7 +1,7 @@
 /**
  * orc workflows — durable multi-step runner (phase 2).
  */
-import { assertProvider, validateModel } from './providers.ts';
+import { assertProvider, validateModel, validateReasoningEffort } from './providers.ts';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -31,7 +31,7 @@ import { assertValidRunId, runInstructionsDir, runResultPath, runAttemptDir } fr
 import { ensurePrivateDir, writePrivateFile } from './private-fs.ts';
 import { isSameProcessAlive } from './runtime/process.ts';
 import type { Turn } from './transcript.ts';
-import type { AgentState, ExecutionPolicy, Provider, StoredProvider, SessionRecord } from './types.ts';
+import type { AgentState, ExecutionPolicy, Provider, StoredProvider, SessionRecord, ReasoningEffort } from './types.ts';
 import { ORC_ENV } from './types.ts';
 import type { WaitForResult } from './session.ts';
 import type { DeliveryPhase, SendResult } from './messages.ts';
@@ -127,6 +127,10 @@ export const WORKFLOW_ROOTS_ENV = 'ORC_WORKFLOW_ROOTS';
 export interface WorkflowStep {
   id: string;
   provider: Provider;
+  /** Overrides the run default for this provider. */
+  model?: string;
+  /** Provider-native effort; omitted leaves the provider default unchanged. */
+  reasoningEffort?: ReasoningEffort;
   alias?: string;
   taskFile?: string;
   prompt?: string;
@@ -267,7 +271,7 @@ export type StepExecutor = (args: {
     patch?: Partial<StepAttempt>,
   ) => Promise<void> | void;
   attempt?: StepAttempt;
-  /** The run's default model for this step's provider (`defaultModels`), if any. */
+  /** Effective model: step.model, then the run default for this provider. */
   model?: string;
 }) => Promise<StepResult>;
 
@@ -341,7 +345,7 @@ export interface RunWorkflowOptions {
    * Default model per provider for steps (the CLI passes settings.toml `[models]` when a run
    * starts; the SDK never reads settings files). Recorded on the run; on resume/retry the
    * recorded map wins (the CLI passes none there), so a later settings change cannot switch
-   * models mid-run. Steps have no model of their own, so each step's session gets
+   * models mid-run. Each step uses `step.model` first, then
    * `defaultModels[step.provider]` (else the provider's own default).
    */
   defaultModels?: Partial<Record<Provider, string>>;
@@ -372,6 +376,11 @@ export function validateModelDefaults(defaults?: Partial<Record<StoredProvider, 
 export function assertRunExecutable(run: WorkflowRun): void {
   for (const step of [...(run.plan?.steps ?? []), ...run.steps, ...(run.attempts ?? [])]) {
     assertProvider(step.provider);
+  }
+  for (const step of run.plan?.steps ?? []) {
+    assertProvider(step.provider);
+    validateModel(step.provider, step.model);
+    validateReasoningEffort(step.provider, step.reasoningEffort);
   }
   validateModelDefaults(run.defaultModels);
 }
@@ -407,6 +416,8 @@ export function validateWorkflowDef(def: WorkflowDef): void {
     seen.add(step.id);
     try {
       assertProvider(step.provider);
+      validateModel(step.provider, step.model);
+      validateReasoningEffort(step.provider, step.reasoningEffort);
     } catch (e) {
       throw new Error(`workflow '${def.name}' step '${step.id}': ${(e as Error).message}`);
     }
@@ -458,6 +469,8 @@ export function buildPlan(def: WorkflowDef): WorkflowPlan {
     ...(def.keepSessionsOnError !== undefined ? { keepSessionsOnError: def.keepSessionsOnError } : {}),
     steps: def.steps.map((s) => {
       const p: PlanStep = { id: s.id, provider: s.provider };
+      if (s.model !== undefined) p.model = s.model;
+      if (s.reasoningEffort !== undefined) p.reasoningEffort = s.reasoningEffort;
       if (s.alias !== undefined) p.alias = s.alias;
       if (s.taskFile !== undefined) p.taskFile = s.taskFile;
       if (s.prompt !== undefined) p.prompt = s.prompt;
@@ -490,6 +503,8 @@ export function buildWorkflowPlan(def: WorkflowDef): WorkflowPlan {
 export function canonicalPlanJson(plan: WorkflowPlan): string {
   const steps = plan.steps.map((s) => {
     const o: Record<string, unknown> = { id: s.id, provider: s.provider };
+    if (s.model !== undefined) o.model = s.model;
+    if (s.reasoningEffort !== undefined) o.reasoningEffort = s.reasoningEffort;
     if (s.alias !== undefined) o.alias = s.alias;
     if (s.taskFile !== undefined) o.taskFile = s.taskFile;
     if (s.prompt !== undefined) o.prompt = s.prompt;
@@ -1013,6 +1028,7 @@ const defaultExecStep: StepExecutor = async ({
     applyInheritedContext({
       provider: step.provider,
       ...(model ? { model } : {}),
+      ...(step.reasoningEffort !== undefined ? { reasoningEffort: step.reasoningEffort } : {}),
       alias: step.alias,
       cwd: step.cwd,
       worktree: step.worktree ? true : undefined,
@@ -1820,7 +1836,8 @@ async function runWorkflowOwned(
         },
         transition,
         attempt,
-        ...(defaultModels?.[step.provider] ? { model: defaultModels[step.provider] } : {}),
+        ...((step.model ?? defaultModels?.[step.provider]) !== undefined
+          ? { model: step.model ?? defaultModels?.[step.provider] } : {}),
       });
     });
   };
@@ -2359,6 +2376,7 @@ function assertDigestMatches(existing: WorkflowRun, def: WorkflowDef, sourcePath
   const digest = planDigest(plan);
   const preDagDigestMatches =
     (existing.schemaVersion ?? 1) < 4 &&
+    plan.steps.every((step) => step.model === undefined && step.reasoningEffort === undefined) &&
     existing.plan?.maxConcurrency === undefined &&
     existing.definitionDigest === legacyPlanDigest(plan);
   if (existing.definitionDigest && existing.definitionDigest !== digest && !preDagDigestMatches) {

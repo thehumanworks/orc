@@ -105,7 +105,7 @@ describe('claude runtime I/O (fake claude)', () => {
     'start: detached group, ready buffered before iteration, env stripped, logs written',
     async () => {
       const record = path.join(root, `record-${randomUUID()}.json`);
-      const l = launch({}, false, { FAKE_CLAUDE_RECORD: record });
+      const l = launch({ reasoningEffort: 'high' }, false, { FAKE_CLAUDE_RECORD: record });
       const rt = await start(l);
       expect(rt.pid).toBeGreaterThan(0);
       expect(rt.providerSessionId).toBe(l.spec.sessionId);
@@ -126,6 +126,7 @@ describe('claude runtime I/O (fake claude)', () => {
       const rec = JSON.parse(fs.readFileSync(record, 'utf8')) as { argv: string[]; env: Record<string, string> };
       expect(rec.argv.slice(0, 1)).toEqual(['-p']);
       expect(rec.argv).toContain('--replay-user-messages');
+      expect(rec.argv[rec.argv.indexOf('--effort') + 1]).toBe('high');
       expect(rec.argv[rec.argv.indexOf('--session-id') + 1]).toBe(l.spec.sessionId);
       expect(rec.argv).not.toContain('--resume');
       expect(rec.env.CLAUDE_CODE_ENTRYPOINT).toBeUndefined();

@@ -18,7 +18,7 @@ import type { SpawnSpec } from './runtime/types.ts';
 import { resolveClaudeTranscript } from './runtime/providers/claude.ts';
 import { buildPiArgs } from './runtime/providers/pi-protocol.ts';
 import { LEGACY_CODEX_SESSION_FILE } from './legacy-codex.ts';
-import { validateModel } from './providers.ts';
+import { validateModel, validateReasoningEffort } from './providers.ts';
 import { sessionStateDir } from './paths.ts';
 
 function existing(p: string | undefined): string | null {
@@ -163,8 +163,10 @@ export function nativeResumeArgv(spec: SpawnSpec): string[] {
   const psid = spec.providerSessionId ?? spec.sessionId;
   switch (spec.provider) {
     case 'claude': {
+      validateReasoningEffort('claude', spec.reasoningEffort);
       const argv = ['claude', '--resume', psid];
       if (spec.model) argv.push('--model', spec.model);
+      if (spec.reasoningEffort !== undefined) argv.push('--effort', spec.reasoningEffort);
       if (spec.agentName) argv.push('--agent', spec.agentName);
       if (spec.systemPrompt) {
         argv.push(

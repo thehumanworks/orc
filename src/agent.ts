@@ -24,7 +24,7 @@ import {
 } from './lineage.ts';
 import { createSession, stop as kernelStop } from './runtime/client.ts';
 import { RUNTIME_SCHEMA_VERSION } from './runtime/types.ts';
-import { assertProvider, validateModel } from './providers.ts';
+import { assertProvider, validateModel, validateReasoningEffort } from './providers.ts';
 import type { SpawnSpec } from './runtime/types.ts';
 
 /**
@@ -49,6 +49,7 @@ function fakeScriptFromEnv(env: NodeJS.ProcessEnv = process.env): unknown | unde
 export function validateOptions(opts: AgentOptions): void {
   assertProvider(opts.provider);
   validateModel(opts.provider, opts.model);
+  validateReasoningEffort(opts.provider, opts.reasoningEffort);
   if (opts.agentName && opts.systemPrompt) {
     throw new Error('agentName and systemPrompt are mutually exclusive — pass only one');
   }
@@ -128,6 +129,7 @@ export async function agent(opts: AgentOptions): Promise<Session> {
     runtime: 'actor',
     provider,
     model: effectiveModel,
+    ...(opts.reasoningEffort !== undefined ? { reasoningEffort: opts.reasoningEffort } : {}),
     agentName: opts.agentName,
     alias,
     cwd,
@@ -203,6 +205,7 @@ export async function agent(opts: AgentOptions): Promise<Session> {
       cwd,
       env: childEnv,
       ...(effectiveModel ? { model: effectiveModel } : {}),
+      ...(opts.reasoningEffort !== undefined ? { reasoningEffort: opts.reasoningEffort } : {}),
       ...(nativeAgentName ? { agentName: nativeAgentName } : {}),
       ...(systemPromptPath ? { systemPrompt: { mode: systemPromptMode, path: systemPromptPath } } : {}),
       ...(provider === 'pi' ? { sessionDir } : {}),

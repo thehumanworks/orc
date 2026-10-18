@@ -4,6 +4,9 @@
 
 export type Provider = 'claude' | 'pi';
 
+/** Provider-native effort levels. Claude accepts low through max; Pi also accepts off/minimal. */
+export type ReasoningEffort = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
 /** Provider names in historical records. Codex is readable, never a new execution path. */
 export type StoredProvider = Provider | 'codex';
 
@@ -74,6 +77,8 @@ export interface ExecutionLineage {
 export interface AgentOptions extends ExecutionLineage {
   provider: Provider;
   model?: string;
+  /** Explicit provider effort; omitted leaves the provider's default unchanged. */
+  reasoningEffort?: ReasoningEffort;
   /** Name of an existing agent definition (.claude/agents, project- or user-scoped). */
   agentName?: string;
   /**
@@ -129,6 +134,7 @@ export interface SessionRecord extends ExecutionLineage {
   providerSessionId?: string;
   provider: StoredProvider;
   model?: string;
+  reasoningEffort?: ReasoningEffort;
   agentName?: string;
   /** Workspace-scoped, reusable active-session alias. */
   alias?: string;

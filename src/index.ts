@@ -260,6 +260,7 @@ export type {
   Provider,
   StoredProvider,
   AgentOptions,
+  ReasoningEffort,
   AgentState,
   SessionRecord,
   SessionStatus,

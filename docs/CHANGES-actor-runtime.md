@@ -75,9 +75,10 @@ Current behaviour: [`../README.md`](../README.md), [`ARCHITECTURE.md`](ARCHITECT
 - **Detached workflow runners** are plain processes logging to `~/.orc/runs/<runId>/runner.log`;
   `orc workflow attach` follows that log. They are launched with `--local`, so a default host never
   redirects them.
-- **Workflow step models**: CLI runs give each step session settings `[models].<provider>`; the run
+- **Workflow step models**: explicit step `model` overrides settings `[models].<provider>`; the run
   records the map (`defaultModels`) at start; `resume`/`retry` and detached runners use the record
-  and never read settings. Over `--host` the daemon applies no `[models]`.
+  and never read settings. Step `model` and `reasoningEffort` are persisted in the plan and
+  protected by its digest. Over `--host` the daemon applies no `[models]`.
 - **Workflows**: a step whose session a human took over is never relaunched by `resume` (attempt
   fails `taken_over`); attempt transition events are emitted once, forward only;
   `StepDoneCtx.capture` is journal text (last reply + final turn), not a pane.

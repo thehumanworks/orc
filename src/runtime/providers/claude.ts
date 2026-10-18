@@ -32,6 +32,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { validateReasoningEffort } from '../../providers.ts';
 import { processStartTime, signalProcessGroup, terminateProcessGroup } from '../process.ts';
 import type {
   ProcessIdentity,
@@ -67,6 +68,7 @@ import {
  * `--session-id` together with `--resume` (claude exits 1), system prompt only via file.
  */
 export function buildClaudeArgv(spec: SpawnSpec, resume: boolean, bin = 'claude'): string[] {
+  validateReasoningEffort('claude', spec.reasoningEffort);
   const argv = [
     bin,
     '-p',
@@ -84,6 +86,7 @@ export function buildClaudeArgv(spec: SpawnSpec, resume: boolean, bin = 'claude'
   if (resume) argv.push('--resume', spec.providerSessionId ?? spec.sessionId);
   else argv.push('--session-id', spec.sessionId);
   if (spec.model) argv.push('--model', spec.model);
+  if (spec.reasoningEffort !== undefined) argv.push('--effort', spec.reasoningEffort);
   if (spec.agentName) argv.push('--agent', spec.agentName);
   if (spec.systemPrompt) {
     argv.push(

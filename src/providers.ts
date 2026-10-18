@@ -2,9 +2,28 @@
  * ORC integrations and structural model validation. Pi owns model catalogs, discovery,
  * authentication and execution; an OpenAI model provider is not an ORC integration.
  */
-import type { Provider } from './types.ts';
+import type { Provider, ReasoningEffort } from './types.ts';
+export type { ReasoningEffort } from './types.ts';
 
 export const PROVIDERS = ['claude', 'pi'] as const;
+
+// Verified against Claude Code 2.1.302 --help and Pi 1.3.0 --help.
+const REASONING_EFFORTS: Record<Provider, readonly ReasoningEffort[]> = {
+  claude: ['low', 'medium', 'high', 'xhigh', 'max'],
+  pi: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+};
+
+/** Validate explicit effort without choosing a default or silently translating levels. */
+export function validateReasoningEffort(
+  provider: Provider,
+  value: unknown,
+): asserts value is ReasoningEffort | undefined {
+  if (value === undefined) return;
+  const supported = REASONING_EFFORTS[provider];
+  if (typeof value !== 'string' || !supported.includes(value as ReasoningEffort)) {
+    throw new Error(`invalid reasoningEffort '${String(value)}' for ${provider} (expected ${supported.join('|')})`);
+  }
+}
 
 export function isProvider(value: unknown): value is Provider {
   return value === 'claude' || value === 'pi';

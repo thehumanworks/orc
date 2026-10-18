@@ -13,7 +13,7 @@
  *   inbox/          InboxItem files      <ULID>.json, written as .tmp-* then renamed
  *   actor.log       actor stdout/stderr
  */
-import type { Provider, StoredProvider, SystemPromptMode } from '../types.ts';
+import type { Provider, ReasoningEffort, StoredProvider, SystemPromptMode } from '../types.ts';
 
 /** Bump only with a migration. */
 export const RUNTIME_SCHEMA_VERSION = 1 as const;
@@ -46,6 +46,7 @@ export interface SpawnSpec {
    */
   env: Record<string, string>;
   model?: string;
+  reasoningEffort?: ReasoningEffort;
   /** claude native `--agent <name>`; Pi resolves agent bodies into systemPrompt. */
   agentName?: string;
   systemPrompt?: SystemPromptFile;
