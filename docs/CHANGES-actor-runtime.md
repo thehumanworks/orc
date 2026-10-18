@@ -1,5 +1,10 @@
 # Changes: the actor runtime (`feat/actor-runtime` vs `main` @ 2795c34)
 
+> **Historical change record (2026-10-15).** The Codex harness and login commands introduced
+> below were subsequently removed in the Pi + Claude consolidation on 2026-10-18. Use the
+> [current migration guide](MIGRATION-pi.md) for installation, authentication, old sessions and
+> workflows. The original changes are retained here to explain persisted data and older builds.
+
 orc no longer uses tmux. Every session is a detached **actor process** that drives its provider
 over a structured protocol, with a durable inbox and an append-only journal. codex is now orc's
 **built-in harness** on the OpenAI Responses API instead of the `codex` CLI.

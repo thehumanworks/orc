@@ -19,7 +19,7 @@ describe('validateOptions', () => {
     expect(() => validateOptions({ provider: 'claude', agentName: 'x' })).not.toThrow();
   });
   test('systemPrompt alone is valid', () => {
-    expect(() => validateOptions({ provider: 'codex', systemPrompt: 'y' })).not.toThrow();
+    expect(() => validateOptions({ provider: 'pi', systemPrompt: 'y' })).not.toThrow();
   });
   test('plain provider is valid', () => {
     expect(() => validateOptions({ provider: 'pi' })).not.toThrow();

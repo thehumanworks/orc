@@ -11,7 +11,7 @@ import { parseTranscript } from './transcript.ts';
 import type { Turn } from './transcript.ts';
 import type { SendOptions, SendResult } from './messages.ts';
 import { assertValidMessageId } from './paths.ts';
-import type { AgentState, Provider, SessionRecord, SessionStatus } from './types.ts';
+import type { AgentState, StoredProvider, SessionRecord, SessionStatus } from './types.ts';
 import { releaseSessionPolicy, wakePolicyHook } from './lineage.ts';
 import { sessionStatusOf } from './session-status.ts';
 import { renderJournalEntry } from './journal-render.ts';
@@ -39,6 +39,7 @@ import { TurnLedger, summarizeLedger } from './runtime/derive.ts';
 import type { SessionView } from './runtime/derive.ts';
 import { listPending } from './runtime/inbox.ts';
 import { readSpawnSpec } from './runtime/spec.ts';
+import { legacyCodexSessionError } from './legacy-codex.ts';
 import { readActorState } from './runtime/actor-state.ts';
 import { readFileTail } from './runtime/fsutil.ts';
 import { ulid } from './runtime/ulid.ts';
@@ -210,7 +211,7 @@ function actorLogTail(sessionId: string): string {
 export class Session {
   readonly id: string;
   readonly sessionId: string;
-  readonly provider: Provider;
+  readonly provider: StoredProvider;
   readonly cwd: string;
   readonly worktreePath?: string;
   readonly branch?: string;
@@ -243,7 +244,10 @@ export class Session {
   }
 
   /** Throws unless the kernel can control this session (not legacy, spawn.json present). */
-  private assertControllable(action: string): void {
+  private assertControllable(action: string, allowHistoricalTakeover = false): void {
+    if (this.provider === 'codex' && !allowHistoricalTakeover) {
+      throw legacyCodexSessionError(this.id);
+    }
     if (this.legacy) {
       throw new SessionNotControllableError(
         `session ${this.id} is a legacy tmux session${
@@ -282,6 +286,12 @@ export class Session {
       };
     }
     const d = deriveState(inspect(this.sessionId, { tail: 0 }));
+    if (this.provider === 'codex' && !d.live) {
+      return { id: this.id, state: 'failed', status, stopped: d.stopped, suspended: false,
+        live: false, pendingMessages: d.pendingMessages, legacy: true,
+        ...(d.lastTurn ? { lastTurn: d.lastTurn } : {}),
+        stopReason: d.stopReason ?? 'codex-integration-removed' };
+    }
     return {
       id: this.id,
       state: d.state,
@@ -320,6 +330,9 @@ export class Session {
     const pollMs = Math.max(1, opts?.pollMs ?? DEFAULT_WAIT_POLL_MS);
     const deadline = Date.now() + timeoutMs;
     if (this.legacy || !hasSpawnSpec(this.sessionId)) {
+      return { state: 'failed', settled: until.includes('failed') };
+    }
+    if (this.provider === 'codex' && sessionStatusOf(this.record) !== 'running') {
       return { state: 'failed', settled: until.includes('failed') };
     }
     const obs = new StateObserver(this.sessionId);
@@ -599,7 +612,7 @@ export class Session {
    * return the provider's own resume command for a human. Handback: `resume()`.
    */
   async takeover(opts: { graceMs?: number; timeoutMs?: number } = {}): Promise<TakeoverResult> {
-    this.assertControllable('be taken over');
+    this.assertControllable('be taken over', true);
     const before = readActorState(this.sessionId)?.provider;
     await kernelStop(this.sessionId, {
       reason: 'takeover',

@@ -69,7 +69,7 @@ describe('parseClaude', () => {
   });
 });
 
-/** A codex harness session file (pi session JSONL v3, src/codex/session-file.ts). */
+/** A historical Codex harness session file (Pi session JSONL v3). */
 const HARNESS_SESSION = [
   { type: 'session', version: 3, id: 'sid-1', timestamp: '2026-10-15T10:00:00.000Z', cwd: '/w' },
   { type: 'model_change', id: 'a0000001', parentId: null, timestamp: '2026-10-15T10:00:00.000Z', provider: 'openai', modelId: 'gpt-5.5' },
@@ -169,7 +169,7 @@ describe('parseTranscript dispatch + renderTurns', () => {
     expect(parseTranscript('claude', fixture('claude-transcript.jsonl'))).toEqual(
       parseClaude(fixture('claude-transcript.jsonl')),
     );
-    // The codex harness writes pi-format sessions: codex uses the pi parser.
+    // Historical Codex harness sessions use Pi's format and remain readable.
     expect(parseTranscript('codex', HARNESS_SESSION)).toEqual(parsePi(HARNESS_SESSION));
     expect(parseTranscript('pi', HARNESS_SESSION)).toEqual(parsePi(HARNESS_SESSION));
   });

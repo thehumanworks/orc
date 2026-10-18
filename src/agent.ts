@@ -7,14 +7,14 @@
 import fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { sanitizeLabel } from './naming.ts';
-import { effectiveAgentModel, resolveAgentDef } from './agentdefs.ts';
+import { resolveAgentDef } from './agentdefs.ts';
 import { createWorktree, gitToplevel, isInsideGitRepo, removeWorktree } from './worktree.ts';
 import { removeRecord, reserveRecord, upsertRecord, validateAlias } from './registry.ts';
 import { piSessionDir } from './paths.ts';
 import { ensurePrivateDir } from './private-fs.ts';
 import { Session } from './session.ts';
 import { withLock } from './lock.ts';
-import type { AgentOptions, Provider, SessionRecord, SystemPromptMode } from './types.ts';
+import type { AgentOptions, SessionRecord, SystemPromptMode } from './types.ts';
 import { removeSessionDir, writeSystemPromptFile } from './session-files.ts';
 import {
   resolveLineage,
@@ -24,6 +24,7 @@ import {
 } from './lineage.ts';
 import { createSession, stop as kernelStop } from './runtime/client.ts';
 import { RUNTIME_SCHEMA_VERSION } from './runtime/types.ts';
+import { assertProvider, validateModel } from './providers.ts';
 import type { SpawnSpec } from './runtime/types.ts';
 
 /**
@@ -44,16 +45,10 @@ function fakeScriptFromEnv(env: NodeJS.ProcessEnv = process.env): unknown | unde
   }
 }
 
-const VALID_PROVIDERS: Provider[] = ['claude', 'codex', 'pi'];
-
 /** Validate options and throw on invalid combinations. */
 export function validateOptions(opts: AgentOptions): void {
-  if (!opts.provider) {
-    throw new Error('provider is required (claude|codex|pi)');
-  }
-  if (!VALID_PROVIDERS.includes(opts.provider)) {
-    throw new Error(`invalid provider '${opts.provider}' (expected claude|codex|pi)`);
-  }
+  assertProvider(opts.provider);
+  validateModel(opts.provider, opts.model);
   if (opts.agentName && opts.systemPrompt) {
     throw new Error('agentName and systemPrompt are mutually exclusive — pass only one');
   }
@@ -77,13 +72,13 @@ export async function agent(opts: AgentOptions): Promise<Session> {
   const baseCwd = await fs.realpath(opts.cwd ?? process.cwd());
 
   // Generate our handle uuid: the kernel session id (claude/pi use it as their
-  // --session-id; the codex harness uses it as its session id).
+  // --session-id).
   const sessionId = randomUUID();
   const shortId = sessionId.slice(0, 8);
 
-  // Resolve system prompt: explicit systemPrompt, OR (codex/pi) the agentName body.
+  // Resolve system prompt: explicit systemPrompt, or the Pi agentName body.
   let resolvedSystemPrompt = opts.systemPrompt;
-  let effectiveModel = opts.model;
+  const effectiveModel = opts.model;
   let nativeAgentName: string | undefined;
 
   if (opts.agentName) {
@@ -91,21 +86,16 @@ export async function agent(opts: AgentOptions): Promise<Session> {
       // claude resolves named agents natively.
       nativeAgentName = opts.agentName;
     } else {
-      // codex/pi have no native launch-time named-agent flag, so resolve the agent's
-      // prompt body ourselves (codex's own agent/prompt stores first, then claude agents).
+      // Pi has no native launch-time named-agent flag; resolve the shared Markdown body.
       const def = await resolveAgentDef(opts.agentName, baseCwd, provider);
       if (!def || def.body.trim().length === 0) {
-        const looked =
-          provider === 'codex'
-            ? '.codex/agents/, $CODEX_HOME/agents/, .codex/prompts/, $CODEX_HOME/prompts/, .claude/agents/, ~/.claude/agents/'
-            : '.claude/agents/, ~/.claude/agents/';
+        const looked = '.claude/agents/, ~/.claude/agents/';
         throw new Error(
           `agentName "${opts.agentName}" not found for provider=${provider} ` +
             `(looked in ${looked}). Define it there, pass systemPrompt instead, or use provider=claude.`,
         );
       }
       resolvedSystemPrompt = def.body;
-      effectiveModel = effectiveAgentModel(opts.model, def, provider);
     }
   }
 
@@ -236,8 +226,8 @@ export async function agent(opts: AgentOptions): Promise<Session> {
         ...record,
         providerSessionId: ready.providerSessionId,
         ...(ready.transcriptPath ? { transcriptPath: ready.transcriptPath } : {}),
-        // codex without --model runs the account's live default model: record (and print) it.
-        ...(provider === 'codex' && !record.model && ready.model ? { model: ready.model } : {}),
+        // Pi reports the concrete model selected from its defaults or aliases.
+        ...(provider === 'pi' && ready.model ? { model: ready.model } : {}),
       };
       await upsertRecord(record);
       session = new Session(record);

@@ -27,7 +27,6 @@ import {
 import { renderSettingsView } from '../src/settings.ts';
 import { renderTurns } from '../src/transcript.ts';
 import { renderCapture, renderJournal, renderJournalEntry } from '../src/journal-render.ts';
-import { renderLoginStatus } from '../src/codex/login.ts';
 import { PLAIN, Style, TONE_STYLES, stripAnsi, toneOf } from '../src/style.ts';
 
 type Golden = Record<string, string | (string | null)[]>;
@@ -79,7 +78,6 @@ describe('colour off is byte-identical to the renderers before styling (main @ 1
       expect(renderTurns(fx.turns, st)).toBe(g('turns'));
       expect(renderJournal(fx.journal, st)).toBe(g('journal'));
       expect(fx.journal.map((e) => renderJournalEntry(e, st))).toEqual(gn('journalEntries'));
-      expect(fx.loginStatuses.map((s) => renderLoginStatus(s, st))).toEqual(gl('login'));
       expect(renderHelp(st)).toBe(HELP_TEXT);
     });
   }
@@ -88,7 +86,7 @@ describe('colour off is byte-identical to the renderers before styling (main @ 1
     expect(renderCapture(fx.journal)).toBe(g('capture'));
   });
 
-  test('HELP_TEXT preserves the old help apart from documented CLI additions', () => {
+  test('HELP_TEXT matches the maintained Pi/Claude reference plus color, version and MCP sections', () => {
     const added = [
       '  --color[=WHEN]        colour: auto (default: only when writing to a terminal) | always | never',
       '  --no-color            same as --color=never. NO_COLOR=1 also disables colour, FORCE_COLOR=1',
@@ -335,15 +333,7 @@ describe('colour on: the expected styled output', () => {
     expect(stripAnsi(renderJournal(fx.journal, ANSI))).toBe(g('journal'));
   });
 
-  test('login status, error and warning lines', () => {
-    expect(renderLoginStatus(fx.loginStatuses[0]!, ANSI).split('\n')).toEqual([
-      B('codex credentials (first match is used):'),
-      `${BC('→')} 1. orc login     oauth (expires in 9d)  ${D('[/home/u/.orc/auth/chatgpt.json]')}`,
-      `  2. pi login      none  ${D('[/home/u/.pi/agent/auth.json]')}`,
-      `  3. OPENAI_API_KEY ${G('set')}`,
-      `${D('active:')} ${G('orc')}`,
-    ]);
-    fx.loginStatuses.forEach((s, i) => expect(stripAnsi(renderLoginStatus(s, ANSI))).toBe(gl('login')[i]!));
+  test('error and warning lines', () => {
     expect(formatError('no session found', ANSI)).toBe(`${BR('error:')} no session found\n`);
     expect(formatError('no session found')).toBe('error: no session found\n');
     expect(formatWarning('peer x unreachable', ANSI)).toBe(`${BY('warning:')} peer x unreachable\n`);
@@ -357,7 +347,7 @@ describe('colour on: the expected styled output', () => {
     expect(lines[0]).toBe(B('orc — multi-agent orchestration CLI'));
     expect(lines[2]).toBe(B('Usage:'));
     expect(lines[3]).toBe(
-      `  ${BC('orc spawn')}  ${C('--provider')} ${w('3', '23')('<claude|codex|pi>')} [options]   Launch a new agent session`,
+      `  ${BC('orc spawn')}  ${C('--provider')} ${w('3', '23')('<claude|pi>')} [options]   Launch a new agent session`,
     );
     expect(lines).toContain(B('Global:'));
     expect(lines).toContain(`  ${BC('orc workflow run')} ${w('3', '23')('<file>')} [${C('--prompt')} TEXT] [${C('--keep-sessions-on-error')}] [${C('--detach')}] [${C('--json')}] [${C('--max-concurrency')} N]`);

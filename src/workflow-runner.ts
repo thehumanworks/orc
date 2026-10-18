@@ -36,9 +36,11 @@ import {
   planDigest,
   reconcileRun,
   runnerLineageEnv,
+  validateModelDefaults,
   validateWorkflowDef,
 } from './workflow.ts';
 import type { WorkflowDef } from './workflow.ts';
+import type { Provider } from './types.ts';
 
 /** Spawns a detached runner (default `spawnDetached`; injectable for tests). */
 export type RunnerSpawner = (argv: string[], opts: SpawnDetachedOptions) => ProcessIdentity;
@@ -131,13 +133,14 @@ async function stampOrStop(
 export async function launchDetachedRun(
   def: WorkflowDef,
   absFile: string,
-  opts: LaunchRunnerOptions & { maxConcurrency?: number; defaultModels?: WorkflowRun['defaultModels']; prompt?: string } = {},
+  opts: LaunchRunnerOptions & { maxConcurrency?: number; defaultModels?: Partial<Record<Provider, string>>; prompt?: string } = {},
 ): Promise<DetachedLaunch> {
   const defForPlan: WorkflowDef =
     opts.maxConcurrency !== undefined ? { ...def, maxConcurrency: opts.maxConcurrency } : def;
   // The parent never calls runWorkflow, so validate here: a malformed workflow must fail
   // now, not spawn a doomed runner and hand back a self-orphaning runId.
   validateWorkflowDef(defForPlan);
+  validateModelDefaults(opts.defaultModels);
 
   const runId = randomUUID().slice(0, 8);
   const plan = buildPlan(defForPlan);
@@ -196,11 +199,11 @@ export async function launchDetachedRecovery(
 ): Promise<DetachedLaunch & { action: 'resume' | 'retry' }> {
   const existing = await readRun(runId);
   if (!existing) throw new Error(`no run found for '${runId}'`);
-  assertRecoveryAllowed(await reconcileRun(existing), action);
   assertRecoveryDefinition(existing, def, {
     stepId: action === 'retry' ? opts.stepId : undefined,
     sourcePath: absFile,
   });
+  assertRecoveryAllowed(await reconcileRun(existing), action);
 
   const argv = [
     ...selfArgv(),

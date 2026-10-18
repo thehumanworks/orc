@@ -13,7 +13,7 @@
  *   inbox/          InboxItem files      <ULID>.json, written as .tmp-* then renamed
  *   actor.log       actor stdout/stderr
  */
-import type { Provider, SystemPromptMode } from '../types.ts';
+import type { Provider, StoredProvider, SystemPromptMode } from '../types.ts';
 
 /** Bump only with a migration. */
 export const RUNTIME_SCHEMA_VERSION = 1 as const;
@@ -36,7 +36,8 @@ export interface SpawnSpec {
   version: typeof RUNTIME_SCHEMA_VERSION;
   /** orc session uuid (claude/pi: also the provider session id). */
   sessionId: string;
-  provider: RuntimeProvider;
+  /** `codex` is retained only to read historical spawn.json; executable specs reject it. */
+  provider: StoredProvider | 'fake';
   /** realpath of the agent cwd (worktree path when a worktree is used). */
   cwd: string;
   /**
@@ -45,7 +46,7 @@ export interface SpawnSpec {
    */
   env: Record<string, string>;
   model?: string;
-  /** claude native `--agent <name>`; codex/pi resolve agent bodies into systemPrompt. */
+  /** claude native `--agent <name>`; Pi resolves agent bodies into systemPrompt. */
   agentName?: string;
   systemPrompt?: SystemPromptFile;
   /** Provider-specific per-session dir (pi --session-dir). */

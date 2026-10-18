@@ -107,7 +107,7 @@ describe('max-concurrency CLI validation', () => {
         maxConcurrency: 3,
         steps: [
           { id: 'a', provider: 'claude', prompt: 'SECRET_PROMPT_DO_NOT_LEAK', needs: [] },
-          { id: 'b', provider: 'codex', needs: ['a'] },
+          { id: 'b', provider: 'pi', needs: ['a'] },
         ],
       },
       attempts: [],

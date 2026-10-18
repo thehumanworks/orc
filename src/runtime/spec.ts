@@ -4,8 +4,14 @@ import { RUNTIME_SCHEMA_VERSION } from './types.ts';
 import type { RuntimeProvider, SpawnSpec } from './types.ts';
 import { sessionPaths } from './layout.ts';
 import { assertValidSessionId, readJsonFile, writeFileAtomic } from './fsutil.ts';
+import { assertProvider, validateModel } from '../providers.ts';
+import { legacyCodexSessionError } from '../legacy-codex.ts';
 
-const PROVIDERS: ReadonlySet<RuntimeProvider> = new Set(['claude', 'codex', 'pi', 'fake']);
+/** Historical specs can be read and stopped, but never launched or sent new work. */
+export function assertExecutableSpec(spec: SpawnSpec): asserts spec is SpawnSpec & { provider: RuntimeProvider } {
+  if (spec.provider === 'codex') throw legacyCodexSessionError(spec.sessionId);
+  if (spec.provider !== 'fake') assertProvider(spec.provider);
+}
 
 export function validateSpawnSpec(spec: SpawnSpec): void {
   if (!spec || typeof spec !== 'object') throw new Error('spawn spec must be an object');
@@ -13,7 +19,8 @@ export function validateSpawnSpec(spec: SpawnSpec): void {
     throw new Error(`spawn spec version ${String(spec.version)} unsupported (want ${RUNTIME_SCHEMA_VERSION})`);
   }
   assertValidSessionId(spec.sessionId);
-  if (!PROVIDERS.has(spec.provider)) throw new Error(`unknown provider '${String(spec.provider)}'`);
+  assertExecutableSpec(spec);
+  if (spec.provider !== 'fake') validateModel(spec.provider, spec.model);
   if (typeof spec.cwd !== 'string' || !path.isAbsolute(spec.cwd)) {
     throw new Error(`spawn spec cwd must be an absolute path (got '${String(spec.cwd)}')`);
   }

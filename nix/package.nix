@@ -105,7 +105,7 @@ stdenvNoCC.mkDerivation (finalAttrs: {
   };
 
   meta = {
-    description = "Run claude, codex and pi coding agents as durable, detached sessions";
+    description = "Run Pi and Claude coding agents as durable, detached sessions";
     homepage = "https://github.com/thehumanworks/orc";
     # No license: the repository has no LICENSE file and package.json no "license" field.
     mainProgram = "orc";

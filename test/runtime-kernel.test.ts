@@ -310,9 +310,10 @@ describe('session locks', () => {
 
 describe('providers registry', () => {
   test('every runtime provider resolves to its own factory', async () => {
-    for (const p of ['fake', 'claude', 'codex', 'pi'] as const) {
+    for (const p of ['fake', 'claude', 'pi'] as const) {
       expect((await getRuntimeFactory(p)).provider).toBe(p);
     }
+    await expect(getRuntimeFactory('codex' as never)).rejects.toThrow(/removed|unknown runtime provider/);
     await expect(getRuntimeFactory('nope' as never)).rejects.toThrow(/unknown runtime provider/);
   });
 });

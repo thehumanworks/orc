@@ -21,7 +21,7 @@ import type {
   WorkflowRun,
   WorkflowRunStatus,
 } from './run-schema.ts';
-import type { AgentState, ExecutionPolicy, Provider } from './types.ts';
+import type { AgentState, ExecutionPolicy, StoredProvider } from './types.ts';
 import type { DeliveryPhase } from './messages.ts';
 
 export type {
@@ -299,7 +299,7 @@ export function normalizeRun(raw: unknown): WorkflowRun | null {
   if (typeof o.cancelReason === 'string') run.cancelReason = o.cancelReason;
   if (o.policy && typeof o.policy === 'object') run.policy = o.policy as ExecutionPolicy;
   if (o.defaultModels && typeof o.defaultModels === 'object' && !Array.isArray(o.defaultModels)) {
-    const dm: Partial<Record<Provider, string>> = {};
+    const dm: Partial<Record<StoredProvider, string>> = {};
     for (const [p, m] of Object.entries(o.defaultModels as Record<string, unknown>)) {
       if ((p === 'claude' || p === 'codex' || p === 'pi') && typeof m === 'string' && m.length > 0) dm[p] = m;
     }
@@ -313,7 +313,7 @@ export function normalizeRun(raw: unknown): WorkflowRun | null {
         if (!s || typeof s !== 'object') continue;
         const ps = s as Record<string, unknown>;
         if (typeof ps.id !== 'string' || typeof ps.provider !== 'string') continue;
-        const step: PlanStep = { id: ps.id, provider: ps.provider as Provider };
+        const step: PlanStep = { id: ps.id, provider: ps.provider as StoredProvider };
         if (typeof ps.alias === 'string') step.alias = ps.alias;
         if (typeof ps.taskFile === 'string') step.taskFile = ps.taskFile;
         if (typeof ps.prompt === 'string') step.prompt = ps.prompt;
@@ -424,7 +424,7 @@ function normalizeStepResult(raw: unknown): StepResult | null {
   const result: StepResult = {
     id: r.id,
     sessionId: typeof r.sessionId === 'string' ? r.sessionId : '',
-    provider: r.provider as Provider,
+    provider: r.provider as StoredProvider,
     state: (typeof r.state === 'string' ? r.state : 'failed') as AgentState,
     ok: r.ok === true,
     commitsAhead: typeof r.commitsAhead === 'number' ? r.commitsAhead : 0,
@@ -465,7 +465,7 @@ function normalizeAttempt(raw: unknown): StepAttempt | null {
     attemptId: x.attemptId,
     attemptNumber: x.attemptNumber,
     stepId: x.stepId,
-    provider: x.provider as Provider,
+    provider: x.provider as StoredProvider,
     phase: x.phase as AttemptPhase,
     createdAt,
     startedAt: typeof x.startedAt === 'string' ? x.startedAt : createdAt,

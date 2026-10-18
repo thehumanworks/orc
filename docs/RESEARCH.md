@@ -4,6 +4,8 @@
 > tmux driver decision (§F.16c) is superseded by [`DESIGN-runtime.md`](DESIGN-runtime.md); orc no
 > longer uses tmux, panes or TUI scraping. Tool versions below are those of the time. For the
 > current system see [`ARCHITECTURE.md`](ARCHITECTURE.md).
+> Codex-specific execution and agent-lookup recommendations below are also historical; the
+> current [Pi migration](MIGRATION-pi.md) delegates those agents to Pi.
 
 Every claim below is backed by a command actually run on this machine
 (Bun 1.3.14, node v25.9.0, claude 2.1.169, codex-cli 0.137.0, pi 0.79.0,

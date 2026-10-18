@@ -5,7 +5,7 @@
  * Uses structural / local types for phase-3 fields to avoid circular type imports
  * with verification/artifacts modules (callers re-export richer types from workflow).
  */
-import type { AgentState, Provider, ExecutionPolicy } from './types.ts';
+import type { AgentState, Provider, StoredProvider, ExecutionPolicy } from './types.ts';
 import type { DeliveryPhase } from './messages.ts';
 import type { ProcessIdentity } from './runtime/types.ts';
 
@@ -111,7 +111,7 @@ export interface StepResult {
   id: string;
   /** Short session handle; '' if spawn failed. */
   sessionId: string;
-  provider: Provider;
+  provider: StoredProvider;
   /** TUI/process lifecycle state at settle (NOT success). */
   state: AgentState;
   ok: boolean;
@@ -144,7 +144,7 @@ export interface StepAttempt {
   attemptNumber: number;
   stepId: string;
   phase: AttemptPhase;
-  provider: Provider;
+  provider: StoredProvider;
   /** Short session id once spawn returns. */
   sessionId?: string;
   /** Delivery message id. */
@@ -183,7 +183,7 @@ export interface StepAttempt {
 
 export interface PlanStep {
   id: string;
-  provider: Provider;
+  provider: StoredProvider;
   alias?: string;
   taskFile?: string;
   prompt?: string;
@@ -298,5 +298,5 @@ export interface WorkflowRun {
    * Step default model per provider, fixed when the run started (the CLI's settings.toml
    * `[models]`); resume/retry reuse it.
    */
-  defaultModels?: Partial<Record<Provider, string>>;
+  defaultModels?: Partial<Record<StoredProvider, string>>;
 }

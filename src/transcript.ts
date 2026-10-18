@@ -5,7 +5,7 @@
  * all UI chrome. `orc read` selects from this compact view by default (the session
  * journal is the `--raw` escape hatch).
  */
-import type { Provider } from './types.ts';
+import type { StoredProvider } from './types.ts';
 import { resolveStyle } from './style.ts';
 import type { Attr, Style } from './style.ts';
 
@@ -153,7 +153,7 @@ export function parseClaude(jsonl: string): Turn[] {
 
 /**
  * pi session JSONL (format v3): pi's own `<session-dir>/*_<sid>.jsonl` AND the codex
- * harness's `~/.orc/sessions/<sid>/codex-session.jsonl` (src/codex/session-file.ts).
+ * harness's `~/.orc/sessions/<sid>/codex-session.jsonl` (historical; no longer written by ORC).
  * Conversation lines are `{"type":"message","message":{role,content}}`; `content` is a
  * string or blocks (`text`, `thinking`, pi-ai `toolCall {name, arguments}`, or a
  * claude-style `tool_use {name, input}`). user/assistant text and one-line tool summaries
@@ -219,7 +219,7 @@ function piToolSummary(name: string, input: unknown): string {
 // ---------------------------------------------------------------------------
 
 /** Parse a provider's on-disk JSONL transcript into normalized turns. */
-export function parseTranscript(provider: Provider, jsonl: string): Turn[] {
+export function parseTranscript(provider: StoredProvider, jsonl: string): Turn[] {
   switch (provider) {
     case 'claude':
       return parseClaude(jsonl);

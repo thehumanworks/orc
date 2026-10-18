@@ -151,14 +151,14 @@ describe('agent() rollback when the provider fails to start (D16)', () => {
 
   test('removes the orc-owned system prompt file when spawn fails (no AGENTS.md mutation)', async () => {
     await withHome(async (home) => {
-      const base = await fs.mkdtemp(path.join(os.tmpdir(), 'orc-codex-rb-'));
+      const base = await fs.mkdtemp(path.join(os.tmpdir(), 'orc-pi-rb-'));
       tmpDirs.push(base);
       const repo = path.join(base, 'repo');
       await fs.mkdir(repo, { recursive: true });
       await fs.writeFile(path.join(repo, 'AGENTS.md'), 'user agents\n');
       await expect(
         agent({
-          provider: 'codex',
+          provider: 'pi',
           cwd: repo,
           systemPrompt: 'rollback-persona',
         }),

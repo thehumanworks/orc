@@ -268,7 +268,7 @@ describe('default host routing', () => {
       const g = write(path.join(c.home, 'settings.toml'), 'provider = "gpt"\n');
       const bad = await orc(c, ['list', '--json']);
       expect(bad.code).toBe(1);
-      expect(JSON.parse(bad.out).error).toBe(`${g}: \`provider\` must be claude|codex|pi, got 'gpt'`);
+      expect(JSON.parse(bad.out).error).toBe(`${g}: \`provider\` invalid provider 'gpt' (expected claude|pi)`);
       expect((await orc(c, ['settings'])).err).toContain(`error: ${g}: \`provider\``);
       write(g, 'host = \n');
       expect((await orc(c, ['state', 'x'])).err).toContain(`error: ${g}: invalid TOML`);

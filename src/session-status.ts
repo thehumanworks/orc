@@ -6,13 +6,11 @@
  *   suspended  not live, not stopped, spawn.json present → resumable
  *   spawning   young reservation whose spawn.json is not written yet (spawn in progress)
  *   dead       stopped (kill/takeover), legacy tmux record, record marked dead, no
- *              spawn.json (past the spawn grace), or a codex session from the removed
- *              codex app-server runtime that is not running (it cannot be resumed)
+ *              spawn.json (past the spawn grace), or a session from the removed Codex integration that is not running
  */
 import { readSpawnSpec } from './runtime/spec.ts';
 import { readActorState } from './runtime/actor-state.ts';
 import { leaseLive } from './runtime/client.ts';
-import { isLegacyCodexSpec } from './runtime/providers/codex.ts';
 import type { SessionRecord, SessionStatus } from './types.ts';
 
 /** How liveness is observed. Injectable (tests); default = the kernel. */
@@ -22,7 +20,7 @@ export type LivenessProbe = (rec: SessionRecord) => SessionStatus;
 export const SPAWN_PENDING_GRACE_MS = 600_000;
 
 export function sessionStatusOf(
-  rec: Pick<SessionRecord, 'sessionId' | 'status' | 'legacy'> & { createdAt?: string },
+  rec: Pick<SessionRecord, 'sessionId' | 'status' | 'legacy'> & { createdAt?: string; provider?: SessionRecord['provider'] },
 ): SessionStatus {
   if (rec.legacy) return 'dead';
   try {
@@ -30,7 +28,7 @@ export function sessionStatusOf(
     if (!spec) return isSpawnPending(rec) ? 'spawning' : 'dead';
     const st = readActorState(rec.sessionId);
     if (leaseLive(st)) return 'running';
-    if (isLegacyCodexSpec(spec)) return 'dead';
+    if (spec.provider === 'codex') return 'dead';
     if (rec.status === 'dead' || st?.phase === 'stopped') return 'dead';
     return 'suspended';
   } catch {
@@ -46,10 +44,10 @@ export const kernelLiveness: LivenessProbe = (rec) => sessionStatusOf(rec);
  * progress). Counted against maxConcurrentSessions and never pruned while young.
  */
 export function isSpawnPending(
-  rec: Pick<SessionRecord, 'sessionId' | 'status' | 'legacy'> & { createdAt?: string },
+  rec: Pick<SessionRecord, 'sessionId' | 'status' | 'legacy'> & { createdAt?: string; provider?: SessionRecord['provider'] },
   now: number = Date.now(),
 ): boolean {
-  if (rec.legacy || rec.status === 'dead' || !rec.createdAt) return false;
+  if (rec.legacy || rec.provider === 'codex' || rec.status === 'dead' || !rec.createdAt) return false;
   try {
     if (readSpawnSpec(rec.sessionId)) return false;
   } catch {

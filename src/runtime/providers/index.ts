@@ -5,7 +5,6 @@
 import type { ProviderRuntimeFactory, RuntimeProvider } from '../types.ts';
 import { fakeRuntimeFactory } from './fake.ts';
 import { claudeRuntime } from './claude.ts';
-import { codexRuntime } from './codex.ts';
 import { piRuntime } from './pi.ts';
 
 export async function getRuntimeFactory(provider: RuntimeProvider): Promise<ProviderRuntimeFactory> {
@@ -14,8 +13,6 @@ export async function getRuntimeFactory(provider: RuntimeProvider): Promise<Prov
       return fakeRuntimeFactory;
     case 'claude':
       return claudeRuntime;
-    case 'codex':
-      return codexRuntime;
     case 'pi':
       return piRuntime;
     default:

@@ -1,7 +1,7 @@
 {
   "name": "orc",
   "version": "0.1.0",
-  "description": "Multi-agent orchestration — run claude/codex/pi coding agents as durable, detached sessions driven over structured protocols (codex: a built-in harness on the OpenAI Responses API). SDK + `orc` CLI.",
+  "description": "Multi-agent orchestration \u2014 run Pi and Claude coding agents as durable, detached sessions over structured protocols. OpenAI and Codex models run through Pi. SDK + `orc` CLI.",
   "type": "module",
   "module": "src/index.ts",
   "main": "src/index.ts",
@@ -21,7 +21,7 @@
     "verify:live": "bun scripts/verify-runtime/all.ts",
     "compile:cli": "bun build --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig ./src/cli/index.ts --outfile dist/orc",
     "install:cli": "bun run compile:cli && mv dist/orc ~/.local/bin/orc",
-    "check:compile": "bun run compile:cli && ./dist/orc --version && ./dist/orc __codex-harness --self-test"
+    "check:compile": "bun run compile:cli && bun scripts/verify-runtime/compiled.ts ./dist/orc"
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "2.3.1",
@@ -29,8 +29,6 @@
     "typescript": "^5"
   },
   "dependencies": {
-    "@earendil-works/pi-agent-core": "1.2.0",
-    "@earendil-works/pi-ai": "1.2.0",
     "@modelcontextprotocol/server": "2.3.1",
     "zod": "4.6.5"
   }

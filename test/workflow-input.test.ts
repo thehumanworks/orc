@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { evaluateWorkflowModule } from '../src/workflow-loader.ts';
-import { readRun } from '../src/runs.ts';
+import { listRuns, readRun, writeRun } from '../src/runs.ts';
 import { serveDaemon } from '../src/daemon/server.ts';
 import { plainCliEnv } from './runtime-helpers.ts';
 
@@ -75,6 +75,52 @@ describe('workflow invocation input', () => {
     expect((await evaluateWorkflowModule(({ prompt }: { prompt?: string }) => ({ ...def, name: prompt }), { prompt: 'sync' })).name).toBe('sync');
     expect((await evaluateWorkflowModule(async () => def)).name).toBe('plain');
     await expect(evaluateWorkflowModule(() => ({ name: 'invalid' }))).rejects.toThrow();
+  });
+
+  test('Pi factories preserve their provider and input through detached launch', async () => {
+    await fs.writeFile(file, `export default ({ prompt }) => ({
+      name: 'pi-input', policy: { maxSessions: 0 },
+      steps: [{ id: 'research', provider: 'pi', prompt }],
+    });`);
+    const result = await cli('--local', 'workflow', 'run', file, '--prompt', INPUT, '--detach', '--json');
+    expect(result.stderr).toBe('');
+    expect(result.code).toBe(0);
+    const run = await finished(JSON.parse(result.stdout).runId);
+    expect(run.status).toBe('failed'); // policy prevents starting a real provider
+    expect(run.prompt).toBe(INPUT);
+    expect(run.plan?.steps[0]?.provider).toBe('pi');
+    expect(run.plan?.steps[0]?.prompt).toBe(INPUT);
+    expect(run.attempts?.[0]?.errorMessage).toContain('maxSessions=0 exceeded');
+  });
+
+  test('removed Codex factories fail before foreground or detached run creation', async () => {
+    await fs.writeFile(file, `export default ({ prompt }) => ({
+      name: 'removed-provider', steps: [{ id: 'research', provider: 'codex', prompt }],
+    });`);
+    for (const detached of [false, true]) {
+      const result = await cli('--local', 'workflow', 'run', file, '--prompt', INPUT,
+        ...(detached ? ['--detach'] : []), '--json');
+      expect(result.code).toBe(1);
+      expect(result.stdout + result.stderr).toContain('dedicated codex provider was removed');
+      expect(await listRuns()).toEqual([]);
+    }
+  });
+
+  test('factory runner handoff rejects historical Codex selections without rewriting the run', async () => {
+    const launched = await cli('--local', 'workflow', 'run', file, '--prompt', INPUT, '--json');
+    expect(launched.code).toBe(1);
+    const original = (await readRun(JSON.parse(launched.stdout).id))!;
+    for (const historical of [
+      { ...original, plan: { ...original.plan!, steps: original.plan!.steps.map((step) => ({ ...step, provider: 'codex' as const })) } },
+      { ...original, defaultModels: { codex: 'gpt-5.5' } },
+    ]) {
+      await writeRun(historical);
+      const before = await readRun(original.id);
+      const result = await cli('--local', 'workflow', 'run', file, '--run-id', original.id, '--json');
+      expect(result.code).toBe(1);
+      expect(result.stdout + result.stderr).toContain('dedicated codex provider was removed');
+      expect(await readRun(original.id)).toEqual(before);
+    }
   });
 
   test('foreground CLI expands file input and persists override through resume and retry', async () => {

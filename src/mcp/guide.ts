@@ -84,14 +84,14 @@ Accept/reject loop: on \`REJECT\`, \`send\` the findings to the implementor's se
     body: `- Call \`settings\`: it shows the default provider and the default model per provider (\`[models]\`) configured on this host. \`spawn\` uses them when you omit \`provider\` / \`model\`.
 - Match capability to role: a fast, cheap model for gathering; the strongest available model for implementing; a strong model for judging, from a different provider (or at least a different model) than the implementor.
 - Only use model names you know are configured or that the user named; omit \`model\` to get the provider's default. \`spawn\` returns the model a session uses.
-- Providers: \`claude\` and \`pi\` need their CLI on the host; \`codex\` needs an OpenAI credential on the host. A spawn fails with a clear error when its provider is unavailable: pick another provider.
+- Providers: \`claude\` and \`pi\` need their CLI on the host. For OpenAI/Codex models use \`provider: pi\`, \`model: openai/<model-id>\`; authenticate with Pi /login (OpenAI, Sign in with ChatGPT) or OPENAI_API_KEY. A spawn fails with a clear error when its provider is unavailable: pick another provider.
 - If only one provider is available, diversify within it: a different model or a reviewer persona (an agent definition) for the judge.`,
   },
   {
     slug: 'spawning',
     title: 'Spawning agents',
     body: `- \`alias\`: a workspace-scoped handle (\`@impl-auth\`); \`@alias\` resolves in the current workspace only, \`@workspace:alias\` from elsewhere. The \`id\` spawn returns always works: prefer it.
-- \`system_prompt\` frames the role (appended to the provider's own by default; \`system_prompt_mode: replace\` replaces it). \`agent\` uses a named agent definition instead (\`.claude/agents/<name>.md\`; codex also reads \`.codex/agents/*.toml\`); the two are mutually exclusive.
+- \`system_prompt\` frames the role (appended to the provider's own by default; \`system_prompt_mode: replace\` replaces it). \`agent\` uses a named agent definition instead (\`.claude/agents/<name>.md\`); the two are mutually exclusive.
 - \`worktree: true\` creates a fresh git worktree on its own branch as the agent's cwd (\`branch\` names it); \`cwd\` must be inside a git repository. A fresh worktree has no installed dependencies: tell the agent to install them if it needs to build or test.
 - \`cwd\` is the base directory (default: the server's); \`workspace\` groups sessions (default: the git toplevel of cwd). A reviewer pointed at another agent's worktree with \`cwd\` lands in that worktree's workspace: pass \`workspace\` (the repository root) to keep it with the others.
 - \`prompt\` is optional: spawn without one, then \`send\` the task when you are ready.`,

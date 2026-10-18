@@ -95,12 +95,13 @@ jobs:
           "$bin" --help > help.txt || fail "--help exited non-zero"
           grep -q '^Usage:' help.txt || fail "--help printed no usage"
 
-          # The embedded codex harness passes its offline self-test (no network, no provider CLI).
-          "$bin" __codex-harness --self-test > self-test.json || { cat self-test.json; fail "codex harness self-test exited non-zero"; }
-          jq -r '.checks[] | "  \(.check): \(if .ok then "ok" else "FAILED" end)"' self-test.json ||
-            { cat self-test.json; fail "codex harness self-test printed unexpected JSON"; }
-          jq -e '.ok == true and (.checks | length) > 0 and all(.checks[]; .ok == true)' self-test.json > /dev/null ||
-            { cat self-test.json; fail "codex harness self-test failed"; }
+          # The real compiled binary re-executes actors and drives both retained adapters.
+          # Protocol fixtures are offline; authenticated provider gates are a separate check.
+          bun "$GITHUB_WORKSPACE/scripts/verify-runtime/compiled.ts" "$bin" > protocol-smoke.json ||
+            { cat protocol-smoke.json; fail "Pi/Claude protocol smoke exited non-zero"; }
+          jq -r '.checks[] | "  \(.check): \(if .ok then "ok" else "FAILED" end)"' protocol-smoke.json
+          jq -e '.ok == true and (.checks | length) == 7 and all(.checks[]; .ok == true)' protocol-smoke.json > /dev/null ||
+            { cat protocol-smoke.json; fail "Pi/Claude protocol smoke failed"; }
 
           # No cwd autoload: a broken bunfig.toml would abort startup, a .env would set ORC_HOST.
           mkdir autoload

@@ -2,7 +2,10 @@
  * Core types for the orc SDK.
  */
 
-export type Provider = 'claude' | 'codex' | 'pi';
+export type Provider = 'claude' | 'pi';
+
+/** Provider names in historical records. Codex is readable, never a new execution path. */
+export type StoredProvider = Provider | 'codex';
 
 export type SystemPromptMode = 'append' | 'replace';
 
@@ -71,7 +74,7 @@ export interface ExecutionLineage {
 export interface AgentOptions extends ExecutionLineage {
   provider: Provider;
   model?: string;
-  /** Name of an existing agent definition (claude/codex, project- or user-scoped). */
+  /** Name of an existing agent definition (.claude/agents, project- or user-scoped). */
   agentName?: string;
   /**
    * Orchestrator-local handle for this session. Distinct from agentName/systemPrompt:
@@ -124,7 +127,7 @@ export interface SessionRecord extends ExecutionLineage {
    * kernel once the provider is ready.
    */
   providerSessionId?: string;
-  provider: Provider;
+  provider: StoredProvider;
   model?: string;
   agentName?: string;
   /** Workspace-scoped, reusable active-session alias. */
@@ -142,7 +145,7 @@ export interface SessionRecord extends ExecutionLineage {
   /**
    * Absolute path of the orc-owned system prompt file (~/.orc/sessions/<sid>/
    * system-prompt.md, 0600) the provider reads at launch. Present when a system prompt or
-   * a resolved (codex/pi) agent body applies. Removed with the session dir.
+   * a resolved Pi agent body applies. Removed with the session dir.
    */
   systemPromptPath?: string;
   createdAt: string;
