@@ -145,12 +145,11 @@ async function complete(launch: ProviderLaunch): Promise<ProviderEvent[]> {
   return events;
 }
 
-/** Keep cleanup bounded while allowing Bun to reap a child that is already exiting. */
-async function settlesWithin(pending: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+async function finishesWithin(work: Promise<unknown>, timeoutMs: number): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
-      pending.then(() => true),
+      work.then(() => true),
       new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
     ]);
   } finally {
@@ -285,17 +284,18 @@ suite('OpenAI through the actual Pi integration', () => {
         const retained = fs.readFileSync(transcriptPath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
         expect(retained.slice(0, entries.length)).toEqual(entries);
       } finally {
-        await proc.stdin.end();
-        // EOF makes Pi exit. On macOS a process in its exiting state can still pass
-        // the liveness probe but reject group signals with EPERM before Bun reaps it.
-        // Allow that exit to finish; real termination errors still fail this test.
-        if (!(await settlesWithin(proc.exited, 1_000))) {
+        // EOF asks Pi to shut down normally. Like PiRuntime.close(), wait for that
+        // exit before signalling; macOS CI rejected the immediate group SIGTERM.
+        const inputClosed = Promise.resolve(proc.stdin.end());
+        if (!(await finishesWithin(Promise.all([inputClosed, proc.exited]), 2_000))) {
           await terminateProcessGroup(identity, 1_000);
         }
-        if (!(await settlesWithin(Promise.all([proc.exited, pump, stderr]), 3_000))) {
-          throw new Error('native Pi cleanup did not finish');
+        if (!(await finishesWithin(Promise.all([inputClosed, proc.exited, pump, stderr]), 2_000))) {
+          throw new Error('native Pi continuation cleanup timed out waiting for exit or pipe drain');
         }
       }
-    }, 25_000);
+      // A successful continuation also takes Pi's normal EOF shutdown path.
+      expect(proc.exitCode).toBe(0);
+    }, 30_000); // Two 10s RPC waits plus the bounded EOF/termination/drain cleanup.
   }
 });

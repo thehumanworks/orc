@@ -67,13 +67,17 @@
 
           # The same offline compiled-binary Pi/Claude actor smoke as Bun/native CI.
           smoke = pkgs.runCommand "orc-smoke" {
+            # Session creation uses git to resolve its workspace, including outside a repo.
             nativeBuildInputs = [ orc pkgs.bun pkgs.git ] ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.procps ];
           } ''
             export HOME="$TMPDIR/home" ORC_HOME="$TMPDIR/orc-home"
             mkdir -p "$HOME" "$ORC_HOME"
+            smoke_status=0
             bun ${./scripts/verify-runtime/compiled.ts} ${lib.getExe orc} \
-              --fixtures ${./test/fixtures} --version ${orc.version} > smoke.json || { cat smoke.json; exit 1; }
+              --fixtures ${./test/fixtures} --version ${orc.version} > smoke.json || smoke_status=$?
+            # Print structured failures before propagating their nonzero status.
             cat smoke.json
+            if [ "$smoke_status" -ne 0 ]; then exit "$smoke_status"; fi
             touch $out
           '';
 

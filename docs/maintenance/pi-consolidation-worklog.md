@@ -132,9 +132,81 @@ was explicit before edits; only the coordinator integrates and publishes commits
 
 ## Publication gate
 
-This log records the implementation state prepared for publication. The coordinator publishes
-coherent implementation/documentation commits, opens a PR against `main`, checks hosted CI on
-the latest commit and resolves introduced failures. Post-publication results are recorded in
-the PR description and its GitHub Checks; they are not inferred from local checks. Leave the
-PR open for review and do not merge it. Shell Git push credentials are absent in this environment;
-the authenticated GitHub connector can publish the same verified commit trees instead.
+The implementation and documentation were published as `fb5f40b` and `53d8ee3` in
+[PR #4](https://github.com/thehumanworks/orc/pull/4). The repository owner merged that PR
+at 2026-10-18 12:30:16 UTC and confirmed the merge in the task conversation. The merge commit
+`4b1c2b03a427ff880d5bd473997bb4851870a176` has the same tree as the final verified implementation.
+The coordinator did not merge the PR.
+
+### Follow-up from main
+
+At the owner's request, remaining hosted-CI corrections use a new branch, `fix/pi-contract-ci`,
+from that merge commit. The follow-up PR must remain open for review. No unrelated local changes
+were present when the branch was created.
+
+Hosted checks on the original PR head `53d8ee3` exposed two introduced verification defects:
+
+| Check | Observed result and correction |
+| --- | --- |
+| [Linux/macOS tests and native binaries](https://github.com/thehumanworks/orc/actions/runs/39127536223) | Linux tests and all four compiled-binary smoke jobs passed. The macOS continuation test passed its history/model/persona assertions, then failed during teardown with `EPERM` while signalling Pi immediately after closing stdin. Give Pi a bounded orderly EOF shutdown before process-group termination; retain the assertions and failing cleanup errors. |
+| [Nix on Linux x64/ARM and macOS ARM](https://github.com/thehumanworks/orc/actions/runs/39127536233) | Dependency hashes and ORC compilation succeeded on all three platforms; the new smoke failed. A minimal-PATH reproduction confirmed `git` was missing when session spawn resolves its workspace. Add Git to the smoke inputs and print failure JSON before propagating the nonzero status. |
+
+The validation agent owns `flake.nix`; the integration agent owns the native Pi continuation
+test cleanup. The durability agent independently reviews both changes, and the coordinator
+owns this log, combined verification and publication. Production provider and process code
+remain outside this follow-up's scope. Both fixes passed independent review with no unresolved
+material findings. The coordinator also reviewed the complete diff.
+
+Follow-up verification before the next concurrent main update:
+
+- Exact Pi 1.2.0 OpenAI and lifecycle contracts: **17 passed / 0 failed**, 99 assertions.
+  Both native continuation cases now also require normal exit code 0. The test deadline allows
+  the existing two RPC deadlines and the bounded EOF/termination/pipe-drain cleanup.
+- The exact Nix smoke shell fragment, with a minimal PATH: without Git, **exit 1** with both
+  provider errors printed and no success marker; adding Git, **7/7 checks passed**, exit 0,
+  success marker created and empty stderr. This establishes the dependency and diagnostic
+  correction locally; it does not substitute for a hosted Nix build.
+- Coordinator's full suite with the exact Pi test install: **944 passed / 14 skipped / 0 failed**,
+  **10,395 assertions**, 63 files. The 14 skips remain the opt-in authenticated Claude contract.
+- Coordinator's typecheck: **PASS**. Final compiled smoke: **7/7 PASS**; 183 bundled modules.
+  `git diff --check`: **PASS**. No new compiler/build warnings were observed.
+- Live provider access is still blocked by the credentials limitation recorded above. These
+  CI corrections add no model/authentication, provider, storage or replay behavior.
+
+[PR #5](https://github.com/thehumanworks/orc/pull/5) was opened with the exact verified tree.
+During publication, the owner also merged [PR #3](https://github.com/thehumanworks/orc/pull/3),
+advancing main to `8fb537ec9b5a2c645dcf0a184c1baa1e638c4db6`. That merge includes workflow
+customization and overlapping Nix/Pi cleanup corrections. The coordinator incorporated that
+main commit into the follow-up branch before requesting fresh CI:
+
+- Preserve all workflow changes from main, including `orc.workflows` in Nix's typecheck sources.
+- Resolve the two overlapping files using the reviewed smoke exit-status handling and bounded
+  Pi cleanup, including the new clean-exit assertion. The Pi test remains byte-identical to the
+  first follow-up's verified version; the Nix smoke fragment also remains unchanged.
+- Both resolutions were independently reviewed against both parents, with no material findings.
+  Comparison against main confirms that only the intended three follow-up files differ.
+
+Final combined verification after incorporating main's additional production code and tests:
+**973 passed / 14 skipped / 0 failed**, **10,562 assertions**, 67 files. Typecheck and all
+**7/7 compiled smoke checks passed**; the added workflow-loader module brings the bundle to
+184 modules. Whitespace checks pass, and no new compiler/build warnings were observed.
+The unchanged Pi contracts and Nix smoke fragment retain their focused evidence above.
+
+Hosted verification at `707e8280f02eef30fd2770037a9149eb800fe505` passed all nine jobs:
+[CI](https://github.com/thehumanworks/orc/actions/runs/39129056216) passed the full Linux/macOS
+suites (973 passed / 14 skipped / 0 failed on each) and all four native binary builds/smokes;
+[Nix](https://github.com/thehumanworks/orc/actions/runs/39129056184) passed flake checks,
+7/7 compiled smokes, builds, binary checks and dev shells on Linux x64/ARM and macOS ARM.
+Both historical Pi continuation cases passed on macOS. Nix warning lines match the successful
+original-baseline run; no new warnings were introduced.
+
+The final architecture audit found no restored Codex execution path or changed Claude adapter.
+Documentation review found one installation clarification tied to the smoke failure: Git is
+needed for ordinary workspace discovery, not only worktrees. The documentation agent corrected
+the README and architecture requirements; the coordinator independently reviewed those two
+lines against the workspace-resolution code. The final follow-up commit changes documentation
+only, and its own latest-commit hosted checks are still required before delivery.
+
+The new PR's latest-commit hosted results are recorded in its description and GitHub Checks.
+Platform success is never inferred from a local Linux run; macOS and all three Nix jobs must
+be checked after publication, and the follow-up PR must remain open.

@@ -29,7 +29,7 @@ ORC retains its shared actor/workflow durability; see the [pi-durable decision](
 | `claude` CLI | for `--provider claude`: on `PATH` (or `ORC_CLAUDE_BIN`), signed in. Verified: 2.1.300 |
 | `pi` CLI | for `--provider pi`, including OpenAI/Codex models; on `PATH`. Reference version: 1.2.0 |
 | OpenAI credential | for Pi's `openai` model provider: Pi `/login` → Sign in with ChatGPT, or `OPENAI_API_KEY`; see [Pi and OpenAI](#pi-and-openaicodex-models) |
-| `git` | only for `--worktree` |
+| `git` | workspace discovery and `--worktree` |
 | `tailscale` | only for `orc daemon` / `--host` |
 
 tmux is **not** used.
