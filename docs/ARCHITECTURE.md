@@ -1,45 +1,42 @@
 # orc — Architecture
 
-orc runs coding agents (`claude`, `codex`, `pi`) as durable sessions for other agents to drive.
+orc runs coding agents (`claude`, `pi`) as durable sessions for other agents to drive.
 Each session is a small **actor process** that drives its provider over a **structured
-protocol** and records every fact in a **journal**. claude and pi are their own CLIs; codex is
-orc's built-in harness (pi-ai + pi-agent-core on the OpenAI Responses API). There is no terminal and no
-screen scraping. Agents hold the reins; humans observe (`read`, `attach`) or take over
+protocol** and records every fact in a **journal**. Claude and Pi are their own CLIs. Pi supplies
+OpenAI/Codex model access through its model-provider layer; there is no ORC-owned model/tool
+harness. There is no terminal or screen scraping. Agents hold the reins; humans observe (`read`, `attach`) or take over
 (`takeover` → `resume`).
 
 This page describes the system as built. [`DESIGN-runtime.md`](DESIGN-runtime.md) has the
 rationale, the options rejected and the implementation notes; [`DESIGN-workflows.md`](DESIGN-workflows.md)
 and [`DESIGN-daemon.md`](DESIGN-daemon.md) cover workflows and the daemon. `RESEARCH.md` is the
 historical (tmux-era) research log.
+The [Pi migration guide](MIGRATION-pi.md) covers the removed dedicated Codex harness and preserved
+historical data. The [pi-durable decision](decisions/pi-durable.md) records why ORC keeps its
+shared session and workflow durability.
 
 ## Stack
 
 - Bun (TypeScript, ESM), `engines.bun >= 1.3.3`. Ships from source or as one binary
   (`bun build --compile`). The kernel uses `Bun.spawn` pipes, `node:fs`, `util.parseArgs`. Runtime
-  dependencies, all pinned exactly: `@earendil-works/pi-ai` and `@earendil-works/pi-agent-core`
-  1.2.0 for the codex harness, and `@modelcontextprotocol/server` 2.3.1 + `zod` 4 for `orc mcp` /
+  dependencies, all pinned exactly: `@modelcontextprotocol/server` 2.3.1 + `zod` 4 for `orc mcp` /
   the daemon's `/mcp` (loaded lazily, so other commands and actors never import them).
 - The only external executables are the claude and pi CLIs (plus `git` for worktrees and
-  `tailscale` for the daemon). codex needs none: the harness is this binary re-executed.
+  `tailscale` for the daemon). Pi library code is owned by the installed Pi distribution, not
+  bundled in ORC. No `pi-durable` dependency or storage migration is introduced.
 - macOS and Linux. Process identity is pid + start time (Linux `/proc/<pid>/stat`, macOS
   `ps -o lstart=`), so a reused pid is never mistaken for a live process.
 
 ## Process model
 
-```
- orc CLI / SDK / daemon (any process, any time)
-   │  write inbox/<ULID>.json            read journal.jsonl, state.json
-   ▼                                          ▲
- ~/.orc/sessions/<sid>/  ◄──── appends ───────┤
-   ▲                                          │
-   │ spawned detached on create / wake        │
- orc __actor <sid>   (one per session: lease, inbox loop, journal writer)
-   │  stdin/stdout pipes, own process group
-   ▼
- claude -p --input-format stream-json … | orc __codex-harness <sid> | pi --mode rpc
-                                           │ HTTPS (Responses API)
-                                           ▼
-                                  api.openai.com/v1/responses
+```mermaid
+flowchart TD
+  Clients["CLI / SDK / HTTP / MCP"] --> Inbox["Durable inbox"]
+  Inbox --> Actor["Session actor"]
+  Actor --> Pi["Pi CLI / RPC"]
+  Actor --> Claude["Claude CLI / stream-json"]
+  Actor --> Journal["ORC journal and state"]
+  Journal --> Clients
 ```
 
 - Clients never talk to the actor directly. They write `spawn.json`/`state.json` under the
@@ -49,6 +46,15 @@ historical (tmux-era) research log.
   `bun src/cli/index.ts`) and spawned detached: new session, no controlling terminal, stdio →
   `actor.log`. It survives its launcher.
 - The provider runs in **its own process group** over pipes. Stopping kills the group.
+
+The layers have separate responsibilities:
+
+| Layer | Owns |
+| --- | --- |
+| ORC integration (`pi` or `claude`) | Detached processes, protocol normalization, mailbox/delivery receipts, session ownership, workflow orchestration |
+| Pi CLI and agent runtime | Agent loop, tools/extensions, compaction, CLI session files, RPC commands |
+| Pi model-provider libraries | Model catalog, provider requests, supported authentication and token refresh; `openai` and `openai-codex` are distinct Pi providers |
+| Claude CLI | Its existing native agent loop, settings, authentication and transcripts |
 
 ## Session kernel (`src/runtime/`)
 
@@ -115,28 +121,34 @@ of normalized events (`ready`, `turn.started`, `assistant.text`, `turn.completed
 `interrupt.acked`, `permission.requested`, `exited`). Outcomes come from protocol events, never exit
 codes. Each runtime appends its raw protocol lines to `provider.jsonl`.
 
-| | claude | codex | pi |
-| --- | --- | --- | --- |
-| process | `claude -p --input-format stream-json --output-format stream-json --verbose --replay-user-messages --permission-mode bypassPermissions --setting-sources user,project,local` | `orc __codex-harness <sid>` (the running orc build); JSONL `init` line carries the spec | `pi --mode rpc -a` |
-| fresh / resume | `--session-id <sid>` / `--resume <sid>` | new / replayed `~/.orc/sessions/<sid>/codex-session.jsonl` (pi session format v3) | same flags both ways: `--session-id` + `--session-dir` |
-| system prompt | `--append-system-prompt-file` / `--system-prompt-file` | harness prompt + file / the file alone | `--append-system-prompt` / `--system-prompt` `<file>` |
-| ready | `initialize` control response | `ready` (credential resolved, model chosen, session loaded) | `get_state` response |
-| ack | `command_lifecycle started` (fallback: replayed user echo) | `turn.started` (prompt accepted) | `prompt` response |
-| outcome | `result` (`terminal_reason` / `is_error`) | pi-agent-core `agent_end`: last assistant `stopReason` | `agent_settled` |
-| interrupt | `control_request interrupt` | `abort` → AbortSignal on the request and tools | `abort` |
-| verified | 2.1.300 | pi-ai / pi-agent-core 1.2.0 (offline; live run pending) | 1.2.0 |
+| | claude | pi |
+| --- | --- | --- |
+| process | `claude -p --input-format stream-json --output-format stream-json --verbose --replay-user-messages --permission-mode bypassPermissions --setting-sources user,project,local` | `pi --mode rpc -a` |
+| fresh / resume | `--session-id <sid>` / `--resume <sid>` | same flags both ways: `--session-id` + `--session-dir` |
+| system prompt | `--append-system-prompt-file` / `--system-prompt-file` | `--append-system-prompt` / `--system-prompt` `<file>` |
+| ready | `initialize` control response | `get_state`; explicit qualified models also require matching Pi `get_available_models` |
+| ack | `command_lifecycle started` (fallback: replayed user echo) | `prompt` response |
+| outcome | `result` (`terminal_reason` / `is_error`) | `agent_settled` |
+| interrupt | `control_request interrupt` | `abort` |
+| reference CLI version | 2.1.300 | 1.2.0 |
 
-Wire types are vendored and version-pinned (`*-protocol.ts`, `src/codex/protocol.ts`); contract
-tests pin each mapping. The codex harness (`src/codex/`): credentials (`auth.ts`: orc store →
-pi's `auth.json` → `OPENAI_API_KEY`; refreshes written back to their source), model choice
-(`models.ts`: `--model` → session model → the live default: first model the ChatGPT account lists,
-or with an API key the newest chat model in pi-ai's catalog; cached 10 min), tools (`tools.ts`:
-read/write/edit/bash/ls), the pi-format session file (`session-file.ts`), `orc login`
-(`login.ts`), and an offline `--self-test` for compiled binaries. There is no context compaction
-yet: a context-window overflow fails the turn with "start a new session". Sessions from the removed
-app-server runtime (provider session id ≠ orc session id) are `dead` and refuse resume.
-claude strips inherited `CLAUDE_CODE_*` variables except auth/backend settings
+Wire types are vendored and version-pinned (`*-protocol.ts`); contract tests pin each mapping.
+For `model: "openai/gpt-5.5"`, ORC passes `--provider openai --model gpt-5.5` to Pi. It checks
+the selected provider/ID and its membership in Pi's configured available-model list before
+publishing readiness; an explicit unknown, unavailable or substituted model fails startup.
+Pi owns that catalog and credentials; ORC keeps no model catalog or authentication store.
+Bare Pi aliases/patterns retain Pi's resolution. Custom model IDs are configured in Pi.
+
+The `openai` provider in Pi 1.2.0 supports both `OPENAI_API_KEY` and `/login openai` →
+**Sign in with ChatGPT**. Its `openai-codex` backend remains a separate Pi provider with separate
+authentication, not a compatibility alias. See [the pinned upstream references](MIGRATION-pi.md#install-and-authenticate-pi).
+
+Claude strips inherited `CLAUDE_CODE_*` variables except auth/backend settings
 (`ORC_CLAUDE_KEEP_ENV` adds more). Permission requests in yolo mode are journaled, then denied.
+
+The removed `src/codex/` harness, protocol adapter, custom tools, login/refresh/model-discovery
+code, direct pi-ai/pi-agent-core dependencies and harness-specific build/test hooks have no
+production replacement inside ORC. Pi's existing CLI supplies those behaviours.
 
 ## Session layer (`src/`)
 
@@ -156,7 +168,7 @@ claude strips inherited `CLAUDE_CODE_*` variables except auth/backend settings
 - **Status** (`session-status.ts`): `running` (lease live), `suspended` (not live, not stopped,
   spawn.json present), `spawning` (a record younger than 10 min without spawn.json: listed,
   counted against concurrency, never pruned; `state` reads `starting`), `dead` (stopped, legacy,
-  marked dead, a codex app-server session, or no spawn.json past the grace).
+  marked dead, an unsupported historical session, or no spawn.json past the grace).
 - **Prune** (`index.ts` `pruneSessions`): re-judges each candidate under its `actor-<sid>` lock and
   removes the record and dir while holding it, so a concurrent `orc resume` (reopen under the same
   lock) either wins or finds nothing. Keeps running/spawning; suspended only with `--suspended`
@@ -166,10 +178,18 @@ claude strips inherited `CLAUDE_CODE_*` variables except auth/backend settings
   the kernel. Pre-actor records normalise to `dead` + `legacy: 'tmux'` (readable, never controlled).
 - **Workspaces and aliases**: workspace = explicit key, else git toplevel, else realpath(cwd);
   `@alias` resolves among active (running/suspended) records of a workspace.
-- **Transcripts** (`provider-cli.ts`): claude `~/.claude/projects/*/<id>.jsonl`; codex
-  `~/.orc/sessions/<sid>/codex-session.jsonl` (parsed with the pi parser); pi
+- **Transcripts** (`provider-cli.ts`): claude `~/.claude/projects/*/<id>.jsonl`; pi
   `get_state.sessionFile` or `<sessionDir>/*_<id>.jsonl`. `orc read` falls back to the journal
-  when none exists yet.
+  when none exists yet. Historical `codex-session.jsonl` files remain readable through the Pi
+  transcript parser; this does not retain their execution implementation.
+- **Removed-provider compatibility**: historical `provider: 'codex'` values remain data in
+  records/specs/runs. No automatic conversion or prompt replay occurs. New Codex inputs and
+  historical `send`/`resume` fail with migration guidance. A harness-session `takeover` stops
+  any old actor, verifies its Pi v3 transcript identity, then prints native Pi `--session`
+  continuation with `--provider openai`, the active branch's model and its explicit prompt/cwd. A
+  missing persona file or unusable migration metadata produces an error. The historical ORC
+  session is not handed back to a new executor. Old app-server rollouts have no automatic
+  importer. See [migration](MIGRATION-pi.md#existing-sessions).
 
 ## CLI and daemon
 
@@ -218,6 +238,10 @@ claude strips inherited `CLAUDE_CODE_*` variables except auth/backend settings
   fails `taken_over` until `orc resume` + `retry`); `retry` appends attempts; `cancel --cascade`
   and `cleanup` only touch sessions proven owned (`rootRunId` / `parentRunId`). Lineage and
   policy propagate through `ORC_*` env vars.
+- **Provider migration**: old Codex plans/attempts stay readable, but their provider or digest
+  is never rewritten to run a different harness. Update the source definition and start a new
+  Pi run with explicit reuse of verified outputs. Pi/Claude-only runs keep the existing
+  adoption, retry and cancellation rules. See [migration](MIGRATION-pi.md#existing-workflows).
 
 ## Storage and privacy
 
@@ -225,11 +249,9 @@ claude strips inherited `CLAUDE_CODE_*` variables except auth/backend settings
 ~/.orc/                     (ORC_HOME)             0700
   registry.json, peers.json                         0600
   locks/                                            0700, lock files 0600
-  auth/chatgpt.json, auth/device-id (ORC_AUTH_DIR)  0700 / 0600 (codex login)
-  cache/codex-models.json                           0600 (model ids per account)
   sessions/<sid>/                                   0700
     spawn.json, state.json, journal.jsonl, provider.jsonl, actor.log,
-    system-prompt.md, codex-session.jsonl, inbox/<ULID>.json   0600
+    system-prompt.md, inbox/<ULID>.json              0600
   transcripts/pi/<sid>/                             0700
   runs/<runId>.json                                 0600 (plan holds step prompts)
   runs/<runId>/  runner.log, <step>.md drops, attempts/, artifacts/, inputs/   0700 / 0600
@@ -238,6 +260,9 @@ claude strips inherited `CLAUDE_CODE_*` variables except auth/backend settings
 The journal holds full prompt and reply text. orc sets these modes explicitly (chmod/fchmod; mkdir
 and open modes are umask-filtered) and tightens older state on its next write
 (`src/private-fs.ts`). `kill --purge` and `prune` remove a session's dir.
+Old Codex credentials, device identity, cached models and Pi-format transcripts are left on
+disk. ORC no longer reads/refreshes those credentials or writes the model cache. Pi's auth and
+settings belong to Pi's own directory; there is no second ORC credential owner.
 
 Locks (`src/lock.ts`, registry lock) are `open('wx')` files recording `{pid, startTime, host,
 token}`. A lock whose owner is provably gone (dead pid, zombie, or a recycled pid with another
@@ -248,10 +273,15 @@ after 5 min. Removal happens under `<lock>.cleanup` after re-reading the owner.
 
 - `bun test`: pure logic, the kernel against the scripted `fake` provider (crash, torn tail,
   stale-provider kill, two senders → one actor), provider mappers over captured CLI output, the
-  codex harness against a local fake OpenAI server (Responses, models, OAuth token), workflows,
-  daemon routes/auth. The CLI suite shadows `tmux` on `PATH` and fails if it is called.
-- `bun run check:compile`: compiles orc and runs `orc __codex-harness --self-test`.
+  Pi model selection, removed-provider/data compatibility, workflows and daemon routes/auth.
+  The CLI suite shadows `tmux` on `PATH` and fails if it is called.
+- `bun run check:compile`: compiles orc and runs `scripts/verify-runtime/compiled.ts`, using
+  isolated state and scripted Pi RPC/Claude stream-json executables to exercise real compiled
+  actors and lifecycle controls. CI and Nix reuse this offline smoke test; it is not live model
+  validation.
 - `bun run typecheck` covers `src`, `test`, `scripts/verify-runtime` and `scripts/dogfood`.
 - Live gates, on an authenticated host: `bun run verify:live` (`scripts/verify-runtime/all.ts`) —
   per-provider runtime gates, CLI end-to-end including SIGKILL → suspended → wake and
-  takeover/resume, a detached workflow, and "tmux never invoked".
+  takeover/resume, a detached workflow, and "tmux never invoked". Missing binaries or known
+  missing credentials are reported as skipped/blocked, never passed live checks. Verification
+  preflight delegates auth status to the native CLI without requesting credential values.
