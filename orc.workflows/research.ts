@@ -17,7 +17,7 @@ export default function research({ prompt }: WorkflowContext): WorkflowDef {
                 id: 'search-query-optimizer',
                 provider: 'pi',
                 model: 'openai/gpt-6.1-sol',
-                reasoningEffort: 'medium',
+                reasoningEffort: 'low',
                 prompt:
                     `Optimize this research question into a precise search brief:\n\n${prompt}\n\n` +
                     'Preserve the intent, state assumptions, and identify useful search terms. ' +
