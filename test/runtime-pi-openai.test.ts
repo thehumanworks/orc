@@ -145,6 +145,19 @@ async function complete(launch: ProviderLaunch): Promise<ProviderEvent[]> {
   return events;
 }
 
+/** Keep cleanup bounded while allowing Bun to reap a child that is already exiting. */
+async function settlesWithin(pending: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      pending.then(() => true),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 beforeAll(() => { root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'orc-pi-openai-'))); });
 afterEach(async () => {
   await Promise.all(runtimes.splice(0).map((runtime) => runtime.close({ graceMs: 500 })));
@@ -273,9 +286,15 @@ suite('OpenAI through the actual Pi integration', () => {
         expect(retained.slice(0, entries.length)).toEqual(entries);
       } finally {
         await proc.stdin.end();
-        await terminateProcessGroup(identity, 1_000);
-        await proc.exited;
-        await pump;
+        // EOF makes Pi exit. On macOS a process in its exiting state can still pass
+        // the liveness probe but reject group signals with EPERM before Bun reaps it.
+        // Allow that exit to finish; real termination errors still fail this test.
+        if (!(await settlesWithin(proc.exited, 1_000))) {
+          await terminateProcessGroup(identity, 1_000);
+        }
+        if (!(await settlesWithin(Promise.all([proc.exited, pump, stderr]), 3_000))) {
+          throw new Error('native Pi cleanup did not finish');
+        }
       }
     }, 25_000);
   }

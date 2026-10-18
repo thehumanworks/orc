@@ -494,7 +494,7 @@ wait options:
   --timeout <sec>       give up after SEC seconds (default 600); returns the last observed state
 
 workflow subcommands:
-  orc workflow run <file> [--detach] [--json] [--max-concurrency N]
+  orc workflow run <file> [--prompt TEXT] [--keep-sessions-on-error] [--detach] [--json] [--max-concurrency N]
                                       Import the file's default-exported WorkflowDef and
                                       run it, streaming step events (or --json the final WorkflowRun).
                                       Exits non-zero if the run failed. --detach runs it as a
@@ -503,6 +503,9 @@ workflow subcommands:
                                       ~/.orc/runs/<runId>/runner.log.
                                       --max-concurrency N (positive int; default 1) allows
                                       dependency-free steps to run concurrently (DAG needs[]).
+                                      --prompt TEXT supplies text to a workflow factory ({prompt}).
+                                      Failed runs clean up sessions by default; use
+                                      --keep-sessions-on-error to retain them for debugging.
   orc workflow list [--json]          List persisted runs from ~/.orc/runs/ (newest first)
   orc workflow status <runId> [--json]  Print a run record (per-step state + attempts). A \`running\`
                                       record whose owner lease/runner has died is reported \`orphaned\`.
@@ -526,7 +529,7 @@ workflow subcommands:
   orc workflow cleanup <runId> [--sessions] [--worktrees] [--json]
                                       Explicit cleanup of owned sessions/worktrees only.
 
-A workflow file default-exports a PLAIN object { name, steps[] } — no import required
+A workflow file default-exports { name, steps[] } or a factory ({prompt}) => that object
 (runWorkflow validates the shape). A step succeeds by an explicit \`done\` predicate over a
 HARD signal (a commit, a file); a worktree step defaults to state==='done' && commitsAhead>=1.
 A non-worktree step with no predicate is reported \`unverified\` — a yield is NOT success.

@@ -28,6 +28,8 @@ import {
   validateWorkflowDef,
   resolveContainedWorkflowFile,
 } from '../workflow.ts';
+import { evaluateWorkflowModule } from '../workflow-loader.ts';
+import type { WorkflowContext } from '../workflow-loader.ts';
 import type { WorkflowDef, WorkflowRun, StepResult } from '../workflow.ts';
 import { schedulingSummary } from '../workflow-scheduler.ts';
 import { readRun, listRuns, FinalizedRunError, LiveOwnerError } from '../runs.ts';
@@ -587,7 +589,11 @@ async function dispatch(
           'resume requires `file` (original workflow path) or a run with sourcePath',
         );
       }
-      const { def, absPath } = await importWorkflowFileWithPath(file);
+      const loaded = await importWorkflowFileWithPath(file, { prompt: existing.prompt });
+      const absPath = loaded.absPath;
+      const def = existing.plan?.keepSessionsOnError === undefined
+        ? loaded.def
+        : { ...loaded.def, keepSessionsOnError: existing.plan.keepSessionsOnError };
       if (body.detach === true) {
         return detachWorkflowControl('resume', runId, def, absPath, ctx);
       }
@@ -633,7 +639,11 @@ async function dispatch(
           : typeof body.stepId === 'string'
             ? body.stepId
             : undefined;
-      const { def, absPath } = await importWorkflowFileWithPath(file);
+      const loaded = await importWorkflowFileWithPath(file, { prompt: existing.prompt });
+      const absPath = loaded.absPath;
+      const def = existing.plan?.keepSessionsOnError === undefined
+        ? loaded.def
+        : { ...loaded.def, keepSessionsOnError: existing.plan.keepSessionsOnError };
       if (body.detach === true) {
         return detachWorkflowControl('retry', runId, def, absPath, ctx, stepId);
       }
@@ -708,10 +718,19 @@ async function runWorkflowRoute(req: Request, ctx: DispatchCtx): Promise<Respons
   const file = typeof body.file === 'string' ? body.file : undefined;
   const detach = body.detach === true;
   const maxConcurrency = parseBodyMaxConcurrency(body);
+  if (body.prompt !== undefined && typeof body.prompt !== 'string') {
+    throw new HttpError(400, '`prompt` must be a string');
+  }
+  if (body.keepSessionsOnError !== undefined && typeof body.keepSessionsOnError !== 'boolean') {
+    throw new HttpError(400, '`keepSessionsOnError` must be a boolean');
+  }
+  const prompt = body.prompt as string | undefined;
+  const keepSessionsOnError = body.keepSessionsOnError as boolean | undefined;
 
   if (detach) {
     if (!file) throw new HttpError(400, 'workflow run --detach requires a `file` (a host-local path)');
-    const def = await importWorkflowFile(file);
+    const loaded = await importWorkflowFile(file, { prompt });
+    const def = keepSessionsOnError === undefined ? loaded : { ...loaded, keepSessionsOnError };
     try {
       validateWorkflowDef(maxConcurrency !== undefined ? { ...def, maxConcurrency } : def);
     } catch (e) {
@@ -720,6 +739,7 @@ async function runWorkflowRoute(req: Request, ctx: DispatchCtx): Promise<Respons
     try {
       const launch = await launchDetachedRun(def, path.resolve(file), {
         maxConcurrency,
+        prompt,
         spawn: ctx.spawnRunner,
       });
       return json({ runId: launch.runId, logPath: launch.logPath });
@@ -735,10 +755,11 @@ async function runWorkflowRoute(req: Request, ctx: DispatchCtx): Promise<Respons
   if (body.def && typeof body.def === 'object') {
     def = body.def as WorkflowDef;
   } else if (file) {
-    def = await importWorkflowFile(file);
+    def = await importWorkflowFile(file, { prompt });
   } else {
     throw new HttpError(400, 'workflow run requires `file` (a host-local path) or `def` (inline)');
   }
+  if (keepSessionsOnError !== undefined) def = { ...def, keepSessionsOnError };
   if (maxConcurrency !== undefined) {
     def = { ...def, maxConcurrency };
   }
@@ -747,18 +768,19 @@ async function runWorkflowRoute(req: Request, ctx: DispatchCtx): Promise<Respons
   } catch (e) {
     throw new HttpError(400, (e as Error).message);
   }
-  const run = await runWorkflow(def, { maxConcurrency });
+  const run = await runWorkflow(def, { maxConcurrency, prompt, sourcePath: file ? path.resolve(file) : undefined });
   return json(run);
 }
 
 /** Import a host-local workflow file and return its default-exported def (400 on failure). */
-async function importWorkflowFile(file: string): Promise<WorkflowDef> {
-  const { def } = await importWorkflowFileWithPath(file);
+async function importWorkflowFile(file: string, context: WorkflowContext = {}): Promise<WorkflowDef> {
+  const { def } = await importWorkflowFileWithPath(file, context);
   return def;
 }
 
 async function importWorkflowFileWithPath(
   file: string,
+  context: WorkflowContext = {},
 ): Promise<{ def: WorkflowDef; absPath: string }> {
   let absPath: string;
   try {
@@ -771,10 +793,8 @@ async function importWorkflowFileWithPath(
     }
   }
   try {
-    const mod = (await import(absPath)) as { default?: WorkflowDef };
-    if (!mod.default) throw new Error(`workflow file '${file}' has no default export`);
-    validateWorkflowDef(mod.default);
-    return { def: mod.default, absPath };
+    const mod = (await import(absPath)) as { default?: unknown };
+    return { def: await evaluateWorkflowModule(mod.default, context), absPath };
   } catch (e) {
     if (e instanceof HttpError) throw e;
     throw new HttpError(400, `failed to import workflow '${file}': ${(e as Error).message}`);
