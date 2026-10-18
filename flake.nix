@@ -67,7 +67,7 @@
 
           # The same offline compiled-binary Pi/Claude actor smoke as Bun/native CI.
           smoke = pkgs.runCommand "orc-smoke" {
-            nativeBuildInputs = [ orc pkgs.bun ] ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.procps ];
+            nativeBuildInputs = [ orc pkgs.bun pkgs.git ] ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.procps ];
           } ''
             export HOME="$TMPDIR/home" ORC_HOME="$TMPDIR/orc-home"
             mkdir -p "$HOME" "$ORC_HOME"
