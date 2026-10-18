@@ -54,7 +54,7 @@ jobs:
           got="$(./result/bin/orc --version)"
           echo "--version: $got"
           [ "$got" = "$want" ] || { echo "::error title=nix build::--version printed '$got', want '$want'"; exit 1; }
-          ./result/bin/orc __codex-harness --self-test
+          ./result/bin/orc --help > /dev/null
 
       - name: Dev shell
         run: nix develop -c bun --version

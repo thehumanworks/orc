@@ -30,6 +30,7 @@ const flag = (name: string): string | undefined => {
   return i >= 0 ? argv[i + 1] : undefined;
 };
 const sessionId = flag('--session-id') ?? 'fake';
+const model = { id: flag('--model') ?? 'fake-chat', provider: flag('--provider') ?? 'fake' };
 const sessionDir = flag('--session-dir') ?? process.cwd();
 fs.mkdirSync(sessionDir, { recursive: true });
 const sessionFile = path.join(sessionDir, `0000_${sessionId}.jsonl`);
@@ -96,6 +97,9 @@ rl.on('line', (line) => {
     return;
   }
   switch (cmd.type) {
+    case 'get_available_models':
+      out({ id: cmd.id, type: 'response', command: 'get_available_models', success: true, data: { models: [model] } });
+      return;
     case 'get_state':
       out({
         id: cmd.id,
@@ -103,7 +107,7 @@ rl.on('line', (line) => {
         command: 'get_state',
         success: true,
         data: {
-          model: { id: 'fake-chat', provider: 'fake' },
+          model,
           thinkingLevel: 'off',
           sessionFile,
           sessionId,

@@ -30,6 +30,8 @@ import nodeFs from 'node:fs';
 import path from 'node:path';
 import type { Provider } from './types.ts';
 import { ORC_ENV } from './types.ts';
+import { PROVIDERS, assertProvider, isProvider, validateModel } from './providers.ts';
+export { isProvider } from './providers.ts';
 import { globalSettingsPath } from './paths.ts';
 import { DEFAULT_DAEMON_PORT, normalizeHost } from './daemon/peers.ts';
 import type { PeerEntry } from './daemon/peers.ts';
@@ -40,7 +42,7 @@ import type { Style } from './style.ts';
 export const ORC_HOST_ENV = 'ORC_HOST';
 /** A project-local settings file, relative to the directory it applies to. */
 export const LOCAL_SETTINGS_FILE = path.join('.orc', 'settings.toml');
-export const SETTINGS_PROVIDERS: readonly Provider[] = ['claude', 'codex', 'pi'];
+export const SETTINGS_PROVIDERS: readonly Provider[] = PROVIDERS;
 
 /** A settings file (or ORC_HOST) is unusable: the message names the file/var and the key. */
 export class SettingsError extends Error {
@@ -154,10 +156,6 @@ export interface LoadSettingsOptions {
   fs?: SettingsFs;
 }
 
-export function isProvider(v: unknown): v is Provider {
-  return typeof v === 'string' && (SETTINGS_PROVIDERS as readonly string[]).includes(v);
-}
-
 /**
  * Whether this process runs inside an orc session. Every session's provider env carries
  * `ORC_PARENT_SESSION_ID` (the spawning session) and `ORC_DEPTH` >= 1 (agent.ts lineage
@@ -222,7 +220,7 @@ export function parseSettingsToml(text: string, file: string): ParsedSettingsFil
       }
       case 'provider': {
         const p = typeof v === 'string' ? v.trim() : v;
-        if (!isProvider(p)) throw invalid(file, 'provider', `must be claude|codex|pi, got ${describe(v)}`);
+        try { assertProvider(p); } catch (e) { throw invalid(file, 'provider', (e as Error).message); }
         values.provider = p;
         break;
       }
@@ -231,6 +229,9 @@ export function parseSettingsToml(text: string, file: string): ParsedSettingsFil
           throw invalid(file, 'models', `must be a table ([models] claude = "…"), got ${describe(v)}`);
         }
         for (const [p, m] of Object.entries(v as Record<string, unknown>)) {
+          if (p === 'codex') {
+            throw invalid(file, 'models.codex', 'belongs to the removed Codex integration; move the model to [models].pi as \"openai/<model-id>\" and use provider = \"pi\". Authenticate with Pi /login or OPENAI_API_KEY. See docs/MIGRATION-pi.md.');
+          }
           if (!isProvider(p)) {
             unknown.push(`models.${p}`);
             continue;
@@ -238,6 +239,7 @@ export function parseSettingsToml(text: string, file: string): ParsedSettingsFil
           if (typeof m !== 'string' || m.trim().length === 0) {
             throw invalid(file, `models.${p}`, `must be a non-empty string, got ${describe(m)}`);
           }
+          try { validateModel(p, m.trim()); } catch (e) { throw invalid(file, `models.${p}`, (e as Error).message); }
           values.models[p] = m.trim();
         }
         break;
@@ -449,7 +451,7 @@ export function defaultHostNotice(host: string, from: string): string {
 /**
  * `orc spawn` provider/model: `--provider` > settings `provider`; `--model` > settings
  * `[models].<provider>` > the provider's own default (undefined). A named `--agent` owns its
- * model (a codex TOML `model`, a claude agent's frontmatter), so `[models]` does not apply.
+ * model (Claude's native frontmatter or Pi's own default), so `[models]` does not apply.
  */
 export function resolveSpawnDefaults(input: {
   provider?: string;

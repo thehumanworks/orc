@@ -1,10 +1,9 @@
 /**
  * scripts/verify-runtime/all.ts end to end, FULLY OFFLINE: pi through the conversational
  * stand-in (test/fixtures/pi-chat-fake.ts), claude through the scripted fake
- * (test/fixtures/claude-stream/fake-claude.ts) and codex forced to SKIP. No real provider
+ * (test/fixtures/claude-stream/fake-claude.ts) with unavailable providers reported as SKIP. No real provider
  * is ever launched: ORC_CLAUDE_BIN points at a guaranteed-missing path unless a test passes
- * an explicit --<p>-bin stand-in, and codex finds no OpenAI credential (empty auth dirs, no
- * OPENAI_API_KEY).
+ * an explicit --<p>-bin stand-in. Pi has an isolated configuration and no API key.
  */
 import { afterAll, describe, expect, test } from 'bun:test';
 import fs from 'node:fs';
@@ -19,12 +18,11 @@ const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'orc-verify-all-test-'));
 
 afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }));
 
-/** Offline env: real claude can never be resolved and codex has no credential. */
+/** Offline env: real claude can never be resolved; Pi uses no inherited credential. */
 function offlineEnv(extra: Record<string, string> = {}): Record<string, string> {
   return {
     ...(process.env as Record<string, string>),
     ORC_CLAUDE_BIN: path.join(tmp, 'absent', 'claude'),
-    ORC_AUTH_DIR: path.join(tmp, 'absent', 'orc-auth'),
     PI_CODING_AGENT_DIR: path.join(tmp, 'absent', 'pi-agent'),
     OPENAI_API_KEY: '',
     ...extra,
@@ -85,7 +83,7 @@ async function run(args: string[], env: Record<string, string>) {
 
 describe('verify-runtime/all.ts', () => {
   test(
-    'pi via the stand-in passes every check; claude without a binary and codex without a credential are SKIP; results file is clean',
+    'pi via the stand-in passes every check; claude without a binary is SKIP; results file is clean',
     async () => {
       const results = path.join(tmp, 'results.json');
       // No claude binary, no OpenAI credential; a lineage var that must not leak in.
@@ -94,16 +92,16 @@ describe('verify-runtime/all.ts', () => {
         ORC_HOME: path.join(tmp, 'must-not-be-used'),
       });
       const r = await run(
-        ['--providers', 'claude,codex,pi', '--pi-bin', FAKE, '--no-workflow', '--results', results],
+        ['--providers', 'claude,pi', '--pi-bin', FAKE, '--no-workflow', '--results', results],
         env,
       );
       expect(r.code).toBe(0);
-      expect(r.out).toContain('ALL PASSED');
+      expect(r.out).toContain('NO FAILURES (checks skipped)');
       const j = JSON.parse(fs.readFileSync(results, 'utf8'));
       expect(j.ok).toBe(true);
       expect(j.tmuxShimInvoked).toBe(false);
       const by = (p: string, c: string) => j.checks.find((x: { provider: string; check: string }) => x.provider === p && x.check === c);
-      for (const p of ['claude', 'codex']) {
+      for (const p of ['claude']) {
         expect(by(p, 'preflight').status).toBe('SKIP');
         expect(by(p, 'runtime gate').status).toBe('SKIP');
         expect(by(p, 'e2e').status).toBe('SKIP');
@@ -216,11 +214,42 @@ describe('verify-runtime/all.ts', () => {
     const env = offlineEnv();
     expect((await run(['--bogus'], env)).code).toBe(2);
     expect((await run(['--providers', 'claude,gemini'], env)).code).toBe(2);
-    // codex is orc's built-in harness: there is no codex binary to override.
+    // The removed integration is rejected, with no hidden Codex execution path.
     const cb = await run(['--codex-bin', '/usr/bin/true'], env);
     expect(cb.code).toBe(2);
-    expect(cb.err).toContain('built-in harness');
+    expect(cb.err).toContain('unknown argument');
+    expect((await run(['--providers', 'codex'], env)).code).toBe(2);
+    expect((await run(['--codex-model', 'gpt-5.4-mini'], env)).code).toBe(2);
   });
+
+  test('native credential readiness reports blocked checks without attempting a model request', async () => {
+    const marker = path.join(tmp, 'must-not-start-provider');
+    const fixture = path.join(tmp, 'unauthenticated.ts');
+    fs.writeFileSync(fixture, [
+      "import fs from 'node:fs';",
+      'const args = process.argv.slice(2);',
+      "if (args.includes('--credentials') || args.some((arg) => arg.startsWith('print-'))) throw new Error('unsafe auth mode');",
+      "if (args.includes('--version')) console.log('1.2.0');",
+      "else if (args[0] === 'auth' && args[1] === 'status') console.log(JSON.stringify({ loggedIn: false }));",
+      "else if (args[0] === 'auth' && args[1] === 'check' && args.includes('--no-refresh')) console.log(JSON.stringify({ status: 'not_ready', provider: 'openai', reason: 'credentials_not_configured' }));",
+      `else { fs.writeFileSync(${JSON.stringify(marker)}, 'unexpected model invocation'); process.exit(1); }`,
+    ].join('\n'));
+    const results = path.join(tmp, 'auth-blocked.json');
+    const result = await run([
+      '--providers', 'claude,pi', '--claude-bin', fixture, '--pi-bin', fixture,
+      '--pi-model', 'openai/gpt-5.4-mini', '--results', results,
+    ], offlineEnv());
+    expect(result.code).toBe(0);
+    expect(result.out).not.toContain('ALL PASSED');
+    const report = JSON.parse(fs.readFileSync(results, 'utf8'));
+    for (const provider of ['claude', 'pi']) {
+      const preflight = report.checks.find((row: { provider: string; check: string }) => row.provider === provider && row.check === 'preflight');
+      expect(preflight.status).toBe('SKIP');
+      expect(preflight.detail).toContain('blocked:');
+    }
+    expect(report.checks.filter((row: { status: string }) => row.status === 'FAIL')).toEqual([]);
+    expect(fs.existsSync(marker)).toBe(false);
+  }, 15_000);
 
   test('ourProcs is hermetic: lookalike processes from another ORC_HOME are not ours', async () => {
     const root = fs.mkdtempSync(path.join(tmp, 'hermetic-'));

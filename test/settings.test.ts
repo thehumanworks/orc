@@ -50,11 +50,11 @@ const globalFile = (home: string) => path.join(home, 'settings.toml');
 describe('parse + validate', () => {
   test('the v1 schema', () => {
     const r = parseSettingsToml(
-      'host = " studio:9000 "\nprovider = "codex"\n[models]\nclaude = "haiku"\ncodex = "gpt-5.5"\npi = "openai/gpt-5"\n',
+      'host = " studio:9000 "\nprovider = "pi"\n[models]\nclaude = "haiku"\npi = "openai/gpt-5"\n',
       '/x/settings.toml',
     );
     expect(r).toEqual({
-      values: { host: 'studio:9000', provider: 'codex', models: { claude: 'haiku', codex: 'gpt-5.5', pi: 'openai/gpt-5' } },
+      values: { host: 'studio:9000', provider: 'pi', models: { claude: 'haiku', pi: 'openai/gpt-5' } },
       unknown: [],
     });
     expect(parseSettingsToml('', '/x/settings.toml')).toEqual({ values: { models: {} }, unknown: [] });
@@ -78,7 +78,7 @@ describe('parse + validate', () => {
     ['provider = 3', 'provider'],
     ['models = "haiku"', 'models'],
     ['[models]\nclaude = ""', 'models.claude'],
-    ['[models]\ncodex = 5', 'models.codex'],
+    ['[models]\npi = 5', 'models.pi'],
     ['[models.claude]\nx = 1', 'models.claude'],
   ])('%p → error naming the file and key %p', (text, key) => {
     let err: unknown;
@@ -114,7 +114,7 @@ describe('discovery', () => {
     const { home, dir, env } = sandbox();
     const repo = path.join(dir, 'repo');
     fs.mkdirSync(path.join(repo, '.git'), { recursive: true });
-    write(globalFile(home), 'host = "global-host"\nprovider = "pi"\n[models]\nclaude = "g-claude"\ncodex = "g-codex"\n');
+    write(globalFile(home), 'host = "global-host"\nprovider = "pi"\n[models]\nclaude = "g-claude"\npi = "global-pi"\n');
     write(localFile(repo), 'provider = "claude"\n[models]\npi = "repo-pi"\n');
     const sub = path.join(repo, 'pkg');
     write(localFile(sub), '[models]\nclaude = "sub-claude"\n');
@@ -128,7 +128,7 @@ describe('discovery', () => {
     expect(s.provider).toEqual({ value: 'pi', source: 'global', from: globalFile(home) });
     expect(s.models).toEqual({
       claude: { value: 'sub-claude', source: 'local', from: localFile(sub) },
-      codex: { value: 'g-codex', source: 'global', from: globalFile(home) },
+      pi: { value: 'global-pi', source: 'global', from: globalFile(home) },
     });
     expect(s.host).toEqual({ value: 'global-host', source: 'global', from: globalFile(home) });
     expect(s.files.map((f) => [f.scope, f.status, f.path])).toEqual([
@@ -140,12 +140,12 @@ describe('discovery', () => {
 
     const atRepo = loadSettings({ cwd: repo, env });
     expect(atRepo.provider).toEqual({ value: 'claude', source: 'local', from: localFile(repo) });
-    expect(defaultModelsOf(atRepo)).toEqual({ claude: 'g-claude', codex: 'g-codex', pi: 'repo-pi' });
+    expect(defaultModelsOf(atRepo)).toEqual({ claude: 'g-claude', pi: 'repo-pi' });
   });
 
   test('the search stops at the git toplevel (a linked worktree `.git` file counts)', () => {
     const { dir, env } = sandbox();
-    write(localFile(dir), 'provider = "codex"\n');
+    write(localFile(dir), 'provider = "pi"\n');
     const repo = path.join(dir, 'repo');
     write(path.join(repo, '.git'), 'gitdir: /elsewhere\n');
     const sub = path.join(repo, 'a');
@@ -159,14 +159,14 @@ describe('discovery', () => {
 
   test('outside a repo only the cwd itself is searched', () => {
     const { dir, env } = sandbox();
-    write(localFile(dir), 'provider = "codex"\n');
+    write(localFile(dir), 'provider = "pi"\n');
     const sub = path.join(dir, 'sub');
     fs.mkdirSync(sub);
     const below = loadSettings({ cwd: sub, env });
     expect(below.root).toBeUndefined();
     expect(below.provider).toBeUndefined();
     expect(below.files.filter((f) => f.scope === 'local').map((f) => f.path)).toEqual([localFile(sub)]);
-    expect(loadSettings({ cwd: dir, env }).provider).toEqual({ value: 'codex', source: 'local', from: localFile(dir) });
+    expect(loadSettings({ cwd: dir, env }).provider).toEqual({ value: 'pi', source: 'local', from: localFile(dir) });
   });
 
   test('a local candidate that IS the global file is skipped (running from ~)', () => {
@@ -196,7 +196,7 @@ describe('discovery', () => {
     const { dir, env } = sandbox();
     const repo = path.join(dir, 'repo');
     fs.mkdirSync(path.join(repo, '.git'), { recursive: true });
-    write(localFile(repo), 'provider = "codex"\n');
+    write(localFile(repo), 'provider = "pi"\n');
     const sub = path.join(repo, 'sub');
     fs.mkdirSync(sub);
     const link = path.join(dir, 'elsewhere', 'link');
@@ -326,7 +326,7 @@ describe('host precedence', () => {
 
   test('inside an orc session default hosts are ignored; provider/model defaults still apply', () => {
     const { home, dir, env } = sandbox();
-    write(globalFile(home), 'host = "global-host"\nprovider = "codex"\n[models]\ncodex = "gpt-x"\n');
+    write(globalFile(home), 'host = "global-host"\nprovider = "pi"\n[models]\npi = "gpt-x"\n');
     for (const lineage of [{ ORC_PARENT_SESSION_ID: 'abcd1234' }, { ORC_DEPTH: '1' }, { ORC_DEPTH: '3' }]) {
       const s = loadSettings({ cwd: dir, env: { ...env, ORC_HOST: 'studio', ...lineage } });
       expect(s.nested).toBe(true);
@@ -334,7 +334,7 @@ describe('host precedence', () => {
       expect(s.hostNote).toMatch(/inside an orc session/);
       expect(decideHost({ settings: s })).toEqual({ kind: 'local', why: 'none' });
       expect(decideHost({ host: 'explicit', settings: s })).toMatchObject({ kind: 'remote', host: 'explicit', explicit: true });
-      expect(resolveSpawnDefaults({ settings: s })).toEqual({ provider: 'codex', model: 'gpt-x' });
+      expect(resolveSpawnDefaults({ settings: s })).toEqual({ provider: 'pi', model: 'gpt-x' });
     }
   });
 
@@ -360,18 +360,18 @@ describe('spawn + workflow defaults', () => {
     provider: { value: 'claude' as const, source: 'global' as const, from: '/g' },
     models: {
       claude: { value: 'haiku', source: 'local' as const, from: '/l' },
-      codex: { value: 'gpt-5.5', source: 'global' as const, from: '/g' },
+      pi: { value: 'gpt-5.5', source: 'global' as const, from: '/g' },
     },
   };
   test('--provider > settings provider; --model > [models].<provider> > provider default', () => {
     expect(resolveSpawnDefaults({ settings })).toEqual({ provider: 'claude', model: 'haiku' });
-    expect(resolveSpawnDefaults({ provider: 'codex', settings })).toEqual({ provider: 'codex', model: 'gpt-5.5' });
-    expect(resolveSpawnDefaults({ provider: 'pi', settings })).toEqual({ provider: 'pi' });
+    expect(resolveSpawnDefaults({ provider: 'pi', settings })).toEqual({ provider: 'pi', model: 'gpt-5.5' });
+    expect(resolveSpawnDefaults({ provider: 'pi', settings: { models: {} } })).toEqual({ provider: 'pi' });
     expect(resolveSpawnDefaults({ model: 'opus', settings })).toEqual({ provider: 'claude', model: 'opus' });
     expect(resolveSpawnDefaults({ settings: { models: {} } })).toEqual({});
   });
   test('a named --agent owns its model: [models] does not apply', () => {
-    expect(resolveSpawnDefaults({ provider: 'codex', agent: 'reviewer', settings })).toEqual({ provider: 'codex' });
+    expect(resolveSpawnDefaults({ provider: 'pi', agent: 'reviewer', settings })).toEqual({ provider: 'pi' });
     expect(resolveSpawnDefaults({ agent: 'x', model: 'm', settings })).toEqual({ provider: 'claude', model: 'm' });
   });
 });
@@ -379,7 +379,7 @@ describe('spawn + workflow defaults', () => {
 describe('orc settings view', () => {
   test('values with their source per key, files considered, warnings', () => {
     const { home, dir, env } = sandbox();
-    const g = write(globalFile(home), 'provider = "codex"\nmystery = 1\n');
+    const g = write(globalFile(home), 'provider = "pi"\nmystery = 1\n');
     const l = write(localFile(dir), 'host = "studio"\n[models]\nclaude = "haiku"\n');
     const s = loadSettings({ cwd: dir, env });
     const v = settingsView(s, { peers: [] });
@@ -391,7 +391,7 @@ describe('orc settings view', () => {
     });
     expect(settingsView(s, { peers: [{ host: 'studio' }] }).host.note).toBeUndefined();
     expect(settingsView(s, { local: true }).host).toMatchObject({ value: null, source: 'flag', from: '--local' });
-    expect(v.provider).toEqual({ value: 'codex', source: 'global', from: g });
+    expect(v.provider).toEqual({ value: 'pi', source: 'global', from: g });
     expect(v.models.claude).toEqual({ value: 'haiku', source: 'local', from: l });
     expect(v.models.pi).toMatchObject({ value: null, source: 'default' });
     expect(v.warnings).toEqual([`${g}: unknown setting(s) ignored: mystery`]);

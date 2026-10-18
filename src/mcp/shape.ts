@@ -60,7 +60,8 @@ const HINTS: ReadonlyArray<[RegExp, string]> = [
     /no session found/,
     'list the sessions (all: true includes dead ones and other workspaces). An @alias resolves only in its own workspace: prefer the id that spawn returned.',
   ],
-  [/provider is required/, 'pass provider (claude|codex|pi), or configure a default provider (the settings tool shows it).'],
+  [/codex.*removed|removed.*codex/i, 'use provider pi with model openai/<model-id> for new sessions; authenticate in Pi. Read historical sessions with read; use local orc takeover for a compatible Pi transcript. See docs/MIGRATION-pi.md.'],
+  [/provider is required/, 'pass provider (claude|pi), or configure a default provider (the settings tool shows it).'],
   [/orc resume|is stopped|was stopped/, 'the session was killed or taken over: call resume first.'],
   [/different prompt/, 'that idempotency_key was already used with different text: use a new key.'],
   [
@@ -71,7 +72,7 @@ const HINTS: ReadonlyArray<[RegExp, string]> = [
   [/no run found/, 'check the run id with workflow_list.'],
   [/requires the original workflow file/, 'pass file: the path of the workflow file the run was started from.'],
   [/still has a live owner/, 'the run is still running (workflow_status shows it); cancel it first to resume or retry.'],
-  [/agentName .* not found/, 'define the agent (.claude/agents/<name>.md, or .codex/agents/ for codex) or pass system_prompt instead.'],
+  [/agentName .* not found/, 'define the agent (.claude/agents/<name>.md) or pass system_prompt instead.'],
   [/not a git repo|inside a git repo|git repository/, 'worktree: true needs cwd inside a git repository.'],
   [/out of range/, 'read without index returns the latest turn; full: true returns every turn.'],
   [/not supported over --host/, 'call it without host (it runs on this machine only).'],

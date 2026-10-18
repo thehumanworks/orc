@@ -32,7 +32,7 @@ import type {
 import { ensureSessionDirs, sessionPaths } from './layout.ts';
 import type { SessionPaths } from './layout.ts';
 import { assertValidSessionId } from './fsutil.ts';
-import { readSpawnSpec, writeSpawnSpec } from './spec.ts';
+import { assertExecutableSpec, readSpawnSpec, writeSpawnSpec } from './spec.ts';
 import { JournalWriter, readJournalFile } from './journal.ts';
 import {
   listPending,
@@ -202,6 +202,7 @@ class Actor {
     return withActorLock(this.sid, async () => {
       const spec = readSpawnSpec(this.sid);
       if (!spec) return 'missing';
+      assertExecutableSpec(spec);
       this.spec = spec;
       const st = readActorState(this.sid) ?? initialActorState(this.sid);
       if (st.phase === 'stopped') return 'stopped';
@@ -351,6 +352,7 @@ class Actor {
     this.heartbeat = setInterval(() => void this.beat(), LEASE_HEARTBEAT_MS);
     if (this.shuttingDown) return;
 
+    assertExecutableSpec(this.spec);
     const factory = await getRuntimeFactory(this.spec.provider);
     if (this.shuttingDown) return;
     // Assigned synchronously so a concurrent shutdown always waits for (and closes) it.

@@ -1,6 +1,7 @@
 /**
  * orc workflows — durable multi-step runner (phase 2).
  */
+import { assertProvider, validateModel } from './providers.ts';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -29,7 +30,7 @@ import { assertValidRunId, runInstructionsDir, runResultPath, runAttemptDir } fr
 import { ensurePrivateDir, writePrivateFile } from './private-fs.ts';
 import { isSameProcessAlive } from './runtime/process.ts';
 import type { Turn } from './transcript.ts';
-import type { AgentState, ExecutionPolicy, Provider } from './types.ts';
+import type { AgentState, ExecutionPolicy, Provider, StoredProvider } from './types.ts';
 import { ORC_ENV } from './types.ts';
 import type { WaitForResult } from './session.ts';
 import type { DeliveryPhase, SendResult } from './messages.ts';
@@ -115,7 +116,6 @@ export {
 };
 export type { NormalizedStepGraph, SchedulerSnapshot, StepSchedStatus, StepView } from './workflow-scheduler.ts';
 
-const VALID_PROVIDERS: Provider[] = ['claude', 'codex', 'pi'];
 const DEFAULT_STEP_TIMEOUT_MS = 600_000;
 const LARGE_PROMPT_BYTES = 1024;
 const STEP_ID_MAX_LEN = 128;
@@ -350,6 +350,22 @@ export function assertValidStepId(stepId: string, label = 'step id'): void {
   }
 }
 
+/** All execution defaults share the same provider/model validation as agent(). */
+export function validateModelDefaults(defaults?: Partial<Record<StoredProvider, string>>): void {
+  for (const [provider, model] of Object.entries(defaults ?? {})) {
+    assertProvider(provider);
+    validateModel(provider, model);
+  }
+}
+
+/** Validate historical execution selections before taking ownership or rewriting a run. */
+export function assertRunExecutable(run: WorkflowRun): void {
+  for (const step of [...(run.plan?.steps ?? []), ...run.steps, ...(run.attempts ?? [])]) {
+    assertProvider(step.provider);
+  }
+  validateModelDefaults(run.defaultModels);
+}
+
 export function validateWorkflowDef(def: WorkflowDef): void {
   if (!def || typeof def !== 'object') throw new Error('workflow: definition must be an object with { name, steps }');
   if (!def.name || typeof def.name !== 'string') throw new Error('workflow: `name` is required');
@@ -376,10 +392,10 @@ export function validateWorkflowDef(def: WorkflowDef): void {
     }
     if (seen.has(step.id)) throw new Error(`workflow '${def.name}': duplicate step id '${step.id}'`);
     seen.add(step.id);
-    if (!VALID_PROVIDERS.includes(step.provider)) {
-      throw new Error(
-        `workflow '${def.name}' step '${step.id}': invalid provider '${step.provider}' (claude|codex|pi)`,
-      );
+    try {
+      assertProvider(step.provider);
+    } catch (e) {
+      throw new Error(`workflow '${def.name}' step '${step.id}': ${(e as Error).message}`);
     }
     try {
       validateAlias(step.alias);
@@ -704,7 +720,7 @@ export function nextAttemptNumber(attempts: StepAttempt[] | undefined, stepId: s
 
 export function createAttempt(args: {
   stepId: string;
-  provider: Provider;
+  provider: StoredProvider;
   attemptNumber: number;
   now?: string;
 }): StepAttempt {
@@ -1388,6 +1404,10 @@ async function runWorkflowOwned(
   const effectivePolicy = existing?.policy ?? policy;
   // Recorded defaults win on resume/retry (predictable after a settings change).
   const defaultModels = existing?.defaultModels ?? opts.defaultModels;
+  // Validate before recording the plan or creating any step. Historical defaults are
+  // retained on read, but an obsolete provider requires an explicit new workflow run.
+  if (existing) assertRunExecutable(existing);
+  validateModelDefaults(defaultModels);
   // Ensure plan has normalized maxConcurrency for legacy records.
   if (effectivePlan.maxConcurrency === undefined) {
     effectivePlan.maxConcurrency = 1;
@@ -2154,7 +2174,7 @@ export function assertRecoveryAllowed(run: WorkflowRun, action: 'resume' | 'retr
 
 export interface StepLog {
   step: string;
-  provider: Provider;
+  provider: StoredProvider;
   turns: Turn[];
 }
 
@@ -2232,8 +2252,11 @@ export async function loadWorkflowFile(file: string): Promise<{ def: WorkflowDef
 export function assertRecoveryDefinition(
   existing: WorkflowRun,
   def: WorkflowDef,
-  opts?: { stepId?: string; sourcePath?: string },
+  opts?: { stepId?: string; sourcePath?: string; defaultModels?: Partial<Record<Provider, string>> },
 ): void {
+  validateWorkflowDef(def);
+  assertRunExecutable(existing);
+  validateModelDefaults(existing.defaultModels ?? opts?.defaultModels);
   assertDigestMatches(existing, def, opts?.sourcePath ?? existing.sourcePath ?? existing.workflowSourcePath);
   if (opts?.stepId && !def.steps.some((s) => s.id === opts.stepId)) {
     throw new Error(`run '${existing.id}' has no step '${opts.stepId}'`);
@@ -2286,7 +2309,7 @@ export async function resumeWorkflow(
   if (existing.status === 'done') return existing;
   const sourcePath =
     opts.workflowSourcePath ?? opts.sourcePath ?? existing.sourcePath ?? existing.workflowSourcePath;
-  assertDigestMatches(existing, def, sourcePath);
+  assertRecoveryDefinition(existing, def, { sourcePath, defaultModels: opts.defaultModels });
   // One owner id for the recovery stamp AND the run, so the owner fence sees one owner.
   const ownerId = opts.ownerId ?? randomUUID().slice(0, 8);
   if (existing.status === 'failed' || existing.status === 'orphaned') {
@@ -2328,7 +2351,7 @@ export async function retryWorkflow(
   if (!existing) throw new Error(`no run found for '${runId}'`);
   const sourcePath =
     opts.workflowSourcePath ?? opts.sourcePath ?? existing.sourcePath ?? existing.workflowSourcePath;
-  assertDigestMatches(existing, def, sourcePath);
+  assertRecoveryDefinition(existing, def, { sourcePath, defaultModels: opts.defaultModels });
   if (opts.stepId) {
     const found = def.steps.some((s) => s.id === opts.stepId);
     if (!found) throw new Error(`run '${runId}' has no step '${opts.stepId}'`);

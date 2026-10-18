@@ -445,8 +445,10 @@ describe('pi framing + argv', () => {
       '--mode',
       'rpc',
       '-a',
+      '--provider',
+      'anthropic',
       '--model',
-      'anthropic/claude-x',
+      'claude-x',
       '--append-system-prompt',
       '/o/prompt.md',
       '--session-id',
@@ -471,5 +473,17 @@ describe('pi framing + argv', () => {
       '4a1f0c2e-7b3d-4e5f-9a60-1234abcd0001',
     ]);
     expect(buildPiArgs(s, true).slice(-2)).toEqual(['--session-id', 'prov-1']);
+  });
+
+  test('qualified OpenAI selectors explicitly bind Pi provider; bare selectors stay native', () => {
+    for (const model of ['openai/gpt-5.5', 'openai-codex/gpt-6.1-sol:high', 'openrouter/openai/gpt-5:exacto']) {
+      const slash = model.indexOf('/');
+      const args = buildPiArgs(spec({ model }), false);
+      expect(args.slice(3, 7)).toEqual(['--provider', model.slice(0, slash), '--model', model.slice(slash + 1)]);
+    }
+    const bare = buildPiArgs(spec({ model: 'haiku' }), false);
+    expect(bare).not.toContain('--provider');
+    expect(bare.slice(3, 5)).toEqual(['--model', 'haiku']);
+    expect(() => buildPiArgs(spec({ model: 'openai/' }), false)).toThrow('invalid Pi model');
   });
 });

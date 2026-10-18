@@ -75,7 +75,7 @@ describe('agent() + Session on the actor runtime', () => {
       expect(rec.runtime).toBe('actor');
       expect('tmuxName' in rec).toBe(false);
       const spec = readSpawnSpec(s.sessionId)!;
-      // The provider-side id (server-assigned for the fake, like codex) is on the record.
+      // The provider-side id (server-assigned for the fake, independent of the ORC id) is on the record.
       expect(rec.providerSessionId).toBe(spec.providerSessionId!);
       expect(rec.providerSessionId).toMatch(/^fake-/);
       const readyEntry = s.journal().find((e) => e.type === 'provider.ready');
@@ -240,7 +240,7 @@ describe('agent() + Session on the actor runtime', () => {
   test(
     'prune keeps taken-over sessions (their dir backs the printed resume command) unless --taken-over',
     async () => {
-      const s = await spawn({ provider: 'codex', systemPrompt: 'be terse' });
+      const s = await spawn({ provider: 'pi', systemPrompt: 'be terse' });
       await s.takeover();
       const promptFile = s.toJSON().systemPromptPath!;
       expect(await pruneSessions()).not.toContain(s.id);
@@ -417,9 +417,9 @@ describe('agent() + Session on the actor runtime', () => {
   );
 
   test(
-    'system prompt goes to an orc-owned 0600 file; codex replace mode is supported (D3)',
+    'system prompt goes to an orc-owned 0600 file; Pi replace mode is supported (D3)',
     async () => {
-      const s = await spawn({ provider: 'codex', systemPrompt: 'be terse', systemPromptMode: 'replace' });
+      const s = await spawn({ provider: 'pi', systemPrompt: 'be terse', systemPromptMode: 'replace' });
       const rec = s.toJSON();
       expect(rec.systemPromptPath).toBe(path.join(sessionPaths(s.sessionId).dir, 'system-prompt.md'));
       expect(fs.readFileSync(rec.systemPromptPath!, 'utf8')).toBe('be terse\n');

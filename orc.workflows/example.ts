@@ -4,10 +4,12 @@
  *   orc workflow run orc.workflows/example.ts            # stream step events
  *   orc workflow run orc.workflows/example.ts --json     # final WorkflowRun as JSON
  *
- * Step `a` (claude) writes a token to handoff.txt in the shared cwd; step `b` (codex)
+ * Step `a` (claude) writes a token to handoff.txt in the shared cwd; step `b` (pi)
  * reads that file and echoes the token back. Because the steps omit `cwd`, they share
  * the directory you invoke `orc workflow run` from — run it from a fresh/empty dir so
  * the handoff is unambiguous (b's transcript echoing the token proves b read a's file).
+ * Select the OpenAI model through [models].pi = "openai/<model-id>" in ORC settings;
+ * authenticate with Pi /login openai or OPENAI_API_KEY before running this workflow.
  *
  * NOTE ON THE IMPORT STORY: a WorkflowDef is just a PLAIN object `default`-exported, so
  * this file needs NO runtime import to run — `orc workflow run` imports it and the runner
@@ -36,7 +38,7 @@ export default {
     },
     {
       id: 'b',
-      provider: 'codex',
+      provider: 'pi',
       prompt:
         `Read the file handoff.txt in the current working directory and reply with its ` +
         `exact contents and nothing else.`,

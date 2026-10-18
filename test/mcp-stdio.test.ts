@@ -215,7 +215,7 @@ describe('orc mcp over stdio', () => {
 
   test('wait on a team: mode any returns at the first settled agent; still-running ones are pending', async () => {
     const fast = (await callTool(client, 'spawn', { provider: 'pi', prompt: 'quick one' })).structuredContent!.id as string;
-    const slow = (await callTool(client, 'spawn', { provider: 'codex', prompt: 'HANG forever' })).structuredContent!.id as string;
+    const slow = (await callTool(client, 'spawn', { provider: 'pi', prompt: 'HANG forever' })).structuredContent!.id as string;
     const w = await callTool(client, 'wait', { ids: [fast, slow], mode: 'any', timeout_seconds: 15 });
     expect(w.isError).toBeFalsy();
     expect(w.structuredContent).toMatchObject({ mode: 'any', reached: [fast], pending: [slow] });

@@ -80,17 +80,17 @@ describe('mapSpawnRequest — request → AgentOptions', () => {
   });
   test('maps agent→agentName and passes prompt/model/cwd/workspace', () => {
     const o = mapSpawnRequest({
-      provider: 'codex',
+      provider: 'pi',
       agent: 'reviewer',
       alias: 'codex-debugger',
-      model: 'gpt-5.5',
+      model: 'openai/gpt-5.5',
       prompt: 'hi',
       cwd: '/tmp/x',
       workspace: 'ws',
     });
     expect(o.agentName).toBe('reviewer');
     expect(o.alias).toBe('codex-debugger');
-    expect(o.model).toBe('gpt-5.5');
+    expect(o.model).toBe('openai/gpt-5.5');
     expect(o.prompt).toBe('hi');
     expect(o.cwd).toBe('/tmp/x');
     expect(o.workspace).toBe('ws');

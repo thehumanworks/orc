@@ -1,19 +1,8 @@
-/**
- * `bun build --compile` keeps the codex harness working: the compiled orc passes its
- * offline self-test (`orc __codex-harness --self-test`: embedded pi-ai OAuth loader,
- * Responses streaming, agent loop + bash tool, session file, transcript parser), and the
- * runtime drives the compiled harness through a turn against the fake OpenAI server.
- * The binary also carries its version (`--version`, daemon `/health`) and ignores a `.env`
- * / `bunfig.toml` in its cwd.
- */
+/** Compiled CLI contract: Pi and Claude actors, MCP, daemon, settings and cwd isolation. */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
-import { createCodexRuntime } from '../src/runtime/providers/codex.ts';
-import type { ProviderEvent } from '../src/runtime/types.ts';
-import { startFakeOpenAI, type FakeOpenAI } from './fixtures/openai-fake.ts';
 import { plainCliEnv } from './runtime-helpers.ts';
 
 const REPO = path.resolve(import.meta.dir, '..');
@@ -21,12 +10,11 @@ const PKG = JSON.parse(fs.readFileSync(path.join(REPO, 'package.json'), 'utf8'))
 /**
  * `bun build` flags of every orc binary (package.json `compile:cli`, .github/workflows/build.yml).
  * A compiled Bun executable autoloads `.env` and `bunfig.toml` from its cwd by default, and
- * orc re-execs itself (actors, the codex harness) in agent worktrees: keep both off.
+ * orc re-execs itself (actors) in agent worktrees: keep both off.
  */
 const COMPILE_FLAGS = ['--compile', '--no-compile-autoload-dotenv', '--no-compile-autoload-bunfig'];
-const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'orc-codex-bin-')));
+const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'orc-compiled-bin-')));
 const bin = path.join(root, 'orc');
-let fake: FakeOpenAI;
 let built = false;
 
 /** process.env without ORC_* (the developer's own ORC_HOST etc. must not leak in). */
@@ -37,7 +25,6 @@ function envWithoutOrc(): Record<string, string> {
 }
 
 beforeAll(() => {
-  fake = startFakeOpenAI();
   const r = Bun.spawnSync([process.execPath, 'build', ...COMPILE_FLAGS, path.join(REPO, 'src', 'cli', 'index.ts'), '--outfile', bin], {
     cwd: REPO,
     stdout: 'pipe',
@@ -48,25 +35,26 @@ beforeAll(() => {
 });
 
 afterAll(() => {
-  fake.stop();
   fs.rmSync(root, { recursive: true, force: true });
 });
 
 describe('compiled orc binary', () => {
-  test(
-    '__codex-harness --self-test passes offline (run outside the repo)',
-    () => {
-      expect(built).toBe(true);
-      const r = Bun.spawnSync([bin, '__codex-harness', '--self-test'], { cwd: root, stdout: 'pipe', stderr: 'pipe' });
-      const out = JSON.parse(r.stdout.toString().trim()) as { ok: boolean; checks: Array<{ check: string; ok: boolean }> };
-      expect(out.checks.filter((c) => !c.ok)).toEqual([]);
-      expect(out.ok).toBe(true);
-      expect(out.checks.map((c) => c.check)).toContain('oauth-loader');
-      expect(out.checks.map((c) => c.check)).toContain('settings-toml');
-      expect(r.exitCode).toBe(0);
-    },
-    60_000,
-  );
+  test('the standalone binary drives Pi and Claude actors through the offline protocol smoke', async () => {
+    const proc = Bun.spawn([process.execPath, path.join(REPO, 'scripts', 'verify-runtime', 'compiled.ts'), bin], {
+      cwd: root,
+      env: envWithoutOrc(),
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [out, err] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    expect({ code: await proc.exited, err }).toEqual({ code: 0, err: '' });
+    const result = JSON.parse(out);
+    expect(result.ok).toBe(true);
+    expect(result.checks.filter((check: { ok: boolean }) => !check.ok)).toEqual([]);
+    expect(result.checks.map((check: { check: string }) => check.check)).toEqual(expect.arrayContaining([
+      'version-help-settings', 'cwd-autoload-disabled', 'pi-openai-execution', 'pi-lifecycle', 'claude-execution', 'claude-lifecycle',
+    ]));
+  }, 60_000);
 
   test(
     'the compiled orc reads settings.toml (orc settings --json)',
@@ -209,44 +197,4 @@ describe('compiled orc binary', () => {
     for (const flag of COMPILE_FLAGS) expect(PKG.scripts['compile:cli']).toContain(flag);
   });
 
-  test(
-    'the runtime drives the compiled harness through a turn',
-    async () => {
-      const home = path.join(root, 'home');
-      const orcHome = path.join(root, 'orc-home');
-      fs.mkdirSync(path.join(orcHome, 'auth'), { recursive: true });
-      fs.writeFileSync(
-        path.join(orcHome, 'auth', 'chatgpt.json'),
-        JSON.stringify({ openai: { type: 'oauth', access: 'tok-bin', refresh: 'rt', expires: Date.now() + 3_600_000, clientId: 'c', scopes: [] } }),
-        { mode: 0o600 },
-      );
-      const cwd = fs.mkdtempSync(path.join(root, 'cwd-'));
-      const state = fs.mkdtempSync(path.join(root, 'state-'));
-      const rt = await createCodexRuntime({ argv: [bin] }).start({
-        spec: { version: 1, sessionId: randomUUID(), provider: 'codex', cwd, env: {}, createdAt: new Date().toISOString() },
-        resume: false,
-        env: {
-          ...(process.env as Record<string, string>),
-          HOME: home,
-          ORC_HOME: orcHome,
-          PI_CODING_AGENT_DIR: path.join(home, 'pi'),
-          ORC_CODEX_TEST_ENDPOINT: fake.origin,
-          OPENAI_API_KEY: '',
-        },
-        rawLogPath: path.join(state, 'provider.jsonl'),
-      });
-      const events: ProviderEvent[] = [];
-      const done = (async () => {
-        for await (const e of rt.events()) events.push(e);
-      })();
-      await rt.send('b1', 'hello compiled harness');
-      const deadline = Date.now() + 20_000;
-      while (!events.some((e) => e.type === 'turn.completed') && Date.now() < deadline) await Bun.sleep(20);
-      await rt.close({ graceMs: 2_000 });
-      await done;
-      expect(events.map((e) => e.type)).toEqual(['ready', 'turn.started', 'assistant.text', 'turn.completed', 'exited']);
-      expect((events[0] as Extract<ProviderEvent, { type: 'ready' }>).info).toMatchObject({ model: 'gpt-fake-1', authSource: 'orc' });
-    },
-    60_000,
-  );
 });

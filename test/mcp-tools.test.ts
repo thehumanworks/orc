@@ -506,7 +506,7 @@ describe('argv building (array argv, never a shell)', () => {
       nested: false,
       host: unset,
       provider: { value: 'claude', source: 'global', from: '/h/.orc/settings.toml' },
-      models: { claude: { value: 'model-a', source: 'global', from: '/h/.orc/settings.toml' }, codex: unset, pi: unset },
+      models: { claude: { value: 'model-a', source: 'global', from: '/h/.orc/settings.toml' }, pi: unset },
       files: [],
       warnings: [],
     };

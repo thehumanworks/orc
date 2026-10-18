@@ -1,13 +1,12 @@
 # Task: orc workflows — core runner (feature 2a)
 
 > **Completed** (the feature shipped). Kept as an example task spec for `scripts/dogfood/run.ts`.
-> Written for the pre-actor runtime: tmux- and codex-CLI-specific steps were removed (codex is now
-> orc's built-in harness); other details (e.g. the large-paste bug) are historical. Current
+> Written for the pre-actor runtime: tmux- and codex-CLI-specific steps were removed (OpenAI and Codex models now run through Pi); other details (e.g. the large-paste bug) are historical. Current
 > behaviour: `README.md`, `docs/ARCHITECTURE.md`.
 
 ## Context
 You are an autonomous coding agent in an **isolated git worktree** of `orc` — a tool that drives
-coding agents (claude/codex/pi) as detached sessions, with an SDK + an `orc` CLI. First:
+coding agents (claude/pi) as detached sessions, with an SDK + an `orc` CLI. First:
 `bun install` (no node_modules in the worktree), then read `README.md`, `docs/DESIGN-workflows.md`
 (the design you are implementing), `src/index.ts`, `src/session.ts` (note `state()`, `waitFor()`,
 `readParsed()`), `src/agent.ts`, `src/state.ts` (`AgentState`), and `scripts/dogfood/run.ts` (a
@@ -98,7 +97,7 @@ just a **plain object** `default`-exported — `orc workflow run <file>` dynamic
 package name; the bin is `orc`). `defineWorkflow` is an OPTIONAL typing helper the author may import
 via a relative path for editor types; it must not be required. Add an example `orc.workflows/example.ts`
 that `default`-exports a plain 2-step `WorkflowDef` (step `a` claude writes a unique token to a file in
-a shared cwd, step `b` codex reads + echoes it) that actually runs, so `orc workflow run
+a shared cwd, step `b` Pi with an OpenAI model reads + echoes it) that actually runs, so `orc workflow run
 orc.workflows/example.ts` is a real smoke test.
 
 ## Constraints

@@ -11,6 +11,8 @@
  * model, review with another), hard-signal success (a step "succeeds" only when it produced real
  * evidence — a commit — not merely because the turn yielded), and step-to-step handoff via a shared
  * worktree.
+ * For the Pi reviewer, select [models].pi = "openai/<model-id>" in ORC settings and
+ * authenticate using Pi /login openai or OPENAI_API_KEY on the execution host.
  */
 import type { WorkflowDef } from '../src/workflow.ts'; // adjust path, or delete (type-only)
 
@@ -35,7 +37,7 @@ export default {
     },
     {
       id: 'review',
-      provider: 'codex', // a DIFFERENT provider reviews — diversity catches more
+      provider: 'pi', // choose an OpenAI model to review Claude's implementation
       alias: 'reviewer',
       needs: ['implement'], // explicit dep (also inferred from artifact inputs[].fromStep)
       cwd: '${implement.worktree}', // run in the implementer's worktree to see its diff

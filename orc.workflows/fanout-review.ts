@@ -11,6 +11,8 @@
  * Independent reviewers run concurrently (when maxConcurrency > 1); the merge
  * step waits on all three via `needs`. Artifact inputs from implement are
  * auto-inferred as dependencies (explicit `needs` still recommended for clarity).
+ * Set [models].pi = "openai/<model-id>" in ORC settings for OpenAI reviewers, and
+ * authenticate using Pi /login openai or OPENAI_API_KEY on the execution host.
  */
 import type { WorkflowDef } from '../src/workflow.ts';
 
@@ -31,7 +33,7 @@ export default {
     },
     {
       id: 'review-a',
-      provider: 'codex',
+      provider: 'pi',
       needs: ['implement'],
       cwd: '${implement.worktree}',
       prompt:
@@ -64,7 +66,7 @@ export default {
     },
     {
       id: 'merge-verdict',
-      provider: 'codex',
+      provider: 'pi',
       needs: ['review-a', 'review-b', 'review-c'],
       cwd: '${implement.worktree}',
       prompt:

@@ -104,7 +104,7 @@ describe('runWorkflow with the default executor', () => {
           },
           {
             id: 'two',
-            provider: 'codex',
+            provider: 'pi',
             cwd: work,
             prompt: 'step two after ${one.sessionId}',
             needs: ['one'],

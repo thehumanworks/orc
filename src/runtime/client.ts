@@ -14,7 +14,7 @@ import { LEASE_HEARTBEAT_MS, LEASE_TTL_MS, MAX_CONSECUTIVE_START_FAILURES } from
 import type { ActorStateFile, ProcessIdentity, SpawnSpec } from './types.ts';
 import { ensureSessionDirs, sessionPaths } from './layout.ts';
 import { assertValidSessionId, readFileTail } from './fsutil.ts';
-import { readSpawnSpec, validateSpawnSpec, writeSpawnSpec } from './spec.ts';
+import { assertExecutableSpec, readSpawnSpec, validateSpawnSpec, writeSpawnSpec } from './spec.ts';
 import { JournalCursor, JournalWriter, readJournal } from './journal.ts';
 import { enqueue, listPending, removeInboxItem } from './inbox.ts';
 import {
@@ -300,7 +300,7 @@ export async function ensureAwake(sessionId: string, opts: EnsureAwakeOptions = 
   assertValidSessionId(sessionId);
   await awaitLeaseRenewal(sessionId);
   const r = await withActorLock(sessionId, async (): Promise<EnsureAwakeResult> => {
-    requireSpec(sessionId);
+    assertExecutableSpec(requireSpec(sessionId));
     const st = readActorState(sessionId) ?? initialActorState(sessionId, 'suspended');
     if (leaseLive(st) && st.lease) {
       return { status: 'live', actor: { pid: st.lease.pid, startTime: st.lease.startTime } };
@@ -448,7 +448,7 @@ export async function send(
   assertValidSessionId(sessionId);
   assertValidMessageId(msg.messageId);
   if (typeof msg.text !== 'string') throw new Error('message text must be a string');
-  requireSpec(sessionId);
+  assertExecutableSpec(requireSpec(sessionId));
 
   let ulid = '';
   let duplicate = false;
@@ -710,7 +710,7 @@ export async function reopen(
 ): Promise<{ status: 'reopened' | 'not-stopped' }> {
   assertValidSessionId(sessionId);
   return withActorLock(sessionId, async () => {
-    requireSpec(sessionId);
+    assertExecutableSpec(requireSpec(sessionId));
     const st = readActorState(sessionId);
     // A stop interrupted by an actor crash is finished first, then reopened like any stop.
     if (st && !leaseLive(st) && isAbandonedStop(st)) {

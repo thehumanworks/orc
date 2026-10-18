@@ -276,10 +276,12 @@ describe('--json is never styled', () => {
     expect((await orc(['list', '--all'], { ...empty, FORCE_COLOR: '1' })).out).toBe(`${ESC}[2m(no sessions)${ESC}[22m\n`);
   }, T);
 
-  test('the hidden codex harness is untouched: its stdout stays pure JSON', async () => {
-    const r = await orc(['__codex-harness', '--self-test'], { FORCE_COLOR: '1', CLICOLOR_FORCE: '1' });
-    expect(r.out).not.toContain(ESC);
-    expect(JSON.parse(r.out.trim())).toMatchObject({ ok: true });
+  test('the removed harness is an unknown command with no protocol output, even with color forced', async () => {
+    const r = await orc(['__codex-harness', '--self-test', '--json'], { FORCE_COLOR: '1', CLICOLOR_FORCE: '1' });
+    expect(r.code).toBe(1);
+    expect(r.out).toBe('');
+    expect(r.err).not.toContain(ESC);
+    expect(r.err).toContain("unknown command '__codex-harness'");
   }, T);
 });
 

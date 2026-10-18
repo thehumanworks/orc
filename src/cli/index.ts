@@ -6,6 +6,7 @@
 import path from 'node:path';
 import { parseArgs } from 'node:util';
 import type { ParseArgsConfig } from 'node:util';
+import { assertProvider, validateModel } from '../providers.ts';
 import { agent } from '../agent.ts';
 import { listSessions, getSession, pruneSessions } from '../index.ts';
 import { renderTurns, selectTurns } from '../transcript.ts';
@@ -18,6 +19,7 @@ import {
   cleanupWorkflow,
   reconcileRun,
   assembleStepLogs,
+  assertRunExecutable,
   validateWorkflowDef,
 } from '../workflow.ts';
 import {
@@ -237,7 +239,7 @@ export function readSelectionFromFlags(values: ReadFlagValues): TurnSelection {
 }
 
 /** No provider from --provider or settings.toml. */
-const PROVIDER_REQUIRED = '--provider is required (claude|codex|pi), or set `provider` in settings.toml';
+const PROVIDER_REQUIRED = '--provider is required (claude|pi), or set `provider` in settings.toml';
 
 async function cmdSpawn(args: string[], settings?: Settings): Promise<number> {
   const { values } = parse(args, {
@@ -267,6 +269,13 @@ async function cmdSpawn(args: string[], settings?: Settings): Promise<number> {
   const provider = defaults.provider as Provider | undefined;
   if (!provider) {
     printError(PROVIDER_REQUIRED, json);
+    return 1;
+  }
+  try {
+    assertProvider(provider);
+    validateModel(provider, defaults.model);
+  } catch (e) {
+    printError((e as Error).message, json);
     return 1;
   }
 
@@ -1252,6 +1261,14 @@ async function assertNoLiveOwner(
     printError(`no run found for '${runId}'`, json);
     return null;
   }
+  // Reconciliation may persist running -> orphaned. Refuse historical execution
+  // selections before that write so a rejected migration never rewrites the run.
+  try {
+    assertRunExecutable(existing);
+  } catch (e) {
+    printError((e as Error).message, json);
+    return null;
+  }
   const live = await reconcileRun(existing);
   const isSelf = opts?.asRunner === true && live.runner?.pid === process.pid;
   if (live.status === 'running' && !isSelf) {
@@ -1528,41 +1545,21 @@ async function cmdDaemon(args: string[]): Promise<number> {
 }
 
 /** `orc remote add|list|rm <host>` — manage the trusted-peer file (~/.orc/peers.json). */
-/**
- * `orc login chatgpt [--import-pi] [--no-browser]` | `orc login status [--json]` — the codex
- * harness's OpenAI credentials (src/codex/login.ts; loaded lazily: it pulls in pi-ai).
- */
+/** Compatibility errors only. Pi owns model-provider credentials and login/logout. */
 async function cmdLogin(args: string[]): Promise<number> {
-  const { values, positionals } = parse(args, {
-    'import-pi': { type: 'boolean' },
-    'no-browser': { type: 'boolean' },
-    json: { type: 'boolean' },
-  });
-  const json = jsonFlag(values);
-  const what = positionals[0];
-  const login = await import('../codex/login.ts');
-  if (what === 'status') {
-    const s = await login.loginStatus();
-    if (json) printJson(s);
-    else process.stdout.write(`${login.renderLoginStatus(s, out())}\n`);
-    return s.active === 'error' ? 1 : 0;
-  }
-  if (what === 'chatgpt') {
-    return login.loginChatGPT({ importPi: values['import-pi'] === true, noBrowser: values['no-browser'] === true });
-  }
-  printError(`usage: orc login chatgpt [--import-pi] [--no-browser] | orc login status [--json]`, json);
+  printError(
+    'ORC no longer manages OpenAI credentials. Start pi, run /login, choose OpenAI and Sign in with ChatGPT (or set OPENAI_API_KEY); then use orc spawn --provider pi --model openai/<model-id>. Existing ORC credentials are preserved. See docs/MIGRATION-pi.md.',
+    args.includes('--json'),
+  );
   return 1;
 }
 
-/** `orc logout chatgpt` — remove orc's ChatGPT credential (pi's login is never touched). */
 async function cmdLogout(args: string[]): Promise<number> {
-  const { values, positionals } = parse(args, { json: { type: 'boolean' } });
-  const json = jsonFlag(values);
-  if (positionals[0] !== 'chatgpt') {
-    printError('usage: orc logout chatgpt', json);
-    return 1;
-  }
-  return (await import('../codex/login.ts')).logoutChatGPT();
+  printError(
+    'ORC no longer manages OpenAI credentials. Use /logout in Pi. Old ORC auth files are preserved; see docs/MIGRATION-pi.md for explicit cleanup.',
+    args.includes('--json'),
+  );
+  return 1;
 }
 
 async function cmdRemoteAdmin(args: string[]): Promise<number> {
@@ -1871,6 +1868,13 @@ async function remoteSpawn(client: DaemonClient, args: string[], settings?: Sett
   const provider = defaults.provider;
   if (!provider) {
     printError(PROVIDER_REQUIRED, json);
+    return 1;
+  }
+  try {
+    assertProvider(provider);
+    validateModel(provider, defaults.model);
+  } catch (e) {
+    printError((e as Error).message, json);
     return 1;
   }
   let prompt: string | undefined;
@@ -2535,11 +2539,6 @@ function cmdVersion(args: string[]): number {
 async function main(): Promise<number> {
   // Hidden: the detached per-session actor (src/runtime/actor-main.ts). Not a user command.
   if (process.argv[2] === '__actor') return (await import('../runtime/actor-main.ts')).runActorMain(process.argv.slice(3));
-  // Hidden: the codex harness child the codex runtime spawns (src/codex/harness.ts), and its
-  // offline `--self-test` (used to check a compiled binary).
-  if (process.argv[2] === '__codex-harness') {
-    return (await import('../codex/harness.ts')).runCodexHarnessMain(process.argv.slice(3));
-  }
   // Peel the global `--color[=WHEN]` / `--no-color` and `--host <h>` / `--local` (they may
   // precede the subcommand) BEFORE per-command parsing, which is strict on unknown options.
   const colorFlag = extractColorFlag(process.argv.slice(2));

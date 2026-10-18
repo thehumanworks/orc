@@ -1,6 +1,6 @@
 /**
  * `orc --version` / `-V` and the shared VERSION (package.json, imported statically so a
- * compiled binary embeds it). The compiled-binary check is in codex-compile.test.ts.
+ * compiled binary embeds it). The compiled-binary check is in compiled-cli.test.ts.
  */
 import { afterAll, describe, expect, test } from 'bun:test';
 import fs from 'node:fs';

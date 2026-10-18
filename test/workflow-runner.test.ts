@@ -632,6 +632,18 @@ describe('launch helpers (injected spawner): spawn first, then stamp (D7)', () =
     expect((await readRun(some.runId))!.defaultModels).toEqual({ claude: 'm' });
   });
 
+  test('detached run: invalid model defaults never write a record or start a runner', async () => {
+    const calls: Call[] = [];
+    for (const defaultModels of [{ pi: 'openai/' }, { codex: 'gpt-5.5' }]) {
+      await expect(launchDetachedRun(oneStep, '/abs/wf.ts', {
+        spawn: fakeSpawner(calls),
+        defaultModels: defaultModels as NonNullable<Parameters<typeof launchDetachedRun>[2]>['defaultModels'],
+      })).rejects.toThrow(/model|removed.*pi/);
+      expect(calls).toHaveLength(0);
+      expect(fs.existsSync(path.join(process.env.ORC_HOME!, 'runs'))).toBe(false);
+    }
+  });
+
   test('detached run: spawn failure finalizes the pre-written record as failed', async () => {
     const calls: Call[] = [];
     await expect(launchDetachedRun(oneStep, '/abs/wf.ts', { spawn: failingSpawner(calls) })).rejects.toBeInstanceOf(

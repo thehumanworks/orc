@@ -1,14 +1,13 @@
 /**
  * Synthetic data for the renderer golden tests (test/style-golden.test.ts): covers every
  * branch of the human renderers (session list/detail, workflow events and runs, settings,
- * transcripts, journals, login status). Pure data — no I/O.
+ * transcripts and journals). Pure data — no I/O.
  */
 import type { SessionView, HostSessionView } from '../../src/cli/output.ts';
 import type { WorkflowEvent, WorkflowRun, StepResult } from '../../src/workflow.ts';
 import type { SettingsView } from '../../src/settings.ts';
 import type { Turn } from '../../src/transcript.ts';
 import type { JournalEntry } from '../../src/runtime/types.ts';
-import type { LoginStatus } from '../../src/codex/login.ts';
 
 const T0 = '2026-10-17T09:30:00.000Z';
 const T1 = '2026-10-17T09:41:12.345Z';
@@ -282,7 +281,6 @@ export const settingsViews: SettingsView[] = [
     provider: { value: null, source: 'default', note: 'spawn requires --provider' },
     models: {
       claude: { value: 'haiku', source: 'global', from: '/home/u/.orc/settings.toml' },
-      codex: { value: null, source: 'default', note: "the provider's own default" },
       pi: { value: 'openai/gpt-5-with-a-long-name', source: 'local', from: '/home/u/src/orc/.orc/settings.toml' },
     },
     files: [
@@ -300,7 +298,6 @@ export const settingsViews: SettingsView[] = [
     provider: { value: 'claude', source: 'env', from: 'ORC_PROVIDER' },
     models: {
       claude: { value: null, source: 'default', note: "the provider's own default" },
-      codex: { value: null, source: 'default' },
       pi: { value: null, source: 'default', note: "the provider's own default" },
     },
     files: [
@@ -341,26 +338,4 @@ export const journal: JournalEntry[] = [
   at({ type: 'actor.stopped', reason: 'stop' }),
   at({ type: 'actor.reopened', reason: 'resume' }),
   at({ type: 'actor.stopped', reason: 'error', error: 'lease lost to pid 77' }),
-];
-
-export const loginStatuses: LoginStatus[] = [
-  {
-    active: 'orc',
-    orc: { path: '/home/u/.orc/auth/chatgpt.json', credential: 'oauth (expires in 9d)' },
-    pi: { path: '/home/u/.pi/agent/auth.json', credential: 'none' },
-    openaiApiKey: true,
-  },
-  {
-    active: 'none',
-    orc: { path: '/home/u/.orc/auth/chatgpt.json', credential: 'none' },
-    pi: { path: '/home/u/.pi/agent/auth.json', credential: 'none' },
-    openaiApiKey: false,
-  },
-  {
-    active: 'error',
-    error: 'invalid JSON in /home/u/.orc/auth/chatgpt.json',
-    orc: { path: '/home/u/.orc/auth/chatgpt.json', credential: 'unreadable', error: 'invalid JSON in /home/u/.orc/auth/chatgpt.json' },
-    pi: { path: '/home/u/.pi/agent/auth.json', credential: 'unreadable', error: 'EACCES' },
-    openaiApiKey: false,
-  },
 ];
