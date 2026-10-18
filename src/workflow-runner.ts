@@ -133,7 +133,7 @@ async function stampOrStop(
 export async function launchDetachedRun(
   def: WorkflowDef,
   absFile: string,
-  opts: LaunchRunnerOptions & { maxConcurrency?: number; defaultModels?: Partial<Record<Provider, string>> } = {},
+  opts: LaunchRunnerOptions & { maxConcurrency?: number; defaultModels?: Partial<Record<Provider, string>>; prompt?: string } = {},
 ): Promise<DetachedLaunch> {
   const defForPlan: WorkflowDef =
     opts.maxConcurrency !== undefined ? { ...def, maxConcurrency: opts.maxConcurrency } : def;
@@ -155,6 +155,7 @@ export async function launchDetachedRun(
     plan,
     definitionDigest: planDigest(plan),
     sourcePath: absFile,
+    ...(opts.prompt !== undefined ? { prompt: opts.prompt } : {}),
     attempts: [],
     // Informational until the runner stamps its own identity (D4).
     lease: makeLease(),

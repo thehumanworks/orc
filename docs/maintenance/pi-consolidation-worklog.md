@@ -157,7 +157,7 @@ owns this log, combined verification and publication. Production provider and pr
 remain outside this follow-up's scope. Both fixes passed independent review with no unresolved
 material findings. The coordinator also reviewed the complete diff.
 
-Follow-up verification on the final combined local tree:
+Follow-up verification before the next concurrent main update:
 
 - Exact Pi 1.2.0 OpenAI and lifecycle contracts: **17 passed / 0 failed**, 99 assertions.
   Both native continuation cases now also require normal exit code 0. The test deadline allows
@@ -172,6 +172,25 @@ Follow-up verification on the final combined local tree:
   `git diff --check`: **PASS**. No new compiler/build warnings were observed.
 - Live provider access is still blocked by the credentials limitation recorded above. These
   CI corrections add no model/authentication, provider, storage or replay behavior.
+
+[PR #5](https://github.com/thehumanworks/orc/pull/5) was opened with the exact verified tree.
+During publication, the owner also merged [PR #3](https://github.com/thehumanworks/orc/pull/3),
+advancing main to `8fb537ec9b5a2c645dcf0a184c1baa1e638c4db6`. That merge includes workflow
+customization and overlapping Nix/Pi cleanup corrections. The coordinator incorporated that
+main commit into the follow-up branch before requesting fresh CI:
+
+- Preserve all workflow changes from main, including `orc.workflows` in Nix's typecheck sources.
+- Resolve the two overlapping files using the reviewed smoke exit-status handling and bounded
+  Pi cleanup, including the new clean-exit assertion. The Pi test remains byte-identical to the
+  first follow-up's verified version; the Nix smoke fragment also remains unchanged.
+- Both resolutions were independently reviewed against both parents, with no material findings.
+  Comparison against main confirms that only the intended three follow-up files differ.
+
+Final combined verification after incorporating main's additional production code and tests:
+**973 passed / 14 skipped / 0 failed**, **10,562 assertions**, 67 files. Typecheck and all
+**7/7 compiled smoke checks passed**; the added workflow-loader module brings the bundle to
+184 modules. Whitespace checks pass, and no new compiler/build warnings were observed.
+The unchanged Pi contracts and Nix smoke fragment retain their focused evidence above.
 
 The new PR's latest-commit hosted results are recorded in its description and GitHub Checks.
 Platform success is never inferred from a local Linux run; macOS and all three Nix jobs must

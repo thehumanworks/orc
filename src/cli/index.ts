@@ -19,8 +19,8 @@ import {
   cleanupWorkflow,
   reconcileRun,
   assembleStepLogs,
+  assertRecoveryDefinition,
   assertRunExecutable,
-  validateWorkflowDef,
 } from '../workflow.ts';
 import {
   awaitRunnerHandoff,
@@ -34,6 +34,8 @@ import {
 
 import type { WorkflowDef, WorkflowEvent, WorkflowRun, StepResult } from '../workflow.ts';
 import { readRun, listRuns } from '../runs.ts';
+import { evaluateWorkflowModule } from '../workflow-loader.ts';
+import type { WorkflowContext } from '../workflow-loader.ts';
 import { resolveUntil } from '../state.ts';
 import { isLoopback, resolveBind } from '../daemon/bind.ts';
 import { tailscaleIp4, tailscaleSelf } from '../daemon/tailscale.ts';
@@ -908,6 +910,8 @@ async function cmdWorkflowRun(args: string[], defaultModels?: DefaultModels): Pr
     detach: { type: 'boolean' },
     'run-id': { type: 'string' },
     'max-concurrency': { type: 'string' },
+    prompt: { type: 'string' },
+    'keep-sessions-on-error': { type: 'boolean' },
   });
   const json = jsonFlag(values);
   const file = positionals[0];
@@ -919,31 +923,31 @@ async function cmdWorkflowRun(args: string[], defaultModels?: DefaultModels): Pr
   if (!conc.ok) return conc.code;
   const absFile = path.resolve(file);
 
-  // Dynamically import the file. A WorkflowDef is a PLAIN object default-export — the
-  // file needs no import to work; runWorkflow VALIDATES the shape. (`defineWorkflow` is
-  // an optional typing helper an author may import via a relative path.)
+  const runId = values['run-id'] as string | undefined;
+  const existing = runId ? await readRun(runId) : null;
+  let prompt: string | undefined;
   let def: WorkflowDef;
   try {
-    const mod = (await import(absFile)) as { default?: WorkflowDef };
-    if (!mod.default) {
-      printError(`workflow file '${file}' has no default export`, json);
-      return 1;
-    }
-    def = mod.default;
+    prompt = existing ? existing.prompt : await resolvePromptArg(values.prompt as string | undefined, { requireStdin: false });
+    ({ def } = await loadWorkflowDefFromFile(file, { prompt }));
+    const keep = existing?.plan?.keepSessionsOnError ?? (values['keep-sessions-on-error'] === true ? true : undefined);
+    if (keep !== undefined) def = { ...def, keepSessionsOnError: keep };
+    // The launcher already persisted the expanded plan. Refuse source drift between
+    // launch and handoff, and execute with that recorded plan below.
+    if (existing) assertRecoveryDefinition(existing, def, { sourcePath: absFile });
   } catch (e) {
     printError(`failed to import workflow '${file}': ${(e as Error).message}`, json);
     return 1;
   }
 
   if (values.detach === true) {
-    return cmdWorkflowRunDetached(absFile, def, json, conc.value, defaultModels);
+    return cmdWorkflowRunDetached(absFile, def, json, conc.value, defaultModels, prompt);
   }
 
   let run: WorkflowRun;
   // `--run-id` is the entrypoint a detached runner executes: reuse the id minted by
   // `--detach` and self-report this process as the run's `runner` (the runner
   // re-persists the record from scratch, stamping its own identity on the lease).
-  const runId = values['run-id'] as string | undefined;
   const runner = runId ? await startDetachedRunner(runId, 'run') : undefined;
   // A detached runner runs with what its LAUNCHER recorded (absent = none) — never this
   // host's settings: a daemon launch (over --host) applies no [models], exactly like a
@@ -954,9 +958,11 @@ async function cmdWorkflowRun(args: string[], defaultModels?: DefaultModels): Pr
     // Stream step events to stdout in human mode; --json prints only the final record.
     run = await runWorkflow(def, {
       runId,
+      continueExisting: existing !== null,
       runner,
       signal: term.signal,
       sourcePath: absFile,
+      prompt,
       maxConcurrency: conc.value,
       defaultModels: models,
       onEvent: json ? undefined : (e: WorkflowEvent) => process.stdout.write(renderWorkflowEvent(e, out())),
@@ -1011,9 +1017,10 @@ async function cmdWorkflowRunDetached(
   json: boolean,
   maxConcurrency?: number,
   defaultModels?: DefaultModels,
+  prompt?: string,
 ): Promise<number> {
   try {
-    const launch = await launchDetachedRun(def, absFile, { maxConcurrency, defaultModels });
+    const launch = await launchDetachedRun(def, absFile, { maxConcurrency, defaultModels, prompt });
     if (json) printJson({ runId: launch.runId, logPath: launch.logPath });
     else process.stdout.write(`${out().text(launch.runId)}\n`);
     return 0;
@@ -1236,12 +1243,10 @@ async function detachWorkflowControl(
   }
 }
 
-async function loadWorkflowDefFromFile(file: string): Promise<{ def: WorkflowDef; absPath: string }> {
+async function loadWorkflowDefFromFile(file: string, context: WorkflowContext = {}): Promise<{ def: WorkflowDef; absPath: string }> {
   const absPath = path.resolve(file);
-  const mod = (await import(absPath)) as { default?: WorkflowDef };
-  if (!mod.default) throw new Error(`workflow file '${file}' has no default export`);
-  validateWorkflowDef(mod.default);
-  return { def: mod.default, absPath };
+  const mod = (await import(absPath)) as { default?: unknown };
+  return { def: await evaluateWorkflowModule(mod.default, context), absPath };
 }
 
 /** `orc workflow resume <runId> [workflowFile] [--detach]` */
@@ -1296,7 +1301,8 @@ async function cmdWorkflowResume(args: string[]): Promise<number> {
   }
   const asRunner = values.runner === true;
   const runner = asRunner ? await startDetachedRunner(runId, 'resume') : undefined;
-  if (!(await assertNoLiveOwner(runId, json, { asRunner }))) return 1;
+  const existing = await assertNoLiveOwner(runId, json, { asRunner });
+  if (!existing) return 1;
   if (!file) {
     printError(
       'workflow resume requires the original workflow file (function predicates remain non-portable; prefer verify descriptors)',
@@ -1305,7 +1311,9 @@ async function cmdWorkflowResume(args: string[]): Promise<number> {
     return 1;
   }
   try {
-    const { def, absPath } = await loadWorkflowDefFromFile(file);
+    const loaded = await loadWorkflowDefFromFile(file, { prompt: existing.prompt });
+    const absPath = loaded.absPath;
+    const def = existing.plan?.keepSessionsOnError === undefined ? loaded.def : { ...loaded.def, keepSessionsOnError: existing.plan.keepSessionsOnError };
     if (values.detach === true) {
       return detachWorkflowControl('resume', runId, def, absPath, json);
     }
@@ -1346,7 +1354,8 @@ async function cmdWorkflowRetry(args: string[]): Promise<number> {
   }
   const asRunner = values.runner === true;
   const runner = asRunner ? await startDetachedRunner(runId, 'retry') : undefined;
-  if (!(await assertNoLiveOwner(runId, json, { asRunner }))) return 1;
+  const existing = await assertNoLiveOwner(runId, json, { asRunner });
+  if (!existing) return 1;
   if (!file) {
     printError(
       'workflow retry requires the original workflow file (function predicates remain non-portable; prefer verify descriptors)',
@@ -1355,7 +1364,9 @@ async function cmdWorkflowRetry(args: string[]): Promise<number> {
     return 1;
   }
   try {
-    const { def, absPath } = await loadWorkflowDefFromFile(file);
+    const loaded = await loadWorkflowDefFromFile(file, { prompt: existing.prompt });
+    const absPath = loaded.absPath;
+    const def = existing.plan?.keepSessionsOnError === undefined ? loaded.def : { ...loaded.def, keepSessionsOnError: existing.plan.keepSessionsOnError };
     const stepId = values.step as string | undefined;
     if (values.detach === true) {
       return detachWorkflowControl('retry', runId, def, absPath, json, stepId);
@@ -2188,6 +2199,8 @@ async function remoteWorkflowRun(client: DaemonClient, args: string[]): Promise<
     json: { type: 'boolean' },
     detach: { type: 'boolean' },
     'max-concurrency': { type: 'string' },
+    prompt: { type: 'string' },
+    'keep-sessions-on-error': { type: 'boolean' },
   });
   const json = jsonFlag(values);
   const file = positionals[0];
@@ -2198,10 +2211,13 @@ async function remoteWorkflowRun(client: DaemonClient, args: string[]): Promise<
   const conc = parseMaxConcurrencyFlag(values['max-concurrency'] as string | undefined, json);
   if (!conc.ok) return conc.code;
   try {
+    const prompt = await resolvePromptArg(values.prompt as string | undefined, { requireStdin: false });
     const res = await client.runWorkflow({
       file,
       detach: values.detach === true,
       maxConcurrency: conc.value,
+      prompt,
+      keepSessionsOnError: values['keep-sessions-on-error'] === true ? true : undefined,
     });
     if (isDetachedWorkflowLaunch(res)) {
       if (json) printJson(res);

@@ -91,6 +91,7 @@
                 ./tsconfig.json
                 ./src
                 ./test
+                ./orc.workflows
                 ./scripts
               ];
             };

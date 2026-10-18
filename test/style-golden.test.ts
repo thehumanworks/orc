@@ -127,6 +127,22 @@ describe('colour off is byte-identical to the renderers before styling (main @ 1
     expect(mcpAt).toBeGreaterThan(0);
     expect(rest.slice(mcpAt, mcpAt + mcpSection.length)).toEqual(mcpSection);
     rest.splice(mcpAt, mcpSection.length);
+    // Workflow prompt factories and failed-session retention add flags and guidance.
+    const workflowGuidance = [
+      '                                      --prompt TEXT supplies text to a workflow factory ({prompt}).',
+      '                                      Failed runs clean up sessions by default; use',
+      '                                      --keep-sessions-on-error to retain them for debugging.',
+    ];
+    const workflowAt = rest.indexOf(workflowGuidance[0]!);
+    expect(workflowAt).toBeGreaterThan(0);
+    expect(rest.slice(workflowAt, workflowAt + workflowGuidance.length)).toEqual(workflowGuidance);
+    rest.splice(workflowAt, workflowGuidance.length);
+    const workflowRun = rest.findIndex((line) => line.startsWith('  orc workflow run <file>'));
+    expect(rest[workflowRun]).toBe('  orc workflow run <file> [--prompt TEXT] [--keep-sessions-on-error] [--detach] [--json] [--max-concurrency N]');
+    rest[workflowRun] = '  orc workflow run <file> [--detach] [--json] [--max-concurrency N]';
+    const factoryAt = rest.indexOf('A workflow file default-exports { name, steps[] } or a factory ({prompt}) => that object');
+    expect(factoryAt).toBeGreaterThan(0);
+    rest[factoryAt] = 'A workflow file default-exports a PLAIN object { name, steps[] } — no import required';
     expect(rest.join('\n')).toBe(g('help'));
   });
 });
@@ -334,7 +350,7 @@ describe('colour on: the expected styled output', () => {
       `  ${BC('orc spawn')}  ${C('--provider')} ${w('3', '23')('<claude|pi>')} [options]   Launch a new agent session`,
     );
     expect(lines).toContain(B('Global:'));
-    expect(lines).toContain(`  ${BC('orc workflow run')} ${w('3', '23')('<file>')} [${C('--detach')}] [${C('--json')}] [${C('--max-concurrency')} N]`);
+    expect(lines).toContain(`  ${BC('orc workflow run')} ${w('3', '23')('<file>')} [${C('--prompt')} TEXT] [${C('--keep-sessions-on-error')}] [${C('--detach')}] [${C('--json')}] [${C('--max-concurrency')} N]`);
     // Words with inner hyphens are not mistaken for flags.
     expect(help).toContain('non-zero');
     expect(help).not.toContain(C('-zero'));

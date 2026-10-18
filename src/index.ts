@@ -143,6 +143,7 @@ export type {
   SchedulerSnapshot,
   StepSchedStatus,
 } from './workflow.ts';
+export type { WorkflowContext, WorkflowFactory } from './workflow-loader.ts';
 export {
   assertValidRunId,
   assertValidMessageId,

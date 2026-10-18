@@ -290,6 +290,7 @@ export function normalizeRun(raw: unknown): WorkflowRun | null {
   if (runner) run.runner = runner;
   if (typeof o.definitionDigest === 'string') run.definitionDigest = o.definitionDigest;
   if (typeof o.sourcePath === 'string') run.sourcePath = o.sourcePath;
+  if (typeof o.prompt === 'string') run.prompt = o.prompt;
   if (typeof o.workflowSourcePath === 'string') run.workflowSourcePath = o.workflowSourcePath;
   if (typeof o.rootRunId === 'string') run.rootRunId = o.rootRunId;
   if (typeof o.parentRunId === 'string') run.parentRunId = o.parentRunId;
@@ -334,6 +335,7 @@ export function normalizeRun(raw: unknown): WorkflowRun | null {
         planSteps.push(step);
       }
       const plan: import('./run-schema.ts').WorkflowPlan = { name: p.name, steps: planSteps };
+      if (typeof p.keepSessionsOnError === 'boolean') plan.keepSessionsOnError = p.keepSessionsOnError;
       if (
         typeof p.maxConcurrency === 'number' &&
         Number.isFinite(p.maxConcurrency) &&

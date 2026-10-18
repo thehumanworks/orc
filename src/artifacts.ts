@@ -445,7 +445,7 @@ export async function materializeInput(args: {
   destName?: string;
 }): Promise<string> {
   const dig = args.ref.digest ?? args.ref.sha256;
-  if (!(await verifyStoredBlob(args.runId, dig))) {
+  if (!(await verifyArtifactBlob(args.ref.runId, args.ref))) {
     throw new ArtifactError(
       'TAMPER',
       `artifact '${args.ref.name}' failed hash verification (tampered or missing blob)`,
@@ -453,15 +453,10 @@ export async function materializeInput(args: {
   }
   const destRoot = runStepInputsDir(args.runId, args.stepId);
   ensurePrivateDir(destRoot);
-  const destName = args.destName ?? args.ref.name;
-  if (destName.includes('..') || destName.includes('/') || destName.includes('\\')) {
-    throw new ArtifactError('INVALID_PATH', `invalid dest name '${destName}'`);
-  }
-  const dest = path.join(destRoot, destName);
-  if (!isPathInsideRoot(dest, destRoot)) {
-    throw new ArtifactError('ESCAPE', 'materialize path escapes inputs dir');
-  }
-  const blob = runArtifactBlobPath(args.runId, dig);
+  const destName = assertSafeRelativePath(args.destName ?? args.ref.name);
+  const dest = await resolveContainedPath(destRoot, destName);
+  ensurePrivateDir(path.dirname(dest));
+  const blob = runArtifactBlobPath(args.ref.runId, dig);
   await fs.copyFile(blob, dest);
   await fs.chmod(dest, PRIVATE_FILE_MODE);
   const h = await sha256File(dest);
@@ -492,7 +487,7 @@ export async function materializeArtifact(args: {
     runId: args.runId,
     stepId: '_shared',
     ref: refFromManifest(manifest),
-    destName: args.destRel ? path.basename(args.destRel) : manifest.name,
+    destName: args.destRel ?? manifest.name,
   });
   return { path: dest, manifest };
 }
@@ -503,11 +498,17 @@ export async function materializeArtifact(args: {
  */
 export async function materializeStepInputs(args: {
   runId: string;
+  stepId: string;
   inputs: ArtifactInputDecl[];
   resolve: (fromStep: string, artifactName: string) => ArtifactRef | undefined;
 }): Promise<Record<string, string>> {
   const paths: Record<string, string> = {};
+  const destinations = new Set<string>();
   for (const inp of args.inputs) {
+    assertValidArtifactName(inp.name);
+    if (Object.hasOwn(paths, inp.name)) {
+      throw new ArtifactError('INVALID_DECL', `duplicate input name '${inp.name}'`);
+    }
     const artName = inp.artifact ?? inp.name;
     const ref = args.resolve(inp.fromStep, artName);
     if (!ref) {
@@ -516,13 +517,18 @@ export async function materializeStepInputs(args: {
         `input '${inp.name}': no artifact '${artName}' from step '${inp.fromStep}'`,
       );
     }
+    const destName = assertSafeRelativePath(inp.materializeAs ?? inp.name);
+    if (destinations.has(destName)) {
+      throw new ArtifactError('INVALID_DECL', `duplicate input destination '${destName}'`);
+    }
+    destinations.add(destName);
     const dest = await materializeInput({
       runId: args.runId,
-      stepId: inp.fromStep,
+      stepId: args.stepId,
       ref,
-      destName: inp.materializeAs ? path.basename(inp.materializeAs) : artName,
+      destName,
     });
-    paths[inp.name] = dest;
+    Object.defineProperty(paths, inp.name, { value: dest, enumerable: true });
   }
   return paths;
 }

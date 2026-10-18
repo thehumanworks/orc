@@ -275,6 +275,8 @@ export class DaemonClient {
     detach?: boolean;
     /** Positive integer; omit for workflow default (1). */
     maxConcurrency?: number;
+    prompt?: string;
+    keepSessionsOnError?: boolean;
   }): Promise<WorkflowRun | DetachedWorkflowLaunch> {
     return this.post('/workflows/run', body) as Promise<WorkflowRun | DetachedWorkflowLaunch>;
   }
