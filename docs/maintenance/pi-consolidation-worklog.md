@@ -192,6 +192,21 @@ Final combined verification after incorporating main's additional production cod
 184 modules. Whitespace checks pass, and no new compiler/build warnings were observed.
 The unchanged Pi contracts and Nix smoke fragment retain their focused evidence above.
 
+Hosted verification at `707e8280f02eef30fd2770037a9149eb800fe505` passed all nine jobs:
+[CI](https://github.com/thehumanworks/orc/actions/runs/39129056216) passed the full Linux/macOS
+suites (973 passed / 14 skipped / 0 failed on each) and all four native binary builds/smokes;
+[Nix](https://github.com/thehumanworks/orc/actions/runs/39129056184) passed flake checks,
+7/7 compiled smokes, builds, binary checks and dev shells on Linux x64/ARM and macOS ARM.
+Both historical Pi continuation cases passed on macOS. Nix warning lines match the successful
+original-baseline run; no new warnings were introduced.
+
+The final architecture audit found no restored Codex execution path or changed Claude adapter.
+Documentation review found one installation clarification tied to the smoke failure: Git is
+needed for ordinary workspace discovery, not only worktrees. The documentation agent corrected
+the README and architecture requirements; the coordinator independently reviewed those two
+lines against the workspace-resolution code. The final follow-up commit changes documentation
+only, and its own latest-commit hosted checks are still required before delivery.
+
 The new PR's latest-commit hosted results are recorded in its description and GitHub Checks.
 Platform success is never inferred from a local Linux run; macOS and all three Nix jobs must
 be checked after publication, and the follow-up PR must remain open.

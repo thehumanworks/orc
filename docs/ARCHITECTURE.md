@@ -21,7 +21,7 @@ shared session and workflow durability.
   (`bun build --compile`). The kernel uses `Bun.spawn` pipes, `node:fs`, `util.parseArgs`. Runtime
   dependencies, all pinned exactly: `@modelcontextprotocol/server` 2.3.1 + `zod` 4 for `orc mcp` /
   the daemon's `/mcp` (loaded lazily, so other commands and actors never import them).
-- The only external executables are the claude and pi CLIs (plus `git` for worktrees and
+- The only external executables are the claude and pi CLIs (plus `git` for workspace discovery and worktrees, and
   `tailscale` for the daemon). Pi library code is owned by the installed Pi distribution, not
   bundled in ORC. No `pi-durable` dependency or storage migration is introduced.
 - macOS and Linux. Process identity is pid + start time (Linux `/proc/<pid>/stat`, macOS
