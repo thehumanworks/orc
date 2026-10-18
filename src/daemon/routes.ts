@@ -122,7 +122,7 @@ export interface SpawnRequest {
  */
 export function mapSpawnRequest(body: SpawnRequest): AgentOptions {
   const provider = body.provider as Provider | undefined;
-  if (!provider) throw new Error('provider is required (claude|codex|pi)');
+  if (!provider) throw new Error('provider is required (claude|pi)');
 
   let mode: SystemPromptMode | undefined;
   if (body.systemPromptMode !== undefined) {

@@ -1,13 +1,18 @@
 # orc — command & SDK reference
 
-The orchestration playbook is in `SKILL.md`; this is the exact surface. `orc help` prints the same
-reference from the binary you are running.
+Read the orchestration playbook in `SKILL.md`. Consult `orc help` from the installed binary for
+its supported commands and `orc <command> --help` for focused help.
+
+Contents: [Sessions](#session-commands) · [Workflows](#workflows) · [Named agents](#named-agents) ·
+[Providers](#providers) · [Removed-provider migration](#removed-provider-migration) ·
+[Remote hosts](#daemon--remote-hosts) · [MCP](#mcp-server) ·
+[Settings](#settings-orc_host-settingstoml---local) · [SDK](#sdk-typescript) · [Files](#state--files).
 
 Conventions:
 
 - Flags are parsed per subcommand and strictly (an unknown flag is an error). Every command except
-  `help` takes `--json`. There is no per-subcommand `--help` (`orc spawn --help` is an unknown-flag
-  error): `orc help` (or `orc --help`, `-h`) prints the whole reference.
+  `help` takes `--json`. Help is local and available even when settings are invalid or the default
+  remote host is offline: `orc help`, `orc --help`, `-h`, or `orc spawn --help`.
 - Errors: exit 1; with `--json` the error is `{"error": "..."}` on **stdout** (option-parse
   errors too), otherwise `error: ...` on stderr (`fatal: ...` for an option-parse error).
 - Global flags (before or after the subcommand): `--host <h>` / `--local` (see Settings) and
@@ -44,16 +49,13 @@ Conventions:
 | `orc resume <sel>` | — | 0 / 1 | same as `state --json` |
 | `orc takeover <sel>` | — | 0 / 1 | `{id, cwd, command, note?}` |
 | `orc prune` | `--worktree`, `--suspended`, `--taken-over` | 0 / 1 | `{ok, pruned: [ids]}` |
-| `orc login chatgpt` | `--import-pi`, `--no-browser` | 0 / 1 | — (Sign in with ChatGPT for codex; stored in `~/.orc/auth/chatgpt.json`) |
-| `orc login status` | — | 0; 1 if a credential file is unreadable (`active: error`) | `{active: orc\|pi\|env\|none\|error, error?, orc: {path, credential, error?}, pi: {…}, openaiApiKey}` (no secrets) |
-| `orc logout chatgpt` | — | 0 | — (orc's credential only; pi's login is untouched) |
-| `orc settings` | — | 0 / 1 (bad settings file; an invalid `ORC_HOST` is a `host.note`) | `{cwd, root, nested, host, provider, models: {claude, codex, pi}, files, warnings}`; each value `{value, source: flag\|env\|local\|global\|default, from?, note?}` |
+| `orc settings` | — | 0 / 1 (bad settings file; an invalid `ORC_HOST` is a `host.note`) | `{cwd, root, nested, host, provider, models: {claude, pi}, files, warnings}`; each value `{value, source: flag\|env\|local\|global\|default, from?, note?}` |
 
 ### spawn options
 
-- `--provider, -p claude|codex|pi` (required unless settings set `provider`); `--model, -m <name>`
-  (default: settings `[models].<provider>` unless `--agent`; else the provider's own — codex: the
-  first model the account lists — `spawn` prints/records it)
+- `--provider, -p claude|pi` (required unless settings set `provider`); `--model, -m <name>`
+  (default: settings `[models].<provider>` unless `--agent`, otherwise the provider's own).
+  For Pi/OpenAI use an exact qualified model such as `openai/gpt-5.5`; see Providers.
 - `--agent <name>` — named agent definition (exclusive with `--system-prompt`)
 - `--alias <name>` — workspace-scoped handle; never changes agent behaviour
 - `--system-prompt <txt>`, `--system-prompt-mode append|replace` (default append)
@@ -80,7 +82,9 @@ sent. A spawn that fails before ready leaves nothing behind (record, session dir
   same text → `replayed: true`, nothing new is sent. Same K + different text → error.
 - A suspended session is woken first (unless `--no-wake`). A killed or taken-over session refuses
   with an error that names `orc resume`.
-- On exit 3: `orc read <sel>` to see whether it landed; resend with a **new** key if not.
+- On exit 3: inspect `orc read <sel>` and any external effects. Absence of a reply does not prove
+  the instruction was never executed. Issue a new instruction with a **new** key only after
+  resolving that uncertainty or deliberately accepting its consequences.
 
 ### state and status
 
@@ -90,12 +94,12 @@ denies it) · `failed` (last turn failed, or not live). An interrupted last turn
 
 `status` (is there an actor): `running` (live lease) · `suspended` (actor gone without a stop;
 resumable; the next send wakes it) · `spawning` (just reserved by a spawn; `state` reads
-`starting`) · `dead` (killed, taken over, legacy tmux record, codex app-server session, or no
+`starting`) · `dead` (killed, taken over, historical Codex/tmux record, or no
 runtime state; sticky). Taken-over sessions are `dead` with `stoppedBy: "takeover"` on the record.
 
 | `state --json` | means |
 | --- | --- |
-| `state: failed, stopped: true` | killed / taken over (`status: dead`); `orc resume` to continue |
+| `state: failed, stopped: true` | killed / taken over (`status: dead`); `orc resume` for retained Pi/Claude sessions; migrate historical Codex records |
 | `state: failed, suspended: true` | crash / reboot / provider exit (`status: suspended`); `orc send` or `orc resume` wakes it |
 | `state: failed, live: true` | the last turn failed: `lastTurn.error` |
 | `lastTurn` | `{messageId, outcome: completed\|failed\|interrupted, at?, error?, reason?, result?}` |
@@ -113,9 +117,9 @@ last state and exits 1. After 3 consecutive failed starts a session is no longer
 - `attach`: follows the journal as text until the session stops/suspends or Ctrl-C. Read-only
   (`--read-only` is accepted and ignored).
 - `takeover`: stops the actor (sticky), waits for the provider to exit, prints
-  `cd <cwd> && <provider resume command>` and `# hand it back with: orc resume <id>`. codex:
-  `pi --session <~/.orc/sessions/<sid>/codex-session.jsonl>` plus a note that pi needs its own
-  OpenAI login.
+  `cd <cwd> && <provider resume command>`. Retained Pi/Claude sessions can be handed back with
+  `orc resume <id>`. Historical Codex harness sessions can continue in native Pi only; see
+  Removed-provider migration.
 - `kill`: sticky stop; drops queued messages; keeps the record and journal (`read` still works).
   `--purge` removes the record and session dir; `--worktree` removes the worktree (not the branch).
 - `prune`: removes `dead` records and their session dirs. Keeps `running` and `spawning` (< 10
@@ -124,7 +128,7 @@ last state and exits 1. After 3 consecutive failed starts a session is no longer
   human's resume command uses their system prompt file).
 - `list`: default = current workspace, `running` + `suspended` + `spawning`. `--all` = every
   workspace incl. dead; `--dead` adds dead; `--run ID` = sessions of a run tree (implies `--all`).
-  Text output marks taken-over sessions `taken-over(hand back: orc resume <id>)`.
+  Use the full/short ID for stopped or historical records, since aliases resolve active sessions.
 
 ## Workflows
 
@@ -157,25 +161,66 @@ last state and exits 1. After 3 consecutive failed starts a session is no longer
 ## Named agents
 
 `orc spawn --agent <name>` resolves a definition:
+
 - **claude**: native `--agent` — `./.claude/agents/<name>.md` then `~/.claude/agents/<name>.md`
-- **codex**: `./.codex/agents/*.toml` by `name` → `$CODEX_HOME/agents/*.toml` →
-  `./.codex/prompts/<name>.md` → `$CODEX_HOME/prompts/<name>.md` → the claude locations; the body
-  is appended to the harness's system prompt (a TOML `model` applies when `--model` is omitted)
-- **pi**: the claude locations; the body becomes the appended system prompt
+- **pi**: the Claude Markdown locations; ORC passes the body as its system prompt. Claude-specific
+  frontmatter model aliases do not apply. Pass `--model` or use Pi's configured default;
+  `--agent` bypasses the ordinary ORC `[models]` fallback.
+
+Move former Codex TOML `developer_instructions` or prompt bodies into these Markdown files.
+ORC no longer discovers `.codex/agents`, `.codex/prompts` or `CODEX_HOME` for new sessions.
 
 ## Providers
 
-All sessions run in yolo mode: claude `--permission-mode bypassPermissions`; pi `-a`; codex is
-orc's built-in harness (pi-ai + pi-agent-core → OpenAI Responses API) with no approvals and the
-tools `read`/`write`/`edit`/`bash`/`ls`. codex credentials, first match wins: `orc login chatgpt`,
-pi's ChatGPT login (`~/.pi/agent/auth.json`), `OPENAI_API_KEY`; `orc login status` shows which.
-codex model without `--model`: the first model the ChatGPT account lists (API key: the newest chat
-model pi-ai knows), recorded on the session. **codex has no context compaction yet**: a turn that
-overflows the context window fails with "…start a new session" — spawn a fresh session with a
-summary. System prompts go through an orc-owned file, never argv or the worktree. Slash commands:
-claude `/compact` and `/goal <condition>` work through `orc send` (verified, claude 2.1.300);
-pickers and `/login` don't; pi unverified; codex has none (sent as text). codex sessions from the
-removed `codex app-server` runtime are `dead` with no transcript.
+Use only `pi` and `claude` as new ORC execution providers. Both use their native CLI: Claude
+stream-json with `--permission-mode bypassPermissions`; Pi RPC with `-a`. Pi owns its model/tool
+loop, compaction, model discovery and authentication. ORC owns detached actors, delivery receipts
+and workflow durability. ORC removes the embedded Codex harness and does not add pi-durable.
+
+For OpenAI/Codex models through Pi (reference CLI version **1.2.0**):
+
+1. Install Pi on the execution host (Node >=22.19.0 for npm). `npm install --global --ignore-scripts
+   @earendil-works/pi-coding-agent@1.2.0` pins the CLI package, not its transitive dependencies;
+   use a lockfile or the corresponding pinned upstream release artifacts for reproducibility.
+2. Launch `pi` interactively, run `/login openai`, and choose **Sign in with ChatGPT**, or export
+   `OPENAI_API_KEY` where the actor runs. Pi's stored credential takes precedence over the
+   environment key; use Pi `/logout` to remove it when switching to the key. ORC does not import
+   its old credentials or refresh them.
+3. List chat models with `pi --list-models` and use, for example,
+   `orc spawn -p pi -m openai/gpt-5.5 --prompt "reply READY"`.
+
+Qualified `provider/model-id[:thinking]` selections bind Pi's provider explicitly. ORC checks the
+selected identity and Pi's available model list before dispatch; configure custom IDs in Pi's
+`models.json`. The list establishes configured authentication, not live account entitlement.
+Bare aliases keep Pi's resolution; no override uses Pi's own default. Pi `openai-codex` is a
+distinct legacy backend/auth route, never an automatic alias for `openai`.
+
+System prompts go through an ORC-owned file, never prompt text on argv or a file in the worktree.
+Claude `/compact` and `/goal <condition>` work through `orc send` (verified, Claude 2.1.300);
+interactive pickers and `/login` do not. Pi slash commands through ORC remain unverified.
+
+## Removed-provider migration
+
+- Treat new `provider: "codex"`, `provider = "codex"` and `[models].codex` as actionable errors.
+  Change callers/settings/workflow definitions to `pi` and an explicit `openai/<model-id>`.
+  `orc login`, `orc login status` and `orc logout` are removed-command errors; authenticate in Pi.
+- Preserve existing records, journals, transcripts and credentials. Historical Codex sessions
+  still support `orc read --full` / `--raw` and `orc kill`; `send` and `resume` refuse them.
+- For a matching harness Pi v3 transcript, `orc takeover <id>` stops the old actor/provider,
+  validates its identity and prints `pi --session <file> --provider openai --model <saved-model>`
+  with the original cwd and system-prompt file/mode. Restore a missing persona file before retrying.
+  Continue in native Pi; the historical ORC session cannot be handed back to ORC. Use a reviewed
+  summary in a fresh Pi session when metadata/transcript compatibility prevents native continuation.
+- Older Codex app-server rollouts remain under `~/.codex/sessions`; there is no Pi importer.
+  Do not rewrite stored provider fields or automatically replay queued/uncertain deliveries.
+- Existing Codex workflow plans and attempts remain readable, but cannot resume through the
+  removed harness. Inspect status/logs, preserve verified outputs, migrate the source definition,
+  then start a new run for unfinished work. Do not edit stored plans to bypass their digest check.
+- Keep ORC's existing session/workflow storage: pi-durable was evaluated and skipped because its
+  embedded model/tool harness does not replace retained Pi RPC/Claude ownership or delivery semantics.
+
+Full instructions and evidence: [migration guide](https://github.com/thehumanworks/orc/blob/main/docs/MIGRATION-pi.md)
+and [durability decision](https://github.com/thehumanworks/orc/blob/main/docs/decisions/pi-durable.md).
 
 ## Daemon & remote hosts
 
@@ -183,7 +228,7 @@ removed `codex app-server` runtime are `dead` with no transcript.
 | --- | --- |
 | `orc daemon [--port 8787] [--bind <ip>] [--insecure]` | HTTP API on the host's tailscale IP; refuses `0.0.0.0` without `--insecure` |
 | `orc remote add\|list\|rm <host> [--port P]` | trusted peers (`~/.orc/peers.json`) |
-| `orc --host <h> <command>` | `list`/`spawn`/`send`/`read`/`wait`/`state`/`kill`/`workflow` against a peer, with local output and `--json` except: `state --json` is only `{id, state, status, suspended, stopped}`; `list` takes only `--workspace`/`--all`/`--dead` and its rows have no `lineage`; `workflow resume`/`retry` take no `--detach`. `attach` / `workflow attach` print `tailscale ssh <h> orc attach <id>` / `… orc workflow attach <runId>`. `resume`/`takeover`/`prune`/`daemon`/`remote`/`login`/`logout`/`settings` are host-local (error). A default host (`ORC_HOST`, settings `host`) routes the same commands — see Settings |
+| `orc --host <h> <command>` | `list`/`spawn`/`send`/`read`/`wait`/`state`/`kill`/`workflow` against a peer, with local output and `--json` except: `state --json` is only `{id, state, status, suspended, stopped}`; `list` takes only `--workspace`/`--all`/`--dead` and its rows have no `lineage`; `workflow resume`/`retry` take no `--detach`. `attach` / `workflow attach` print `tailscale ssh <h> orc attach <id>` / `… orc workflow attach <runId>`. `resume`/`takeover`/`prune`/`daemon`/`remote`/`settings` are host-local (error). A default host (`ORC_HOST`, settings `host`) routes the same commands — see Settings |
 | `orc list --all-hosts` | local + every peer, with a `host` column; an unreachable peer is a stderr warning |
 
 Auth is fail-closed: allowlisted tailnet identity (all scopes), `Authorization: Bearer` (client
@@ -204,7 +249,7 @@ legacy session, or run state (cancelled / live owner) · 502 provider failed to 
 | `orc daemon [--mcp-allow-host H]…` | also serves the tools at `/mcp` (Streamable HTTP, stateless), run on the daemon host (`--local`; absolute paths; no `host`). Same auth; each tool needs its REST scope (`wait`/`read`/`state`/`list`/`settings`: `sessions:read`; `spawn`/`send`/`resume`: `sessions:write`; workflow reads/writes: `workflows:read`/`workflows:write`; `kill`/`prune`/`workflow_cancel`/`workflow_cleanup`: `admin`). `tools/list` shows only allowed tools. `Host`/`Origin` must name the daemon (403 otherwise) |
 
 The server instructions and the `guide` tool teach the lead the team method; not exposed:
-`attach`, `workflow attach`, `takeover`, `login`/`logout`, `daemon`, `remote`, `mcp`, `help`.
+`attach`, `workflow attach`, `takeover`, `daemon`, `remote`, `mcp`, `help`.
 Daemon credentials (`ORC_DAEMON_SECRET`/`ORC_DAEMON_TOKENS`/`ORC_DAEMON_TOKEN`) never reach the
 CLI children, except the client ones on an explicit `host` call.
 
@@ -212,8 +257,9 @@ CLI children, except the client ones on an explicit `host` call.
 
 ```toml
 host = "studio"        # default remote target: host or host:port (as --host)
-provider = "claude"    # default spawn --provider
+provider = "pi"        # default spawn --provider
 [models]               # default --model per provider (spawn + workflow steps)
+pi = "openai/gpt-5.5"
 claude = "haiku"
 ```
 
@@ -224,17 +270,19 @@ claude = "haiku"
 - Unknown keys/tables: one stderr warning per file (`orc: warning: <file>: unknown setting(s)
   ignored: …`). Bad types/values or bad TOML: exit 1 naming the file and key. An invalid
   `ORC_HOST` refuses only commands it would route (not with `--local`/`--host`).
+- The removed `provider = "codex"` and `[models].codex` fail explicitly; they are not ignored
+  keys or automatic mappings. Change them using Removed-provider migration.
 
 | key | precedence (first wins) |
 | --- | --- |
 | host | `--local` > `--host` > `ORC_HOST` (set, non-empty; `""` = no default host) > local > global > run here |
 | provider | `--provider` > local > global > error |
-| model | `--model` > local `[models].<p>` > global `[models].<p>` > provider default (a named `--agent` keeps its own model) |
+| model | `--model` > local `[models].<p>` > global `[models].<p>` > provider default; `--agent` bypasses `[models]` (Claude native agent model, Pi explicit model or native default) |
 
 - A default host applies to `list`/`spawn`/`send`/`read`/`wait`/`state`/`kill`/`attach`/`workflow`
   (not `list --all-hosts`) and prints `orc: → <host> (from ORC_HOST|<file>)` on **stderr** (also
-  with `--json`). Host-local commands (`daemon`, `remote`, `resume`, `takeover`, `prune`, `login`,
-  `logout`, `settings`, `help`) ignore it and never error because of it; explicit `--host` on them
+  with `--json`). Host-local commands (`daemon`, `remote`, `resume`, `takeover`, `prune`,
+  `settings`, `help`) ignore it and never error because of it; explicit `--host` on them
   stays an error. `--local` may appear anywhere in argv.
 - **Safety rules.** (1) A `host` from a LOCAL file must be a trusted peer (`orc remote add`; host +
   port, default 8787) or your own global settings `host`, or the command fails: `orc remote add
@@ -266,6 +314,7 @@ await s.kill({ removeWorktree: true });
 
 `waitForResult()` adds `settled`; `send()` throws `SessionNotControllableError` (`code`
 `ORC_SESSION_STOPPED` | `ORC_MESSAGE_CONFLICT` | `ORC_SESSION_LEGACY` | `ORC_SESSION_UNKNOWN`).
+Removed-provider errors also carry `ORC_SESSION_LEGACY` and migration instructions.
 Also: `interrupt()`, `takeover()`, `resume()`, `attach({signal})`,
 `pruneSessions({suspended, takenOver})`. `SessionStatus` = `running|suspended|spawning|dead`.
 Use the SDK when orchestration logic is non-trivial or reused (loops, fan-out, branching); use the
@@ -279,5 +328,7 @@ CLI for quick steering.
 - `~/.orc/sessions/<sid>/journal.jsonl` is the source of truth for state (`read --raw`, `attach`);
   the provider transcript (what `read` parses) persists after `kill`.
 - `~/.orc/runs/<runId>.json` holds the run record, including step prompts.
-- codex: login in `~/.orc/auth/chatgpt.json` (`ORC_AUTH_DIR`), transcript
-  `~/.orc/sessions/<sid>/codex-session.jsonl` (pi session format).
+- Pi owns its auth/settings directory (`PI_CODING_AGENT_DIR`, otherwise `~/.pi/agent`). ORC
+  does not read the old `ORC_AUTH_DIR` or `ORC_CODEX_*` harness settings.
+- Historical Codex `~/.orc/auth/chatgpt.json`, device identity, model cache and
+  `~/.orc/sessions/<sid>/codex-session.jsonl` remain on disk untouched by this migration.

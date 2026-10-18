@@ -510,6 +510,13 @@ d('pi runtime contract (real pi --mode rpc, mock model)', () => {
       const streaming = mock.nextSlowStream();
       await rt.send('m-open', 'SLOW until closed');
       await streaming;
+      // The server enqueueing a chunk does not prove Pi consumed it. Synchronize on the
+      // real RPC output before aborting so this checks persistence of received text.
+      const streamedBy = Date.now() + 5_000;
+      while (!rawLog(s).some((r) => r.dir === 'recv' && r.line.includes('text_delta') && r.line.includes('chunk0'))) {
+        if (Date.now() > streamedBy) throw new Error('Pi did not emit the first content chunk');
+        await Bun.sleep(10);
+      }
       await rt.close({ graceMs: 3_000 });
       await c.done;
       // close() aborts first: pi itself settles the run (and answers the abort) before stdin ends.

@@ -9,6 +9,7 @@
  * `orc --host <h> …`) and `daemon` (`orc daemon`'s `/mcp`; every call runs `orc --local …`
  * on the daemon host, paths must be absolute, and each tool needs a daemon scope).
  */
+import { PROVIDERS, isProvider, validateModel } from '../providers.ts';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
@@ -231,8 +232,6 @@ function str(v: unknown): string | undefined {
 // Tool definitions
 // ---------------------------------------------------------------------------------------
 
-const PROVIDERS = ['claude', 'codex', 'pi'] as const;
-
 const spawnTool: OrcTool = {
   name: 'spawn',
   title: 'Spawn an agent session',
@@ -247,8 +246,8 @@ const spawnTool: OrcTool = {
       : ' Relative cwd/workspace resolve against this server\'s directory.'),
   schema: (cfg) =>
     z.strictObject({
-      provider: z.enum(PROVIDERS).optional().describe('claude | codex | pi (default: settings)'),
-      model: z.string().min(1).max(200).optional().describe('model name (default: settings [models], else the provider default)'),
+      provider: z.enum(PROVIDERS).optional().describe('claude | pi (default: settings)'),
+      model: z.string().min(1).max(200).optional().describe('model selector; Pi: openai/<model-id> for OpenAI/Codex (default: settings [models], else the provider default)'),
       prompt: z.string().min(1).optional().describe('the task: goal, context, constraints, how to verify, what to deliver'),
       alias: z.string().min(1).max(64).optional().describe('workspace-scoped handle, e.g. impl-auth (then @impl-auth)'),
       agent: z.string().min(1).max(200).optional().describe('named agent definition (exclusive with system_prompt)'),
@@ -267,6 +266,12 @@ const spawnTool: OrcTool = {
       worktree: z.boolean().optional().describe('run in a fresh git worktree on its own branch'),
       branch: z.string().min(1).max(200).optional().describe('worktree branch name (needs worktree: true)'),
       ...hostField(cfg),
+    }).superRefine((args, ctx) => {
+      try {
+        validateModel(isProvider(args.provider) ? args.provider : 'claude', args.model);
+      } catch (e) {
+        ctx.addIssue({ code: 'custom', path: ['model'], message: (e as Error).message });
+      }
     }),
   async run(a, ctx) {
     const cwd = str(a.cwd);

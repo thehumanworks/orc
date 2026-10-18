@@ -2,7 +2,7 @@
 name: orc
 description: >-
   Act as the orchestrator of a fleet of coding subagents to deliver a task, using the `orc`
-  CLI/SDK (it runs claude/codex/pi agents as durable, detached sessions you can steer, read,
+  CLI/SDK (it runs Pi and Claude agents as durable, detached sessions you can steer, read,
   wait on and resume). Use this whenever the user prefixes a task with /orc, OR asks to
   orchestrate / delegate / parallelize / fan out work across multiple agents, run a multi-step or
   repeatable agent workflow (code review, migration, release, large refactor), spin up
@@ -31,16 +31,17 @@ diversity-sensitive. If the coordination overhead would exceed the task's value 
 one-line change, a quick lookup — just do it directly (or hand it to a single subagent). Match the
 machinery to the task.
 
-`orc` runs real coding agents (`claude`, `codex`, `pi`) as **durable, detached sessions**: one
-actor process per session drives the provider over a structured protocol and journals everything
-(`codex` is orc's built-in harness on the OpenAI Responses API; it needs `orc login chatgpt`, pi's
-ChatGPT login, or `OPENAI_API_KEY` — check with `orc login status`). A
-subagent's work is never opaque — you (or the user) can read its transcript or follow its journal
-at any time — and sessions outlive this one. Exact flags, exit codes and JSON shapes:
+Run agents through ORC's two production integrations, `pi` and `claude`. One actor process per
+session drives the native CLI over a structured protocol. For OpenAI/Codex models, use
+`--provider pi --model openai/<model-id>`; authenticate on the execution host in Pi with
+`/login openai` → **Sign in with ChatGPT**, or `OPENAI_API_KEY`. Pi owns models, tools and
+authentication; ORC retains its mailbox, journal, actor ownership and workflow durability.
+There is no separate Codex executor or pi-durable dependency. Read each subagent's transcript
+or follow its journal at any time; sessions outlive the client. Exact flags, exit codes and JSON shapes:
 **`references/orc-cli.md`**. The essentials:
 
 ```
-orc spawn -p <claude|codex|pi> [--prompt P|-|@file] [--agent NAME] [--alias NAME] [--worktree] [--cwd DIR] --json
+orc spawn -p <claude|pi> [-m MODEL] [--prompt P|-|@file] [--agent NAME] [--alias NAME] [--worktree] [--cwd DIR] --json
 orc send  <id|@alias> [PROMPT|-|@file] [--idempotency-key K]  # steer; exit 3 = delivery unknown
 orc state <id|@alias> --json         # starting|running|done|waiting|failed (+ stopped/suspended)
 orc wait  <id|@alias> [--for done|settled] [--timeout SEC]  # BLOCK until it settles
@@ -68,6 +69,11 @@ provider (`[models]`), so `orc spawn` without `-p` can work. A project file's `h
 trusted peer (`orc remote add`) or the user's global host, or commands fail — never "fix" that by
 adding a peer yourself; ask the user. Agents you spawn ignore default hosts (they run nested), so
 their own `orc` calls stay on their host unless told `--host`.
+
+Reject removed Codex inputs deliberately: replace `provider = "codex"` and `[models].codex`
+with `pi` and `[models].pi = "openai/<model-id>"`. Use `pi --list-models` for exact IDs.
+Do not rewrite historical provider fields or replay old messages. Read the removed-provider
+migration section in `references/orc-cli.md` before continuing an old session or workflow.
 
 ## The orchestration loop
 
@@ -104,18 +110,20 @@ transcript to confirm.
 | `state: running` | turn open or message queued | `orc wait` |
 | `state: waiting` | provider asked for a permission (rare in yolo; orc denies it) | read it; re-instruct |
 | `state: starting`, status `spawning`/`running` | provider still booting | `orc wait` |
-| `state: failed`, `stopped: false`, `suspended: false` | the last turn failed | read the error (`orc state --json` → `lastTurn.error`); resend or respawn. codex error "…exceeds the model's context window; start a new session": codex has no compaction yet — spawn a fresh session with a summary |
+| `state: failed`, `stopped: false`, `suspended: false` | the last turn failed | read `lastTurn.error`, inspect any effects, then correct the instruction or start a fresh session with a summary |
 | `state: failed`, `suspended: true` | actor gone (crash/reboot); status `suspended` | just `orc send` — it wakes and resumes the same conversation |
-| `state: failed`, `stopped: true` | killed or taken over; status `dead` | `orc resume <id>` if you still need it |
+| `state: failed`, `stopped: true` | killed, taken over or historical; status `dead` | `orc resume <id>` for a retained Pi/Claude session; use the migration path for an old Codex session |
 
 - `orc send` exits **0** when the message was `acknowledged` or durably `queued`, **3** when delivery
   is `unknown` (cut before the provider acked it; orc never re-sends it), **1** on failure. On 3:
-  `orc read` to see whether it landed, then send again **with a new key**.
+  inspect `orc read` and the external result before deciding whether to send a new instruction.
+  Transcript persistence does not prove exactly-once effects; an intentional new send needs a new key.
 - For sends you may retry (scripts, loops), pass `--idempotency-key <stable-key>`: a repeat with the
   same text is a no-op that returns `replayed: true`.
 - `orc takeover <id>` stops orc's actor and prints the provider's own resume command for a human;
-  `orc resume <id>` hands it back. There is no live TUI to attach to; `orc attach <id>` follows the
-  journal read-only.
+  `orc resume <id>` hands a retained Pi/Claude session back. An old Codex harness transcript may
+  continue in native Pi after takeover, but its historical ORC record cannot resume or receive
+  messages. There is no live TUI to attach to; `orc attach <id>` follows the journal read-only.
 
 ## Choose your structure: ad-hoc orchestration vs. a versioned workflow
 
@@ -131,24 +139,22 @@ transcript to confirm.
   success should gate on a hard signal (`verify`, a `done` predicate, or a worktree commit), not just
   `state === 'done'` — the template shows the pattern. `resume`/`retry` need the workflow file.
 
-## Prefer provider diversity
+## Prefer model diversity
 
-Spawn different subagents from **different providers** on purpose. Models from different providers have
-genuinely different failure modes, blind spots, and styles — diversity is a feature, not a
-coincidence. Concretely:
+Use different models or model providers for independent perspectives. Distinguish ORC's integration
+(`pi` or `claude`) from Pi's model provider (`openai`, `anthropic`, or another configured provider):
 
 - **Implement with one provider, review with another** (e.g. implement with `claude`, adversarially
-  review with `codex`). A reviewer that didn't write the code catches more.
+  review with `pi -m openai/gpt-5.5`). Have an agent that did not author the implementation review it.
 - For a hard design question, ask **two providers the same question** and synthesize — disagreement is
   signal.
 - Rotate which provider does what across a session so you're not over-relying on one model's habits.
 
-All three (`claude`, `codex`, `pi`) drive the same lifecycle; pick by strength and for diversity, not
-convenience. But only **one** provider is required — don't assume all three are available: claude
-and pi need their CLI on `PATH`; codex needs an OpenAI credential (`orc login status` shows it; no
-codex CLI is involved). A spawn fails if its provider is unavailable. If only one is available,
-diversify *within* it: use a different model (`-m`) or a different persona (`--agent`) for the
-implement vs. review roles, so a *different agent* still checks the work.
+Pi and Claude share ORC's lifecycle. Check which native CLIs and authenticated models are available
+on the execution host; do not assume both are installed. Choose exact Pi IDs with `pi --list-models`.
+A qualified selection is checked against Pi's selected and available models before prompts.
+If only one integration is available, use a different model (`-m`) or persona (`--agent`) for
+the review role, so an independent agent still checks the work.
 
 ## Specialized, reusable subagents
 
@@ -158,13 +164,14 @@ reuse it with `orc spawn --agent <name>`:
 
 - `claude` resolves a named agent natively from `.claude/agents/<name>.md` (project) or
   `~/.claude/agents/<name>.md` (user).
-- `codex` resolves `.codex/agents/*.toml` by parsed `name` first (project, then
-  `$CODEX_HOME/agents`, default `~/.codex/agents`), then `.codex/prompts/<name>.md`, then the
-  claude locations; `pi` resolves the claude locations. orc injects the agent's body as the system
-  prompt.
+- `pi` resolves the same Markdown locations and receives the body as its system prompt.
+  Claude-specific frontmatter model aliases are not applied to Pi. Pass `--model` or configure
+  Pi's default; `--agent` bypasses ORC's ordinary `[models]` fallback.
+- Move former Codex TOML `developer_instructions` or prompt Markdown into this format. ORC no
+  longer discovers `.codex/agents`, `.codex/prompts` or `CODEX_HOME` for new agents.
 
 Treat these definitions as **living artifacts**: when a specialized subagent underperforms, edit its
-`.toml` or `.md` and improve it — that's how the fleet gets better over time. A good agent definition states the
+`.md` and improve it — that's how the fleet gets better over time. A good agent definition states the
 role, the standards it holds, what to focus on, and what "done" means for it. (`--agent` and a raw
 `--system-prompt` are mutually exclusive; use `--agent` for anything reusable.)
 
@@ -185,8 +192,8 @@ whole point of orc over headless one-shots:
   then the turn completes (`orc wait` returns). Good for "keep fixing failures until the suite is
   green". Still verify the condition yourself.
 - Slash commands reach the provider as the message text. Only claude's `/compact` and `/goal` are
-  verified; interactive pickers and `/login` don't work, pi slash commands are unverified, and the
-  codex harness has none (assume they arrive as plain text).
+  verified; interactive pickers and `/login` don't work through `orc send`, and Pi slash commands
+  are unverified. Sign in using Pi interactively before spawning the ORC session.
 - A stuck subagent (no progress across several reads, repeated failed turns, or `waiting`) is a steer
   signal: nudge it, give it the missing context, or kill it and respawn with a sharper prompt. Don't
   let it spin.
@@ -262,7 +269,7 @@ orc read "$ID"                                          # see what it did (token
 # verify: a SECOND provider reviews the SAME branch (run it IN that worktree; --workspace keeps it
 # in this repo's workspace — a --cwd inside a linked worktree would otherwise get its own)
 REPO=$(git rev-parse --show-toplevel)                    # the main checkout (run from the repo)
-RV=$(orc spawn -p codex --cwd "$WT" --workspace "$REPO" --prompt "Review the diff on this branch for correctness; be adversarial." --json | jq -r .id)
+RV=$(orc spawn -p pi -m openai/gpt-5.5 --cwd "$WT" --workspace "$REPO" --prompt "Review the diff on this branch for correctness; be adversarial." --json | jq -r .id)
 orc wait "$RV" --for settled && orc read "$RV"
 # ... you review the diff + merge the branch if it's good ...
 orc kill "$ID" --worktree --purge; orc kill "$RV" --purge   # kill sessions + remove the worktree

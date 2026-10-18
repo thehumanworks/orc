@@ -16,6 +16,10 @@ Phase 2 durable execution tree (summary of implemented semantics):
 - `resume` / `retry` take the original workflow file (required by the local CLI; over `--host` the
   daemon falls back to the run's recorded source file); the plan digest must match
 
+Current production providers are `pi` and `claude`. Old Codex plans remain readable but are not
+silently converted or resumed through another integration; see [Pi migration](MIGRATION-pi.md#existing-workflows).
+The shared workflow durability described here remains in place; [pi-durable was evaluated and skipped](decisions/pi-durable.md).
+
 ---
 
 ## Requirement (from the user's goal)
@@ -59,7 +63,7 @@ export default defineWorkflow({
     { id: 'implement', provider: 'claude', worktree: true, taskFile: 'tasks/NN.md',
       // step succeeds when the agent settles AND its branch has a new commit:
       done: ({ state, commitsAhead }) => state === 'done' && commitsAhead >= 1 },
-    { id: 'review',    provider: 'codex',  cwd: '${implement.worktree}',
+    { id: 'review',    provider: 'pi',  cwd: '${implement.worktree}',
       prompt: 'Review the diff on this branch for correctness; write findings to REVIEW.md',
       done: ({ state }) => state === 'done' },
   ],

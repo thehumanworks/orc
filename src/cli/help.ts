@@ -34,11 +34,11 @@ const GROUPS: Record<string, Record<string, string>> = {
     rm: '  orc remote rm <host> [--json]\n\nRemove a trusted peer from this host\'s peer list.',
   },
   login: {
-    chatgpt: '  orc login chatgpt [--import-pi] [--no-browser]\n\nSign in with ChatGPT for codex.\n  --import-pi         Import an existing pi ChatGPT login\n  --no-browser        Print the authorization URL without opening a browser',
-    status: '  orc login status [--json]\n\nShow which OpenAI credential codex sessions use.',
+    chatgpt: '  orc login chatgpt (removed)\n\nStart pi, run /login, choose OpenAI and Sign in with ChatGPT, or set OPENAI_API_KEY.\nSelect provider pi and model openai/<model-id> for new sessions. See docs/MIGRATION-pi.md.',
+    status: '  orc login status (removed)\n\nPi owns OpenAI credentials; inspect providers with /login in Pi. See docs/MIGRATION-pi.md.',
   },
   logout: {
-    chatgpt: '  orc logout chatgpt [--json]\n\nRemove orc\'s ChatGPT credential; pi\'s login is unchanged.',
+    chatgpt: '  orc logout chatgpt (removed)\n\nUse /logout in Pi. Old ORC auth files are preserved; see docs/MIGRATION-pi.md.',
   },
 };
 

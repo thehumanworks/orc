@@ -65,19 +65,15 @@
         {
           inherit orc;
 
-          # The binary runs in the sandbox: --version is package.json's, --help works, and the
-          # embedded codex harness passes its offline self-test.
-          smoke = pkgs.runCommand "orc-smoke" { nativeBuildInputs = [ orc ]; } ''
+          # The same offline compiled-binary Pi/Claude actor smoke as Bun/native CI.
+          smoke = pkgs.runCommand "orc-smoke" {
+            nativeBuildInputs = [ orc pkgs.bun ] ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.procps ];
+          } ''
             export HOME="$TMPDIR/home" ORC_HOME="$TMPDIR/orc-home"
             mkdir -p "$HOME" "$ORC_HOME"
-            got="$(orc --version)"
-            if [ "$got" != "orc ${orc.version}" ]; then
-              echo "orc --version printed '$got', want 'orc ${orc.version}' (package.json)" >&2
-              exit 1
-            fi
-            orc --help > help.txt
-            grep -q '^Usage:' help.txt
-            orc __codex-harness --self-test | tee self-test.json
+            bun ${./scripts/verify-runtime/compiled.ts} ${lib.getExe orc} \
+              --fixtures ${./test/fixtures} --version ${orc.version} > smoke.json
+            cat smoke.json
             touch $out
           '';
 

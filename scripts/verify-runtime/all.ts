@@ -2,27 +2,26 @@
 /**
  * One command that verifies orc's tmux-free runtime on an authenticated macOS or Linux host:
  *
- *   bun scripts/verify-runtime/all.ts [--providers claude,codex,pi] [--claude-model M]
- *       [--codex-model M] [--pi-model M] [--keep]
+ *   bun scripts/verify-runtime/all.ts [--providers claude,pi] [--claude-model M]
+ *       [--pi-model M] [--keep]
  *       [--claude-bin P] [--pi-bin P] [--no-runtime-gates] [--no-e2e] [--no-workflow]
  *       [--results <file>]   (default: <repo>/verify-results.json)
  *
- * 1. Preflight: OS/arch, bun, each provider's binary + version; for codex (orc's built-in
- *    harness, no binary) an OpenAI credential: `orc login chatgpt`, pi's ChatGPT login or
- *    OPENAI_API_KEY (a missing provider is SKIP, never a failure). A `tmux` shim that logs
+ * 1. Preflight: OS/arch, bun, each provider's binary + version. A missing executable is
+ *    SKIP; model selection and authentication are delegated to the native provider.
+ *    A `tmux` shim that logs
  *    its argv and exits 127 is first on PATH for everything below; the run fails if it is
  *    ever invoked.
- * 2. Runtime gates: scripts/verify-runtime/{claude,codex,pi}.ts as subprocesses.
+ * 2. Runtime gates: scripts/verify-runtime/{claude,pi}.ts as subprocesses.
  * 3. CLI end-to-end per provider, from source (`bun src/cli/index.ts`) with an isolated
  *    ORC_HOME and a temp git repo as cwd (see README.md for every check).
  * 4. A detached 2-step claude workflow followed with `orc workflow attach`.
  * 5. A PASS/FAIL/SKIP table on stdout + verify-results.json in the repo root (no env, no
  *    credentials, no emails). Exit 1 on any FAIL. Temp dirs are removed unless --keep.
  *
- * Safety: every orc call runs with a temp ORC_HOME (your ~/.orc is never touched — except
- * ~/.orc/auth, the codex login, which the temp homes use in place via ORC_AUTH_DIR so a
- * token refresh lands in your real store), inherited ORC_* lineage/test variables are
- * dropped, and provider configs are never modified. Only processes this run started are
+ * Safety: every orc call runs with a temp ORC_HOME; user ORC state is untouched. Inherited
+ * ORC_* lineage/test variables are dropped. Native providers manage their own auth and
+ * configuration; provider token refreshes may update their stores. Only processes this run started are
  * ever signalled. `--<p>-bin` points a provider at another executable (e.g.
  * test/fixtures/pi-chat-fake.ts) via a wrapper on PATH.
  */
@@ -30,7 +29,6 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { resolveClaudeTranscript } from '../../src/runtime/providers/claude.ts';
-import { resolveCodexAuth } from '../../src/codex/auth.ts';
 import { isSameProcessAlive } from '../../src/runtime/process.ts';
 import type { ProcessIdentity } from '../../src/runtime/types.ts';
 
@@ -38,7 +36,7 @@ import type { ProcessIdentity } from '../../src/runtime/types.ts';
 // args
 // ---------------------------------------------------------------------------------
 
-const PROVIDERS = ['claude', 'codex', 'pi'] as const;
+const PROVIDERS = ['claude', 'pi'] as const;
 type Provider = (typeof PROVIDERS)[number];
 
 interface Args {
@@ -52,8 +50,8 @@ interface Args {
   workflow: boolean;
 }
 
-const USAGE = `usage: bun scripts/verify-runtime/all.ts [--providers claude,codex,pi] [--claude-model M]
-       [--codex-model M] [--pi-model M] [--keep] [--claude-bin P] [--pi-bin P]
+const USAGE = `usage: bun scripts/verify-runtime/all.ts [--providers claude,pi] [--claude-model M]
+       [--pi-model M] [--keep] [--claude-bin P] [--pi-bin P]
        [--no-runtime-gates] [--no-e2e] [--no-workflow] [--results <file>]`;
 
 function parseArgs(argv: string[]): Args {
@@ -65,7 +63,7 @@ function parseArgs(argv: string[]): Args {
       if (v === undefined || v.startsWith('--')) throw new Error(`${k} needs a value`);
       return v;
     };
-    const pm = /^--(claude|codex|pi)-(model|bin)$/.exec(k);
+    const pm = /^--(claude|pi)-(model|bin)$/.exec(k);
     if (k === '--providers') {
       const list = val()
         .split(',')
@@ -74,11 +72,6 @@ function parseArgs(argv: string[]): Args {
       for (const p of list) if (!(PROVIDERS as readonly string[]).includes(p)) throw new Error(`unknown provider '${p}'`);
       a.providers = list as Provider[];
     } else if (pm) {
-      if (pm[1] === 'codex' && pm[2] === 'bin') {
-        throw new Error(
-          '--codex-bin: codex is orc\'s built-in harness (no codex binary); use scripts/verify-runtime/codex.ts --orc-bin <orc> for a compiled orc',
-        );
-      }
       a[pm[2] as 'model' | 'bin'][pm[1] as Provider] = val();
     } else if (k === '--results') a.results = path.resolve(val());
     else if (k === '--keep') a.keep = true;
@@ -294,14 +287,7 @@ function removeClaudeTranscripts(root: string, sids: Iterable<string>, env: Reco
 const REPO = path.resolve(import.meta.dir, '..', '..');
 const CLI = path.join(REPO, 'src', 'cli', 'index.ts');
 const BUN = process.execPath;
-const BIN_ENV: Record<Provider, string | undefined> = { claude: 'ORC_CLAUDE_BIN', codex: undefined, pi: undefined };
-
-/** The real orc credential dir (codex login), resolved BEFORE any temp ORC_HOME applies. */
-function realOrcAuthDir(): string {
-  if (process.env.ORC_AUTH_DIR) return path.resolve(process.env.ORC_AUTH_DIR);
-  const home = process.env.ORC_HOME ? path.resolve(process.env.ORC_HOME) : path.join(os.homedir(), '.orc');
-  return path.join(home, 'auth');
-}
+const BIN_ENV: Record<Provider, string | undefined> = { claude: 'ORC_CLAUDE_BIN', pi: undefined };
 
 /** process.env minus ORC_* (except provider bin overrides), with the shim dir first on PATH. */
 function baseEnv(shimDir: string): Record<string, string> {
@@ -313,22 +299,7 @@ function baseEnv(shimDir: string): Record<string, string> {
     env[k] = v;
   }
   env.PATH = `${shimDir}${path.delimiter}${process.env.PATH ?? ''}`;
-  env.ORC_AUTH_DIR = realOrcAuthDir();
   return env;
-}
-
-/** codex preflight: which OpenAI credential the harness would use (never a secret). */
-async function codexCredential(env: Record<string, string>): Promise<string | undefined> {
-  const prev = process.env.ORC_AUTH_DIR;
-  process.env.ORC_AUTH_DIR = env.ORC_AUTH_DIR;
-  try {
-    return (await resolveCodexAuth(env)).label;
-  } catch {
-    return undefined;
-  } finally {
-    if (prev === undefined) delete process.env.ORC_AUTH_DIR;
-    else process.env.ORC_AUTH_DIR = prev;
-  }
 }
 
 function writeExecutable(file: string, body: string): void {
@@ -350,6 +321,29 @@ function versionOf(bin: string, env: Record<string, string>): string {
   const r = Bun.spawnSync([bin, '--version'], { env, stdout: 'pipe', stderr: 'pipe', stdin: 'ignore', timeout: 20_000 });
   const text = (r.stdout.toString() || r.stderr.toString()).trim().split('\n')[0] ?? '';
   return r.exitCode === 0 ? text || '?' : `? (--version exited ${r.exitCode})`;
+}
+
+/**
+ * Readiness stays provider-owned. These native status commands print no credentials;
+ * never use Pi's --credentials / print-*-token modes here. An older/custom executable
+ * without the status command is tested by the runtime gate instead of guessed about.
+ */
+function nativeAuthBlock(p: Provider, bin: string, env: Record<string, string>, model?: string): string | undefined {
+  if (p === 'pi' && !model) return undefined; // Pi's native check requires an explicit target.
+  const argv = p === 'claude'
+    ? [bin, 'auth', 'status', '--json']
+    : [bin, 'auth', 'check', '--model', model!, '--json', '--no-refresh'];
+  const result = Bun.spawnSync(argv, { env, stdin: 'ignore', stdout: 'pipe', stderr: 'ignore', timeout: 20_000 });
+  try {
+    const status = JSON.parse(result.stdout.toString()) as Record<string, unknown>;
+    if (p === 'claude' && status.loggedIn === false) return 'blocked: Claude is not authenticated; run `claude auth login`';
+    if (p === 'pi' && status.status === 'not_ready' && status.reason === 'credentials_not_configured') {
+      return 'blocked: Pi has no credential for the selected model; configure Pi /login or the provider API key';
+    }
+  } catch {
+    // Not a supported readiness response: the actual runtime reports any failure.
+  }
+  return undefined;
 }
 
 // ---------------------------------------------------------------------------------
@@ -704,7 +698,7 @@ interface GateResult {
   rows: { status: string; check: string; detail: string }[];
 }
 
-/** Parse the three gate table formats (claude: "PASS  step …", codex: "#  check PASS …", pi: "step  PASS …"). */
+/** Parse the retained gate tables (claude: "PASS  step …", pi: "step  PASS …"). */
 function parseGateRows(text: string): GateResult['rows'] {
   const out: GateResult['rows'] = [];
   for (const raw of text.split('\n')) {
@@ -712,11 +706,6 @@ function parseGateRows(text: string): GateResult['rows'] {
     let m = /^(PASS|FAIL|SKIP|WARN)\s{2}(.+?)\s{2,}\d+ms\s{2}(.*)$/.exec(line);
     if (m) {
       out.push({ status: m[1]!, check: m[2]!.trim(), detail: m[3]! });
-      continue;
-    }
-    m = /^\s*\d+\s{2}(.+?)\s{2}(PASS|FAIL)\s+\S+s\s{2}(.*)$/.exec(line);
-    if (m) {
-      out.push({ status: m[2]!, check: m[1]!.trim(), detail: m[3]! });
       continue;
     }
     m = /^(.+?)\s{2}(PASS|FAIL|WARN)\s+\d+\s{2}(.*)$/.exec(line);
@@ -803,19 +792,6 @@ async function main(): Promise<number> {
       providerInfo[p] = { selected: false };
       continue;
     }
-    if (p === 'codex') {
-      const cred = await codexCredential(env);
-      if (!cred) {
-        providerInfo[p] = { selected: true };
-        record(p, 'preflight', 'SKIP', 'no OpenAI credential: run `orc login chatgpt`, log in to pi, or set OPENAI_API_KEY');
-        continue;
-      }
-      providerInfo[p] = { selected: true, bin: 'built-in harness', version: sanitize(cred), model: args.model[p] ?? '(account default)' };
-      record(p, 'preflight', 'PASS', `built-in harness — ${sanitize(cred)}`);
-      if (!args.model[p]) console.log(`  note  codex will use the first model your account lists (pass --codex-model <id> to choose)`);
-      available.push(p);
-      continue;
-    }
     const bin = resolveBin(p, env);
     if (!bin) {
       providerInfo[p] = { selected: true };
@@ -830,6 +806,11 @@ async function main(): Promise<number> {
       overridden: !!args.bin[p],
       model: args.model[p] ?? '(provider default)',
     };
+    const authBlock = nativeAuthBlock(p, bin, env, args.model[p]);
+    if (authBlock) {
+      record(p, 'preflight', 'SKIP', authBlock);
+      continue;
+    }
     record(p, 'preflight', 'PASS', `${bin} — ${version}${args.bin[p] ? ' (override)' : ''}`);
     if (!args.model[p]) {
       console.log(`  note  ${p} will use your default model (pass --${p}-model <cheap model> to choose)`);
@@ -936,7 +917,7 @@ async function main(): Promise<number> {
   };
   fs.writeFileSync(resultsPath, `${JSON.stringify(results, null, 2)}\n`);
   console.log(
-    `\n${ok ? 'ALL PASSED' : 'FAILED'}: ${counts.PASS} pass, ${counts.FAIL} fail, ${counts.SKIP} skip — results: ${sanitize(resultsPath)}` +
+    `\n${ok ? (counts.SKIP > 0 ? 'NO FAILURES (checks skipped)' : 'ALL PASSED') : 'FAILED'}: ${counts.PASS} pass, ${counts.FAIL} fail, ${counts.SKIP} skip — results: ${sanitize(resultsPath)}` +
       (args.keep ? `\nkept: ${root}` : ''),
   );
   return ok ? 0 : 1;

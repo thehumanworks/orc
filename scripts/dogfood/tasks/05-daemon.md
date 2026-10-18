@@ -1,8 +1,7 @@
 # Task: orc daemon — HTTP API + tailscale federation (feature 3)
 
 > **Completed** (the feature shipped). Kept as an example task spec for `scripts/dogfood/run.ts`.
-> Written for the pre-actor runtime: tmux- and codex-CLI-specific steps were removed (codex is now
-> orc's built-in harness); other details (e.g. the large-paste bug) are historical. Current
+> Written for the pre-actor runtime: tmux- and codex-CLI-specific steps were removed (OpenAI and Codex models now run through Pi); other details (e.g. the large-paste bug) are historical. Current
 > behaviour: `README.md`, `docs/ARCHITECTURE.md`.
 
 > Spawn this ONLY after F2b (`--detach`/`logs`) is merged — the daemon exposes the workflow surface.

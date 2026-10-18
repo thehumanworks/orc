@@ -10,7 +10,7 @@ import type { McpMode } from './tools.ts';
 /** Hard cap for the instructions text: older Claude Code keeps 2,048 characters (enforced by test/mcp-tools.test.ts). */
 export const INSTRUCTIONS_MAX_CHARS = 2_048;
 
-const BODY = `orc runs coding agents (claude, codex, pi) as durable background sessions. You are the LEAD: orchestrate, don't implement. Plan, delegate, verify, integrate.
+const BODY = `orc runs coding agents (claude, pi) as durable background sessions. You are the LEAD: orchestrate, don't implement. Plan, delegate, verify, integrate.
 
 Loop: spawn returns at once with an id -> wait (bounded; "still running" is normal, call wait again) -> read the last turn -> send the next instruction. done means the agent yielded and awaits input, not that it succeeded: accept work only on hard evidence (tests run, diff read, commits present).
 

@@ -21,6 +21,10 @@ const out = (o: unknown) => process.stdout.write(`${JSON.stringify(o)}\n`);
 const argv = process.argv.slice(2);
 const sidIdx = argv.indexOf('--session-id');
 const sessionId = sidIdx >= 0 ? argv[sidIdx + 1] : 'fake';
+const model = {
+  id: process.env.FAKE_MODEL_ID ?? 'fake-model',
+  provider: process.env.FAKE_MODEL_PROVIDER ?? 'fake',
+};
 
 if (mode === 'hang') {
   process.on('SIGTERM', () => {});
@@ -46,6 +50,10 @@ rl.on('line', (line) => {
     return;
   }
   switch (cmd.type) {
+    case 'get_available_models':
+      out({ id: cmd.id, type: 'response', command: 'get_available_models', success: true,
+        data: { models: process.env.FAKE_MODEL_UNAVAILABLE === '1' ? [] : [model] } });
+      return;
     case 'get_state':
       if (mode === 'mute') return;
       out({
@@ -54,10 +62,10 @@ rl.on('line', (line) => {
         command: 'get_state',
         success: true,
         data: {
-          model: { id: 'fake-model', provider: 'fake' },
+          model,
           thinkingLevel: 'off',
           sessionFile: `/nonexistent/${sessionId}.jsonl`,
-          sessionId,
+          sessionId: process.env.FAKE_SESSION_ID ?? sessionId,
           messageCount: 0,
         },
       });

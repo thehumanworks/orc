@@ -135,6 +135,53 @@ afterAll(() => {
 });
 
 describe('pi runtime lifecycle (fake pi)', () => {
+  test('a qualified selector cannot silently select another Pi provider or model', async () => {
+    for (const model of ['openai/fake-model', 'fake/another-model']) {
+      const l = launch('slow');
+      l.spec.model = model;
+      await expect(factory().start(l)).rejects.toThrow(/requested model .* but Pi selected/);
+      expect(rawLog(l).filter((r) => r.dir === 'send').every((r) => !r.line.includes('"type":"prompt"'))).toBe(true);
+      expect(processesMentioning(l.spec.sessionId)).toEqual([]);
+    }
+  }, 15_000);
+
+  test('exact OpenAI selector and a supported thinking suffix retain the Pi path', async () => {
+    for (const model of ['openai/gpt-5.5', 'openai/gpt-5.5:high']) {
+      const l = launch('slow', { FAKE_MODEL_PROVIDER: 'openai', FAKE_MODEL_ID: 'gpt-5.5' });
+      l.spec.model = model;
+      const rt = await start(factory(), l);
+      const { events, done } = collect(rt);
+      await rt.close({ graceMs: 500 });
+      await done;
+      expect(events[0]).toMatchObject({ type: 'ready', info: { model: 'openai/gpt-5.5' } });
+      expect(rawLog(l).some((r) => r.dir === 'info' && r.line.includes('"--provider","openai","--model"'))).toBe(true);
+      expect(rawLog(l).filter((r) => r.dir === 'send').map((r) => JSON.parse(r.line).type))
+        .toEqual(['get_state', 'get_available_models']);
+    }
+  }, 15_000);
+
+  test('a qualified model absent from Pi available models fails before a prompt', async () => {
+    const l = launch('slow', { FAKE_MODEL_PROVIDER: 'openai', FAKE_MODEL_ID: 'gpt-5.5', FAKE_MODEL_UNAVAILABLE: '1' });
+    l.spec.model = 'openai/gpt-5.5';
+    await expect(factory().start(l)).rejects.toThrow(/not available in Pi's authenticated model list/);
+    expect(rawLog(l).filter((r) => r.dir === 'send').every((r) => !r.line.includes('"type":"prompt"'))).toBe(true);
+    expect(processesMentioning(l.spec.sessionId)).toEqual([]);
+  }, 10_000);
+
+  test('a literal colon model id is checked before interpreting a thinking suffix', async () => {
+    const l = launch('slow', { FAKE_MODEL_PROVIDER: 'openrouter', FAKE_MODEL_ID: 'vendor/model:exacto' });
+    l.spec.model = 'openrouter/vendor/model:exacto';
+    const rt = await start(factory(), l);
+    await rt.close({ graceMs: 500 });
+  }, 10_000);
+
+  test('a different session id is refused before any prompt is delivered', async () => {
+    const l = launch('slow', { FAKE_SESSION_ID: 'different-session' });
+    await expect(factory().start(l)).rejects.toThrow(/requested session .* but Pi opened 'different-session'/);
+    expect(rawLog(l).filter((r) => r.dir === 'send').every((r) => !r.line.includes('"type":"prompt"'))).toBe(true);
+    expect(processesMentioning(l.spec.sessionId)).toEqual([]);
+  }, 10_000);
+
   test(
     'close: provider ignores stdin EOF and SIGTERM → group SIGKILLed; exited is last',
     async () => {

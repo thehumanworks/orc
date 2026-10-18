@@ -1,19 +1,23 @@
 # orc
 
-`orc` runs coding agents (`claude`, `codex`, `pi`) as durable, detached sessions that other
+`orc` runs coding agents (`claude`, `pi`) as durable, detached sessions that other
 agents (and humans) drive. Its core primitive, `agent()`, starts one **actor process per session**
 that drives the provider over a **structured protocol** (no terminal, no screen scraping),
-optionally in a fresh git worktree, in yolo mode by default. `claude` and `pi` are their own CLIs;
-`codex` is orc's **built-in harness** on the OpenAI Responses API (no codex CLI needed).
+optionally in a fresh git worktree, in yolo mode by default. `claude` and `pi` are their own CLIs.
+OpenAI and Codex model access goes through Pi's supported model providers and authentication;
+orc has no separate Codex execution harness.
 
-- **Durable.** Each session has a mailbox (`inbox/`) and an append-only journal. Prompts survive an
-  actor crash or a reboot; the next `orc send` (or `orc resume`) wakes the session.
+- **Durable.** Each session has a mailbox (`inbox/`) and an append-only journal. Queued prompts
+  survive an actor crash or a reboot; the next `orc send` (or `orc resume`) wakes the session.
+  A prompt whose delivery is uncertain is recorded for inspection and never automatically resent.
 - **Observable.** `orc read` (parsed transcript), `orc read --raw` (journal), `orc attach` (live
   journal view), `orc takeover` (hand the session to a human; `orc resume` takes it back).
 - **Scriptable.** A TypeScript SDK (Bun, ESM) and the `orc` CLI; every command takes `--json`.
 
 Design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (the current system) and
 [`docs/DESIGN-runtime.md`](docs/DESIGN-runtime.md) (the actor runtime and why it replaced tmux).
+Moving from `--provider codex`: [migration guide](docs/MIGRATION-pi.md).
+ORC retains its shared actor/workflow durability; see the [pi-durable decision](docs/decisions/pi-durable.md).
 
 ## Requirements
 
@@ -23,8 +27,8 @@ Design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (the current system) and
 | OS | macOS or Linux (POSIX process groups; macOS also needs `ps`). No Windows. |
 | at least one provider | see below; other CLI versions are not refused |
 | `claude` CLI | for `--provider claude`: on `PATH` (or `ORC_CLAUDE_BIN`), signed in. Verified: 2.1.300 |
-| `pi` CLI | only for `--provider pi`, and to continue a codex session after `orc takeover`. Verified: 1.2.0 |
-| OpenAI credential | for `--provider codex`: `orc login chatgpt`, pi's ChatGPT login, or `OPENAI_API_KEY` (see [codex](#codex-built-in-harness)). The `codex` CLI is **not** needed |
+| `pi` CLI | for `--provider pi`, including OpenAI/Codex models; on `PATH`. Reference version: 1.2.0 |
+| OpenAI credential | for Pi's `openai` model provider: Pi `/login` → Sign in with ChatGPT, or `OPENAI_API_KEY`; see [Pi and OpenAI](#pi-and-openaicodex-models) |
 | `git` | only for `--worktree` |
 | `tailscale` | only for `orc daemon` / `--host` |
 
@@ -85,7 +89,7 @@ orc kill "$ID"                 # stop it (record + journal kept; --purge removes
 | `running` | the session's actor holds a live lease | — |
 | `suspended` | actor gone without a stop (crash, reboot, provider exit) | the next `orc send` wakes it and resumes the provider session; `orc resume` does too |
 | `spawning` | reserved by `orc spawn` moments ago; the actor is being created (`state`: `starting`) | becomes `running`, or `dead` if the spawn died (after 10 min) |
-| `dead` | stopped by `orc kill` / `orc takeover`, a legacy tmux record, a codex app-server session, or no runtime state | sticky: never auto-wakes. `orc resume` hands a killed or taken-over session back |
+| `dead` | stopped by `orc kill` / `orc takeover`, a legacy record, or no runtime state | sticky: never auto-wakes. `orc resume` hands a supported killed or taken-over session back |
 
 **State:** what is the agent doing? (`orc state`, `orc wait`; derived from the journal)
 
@@ -105,6 +109,8 @@ Rules that matter for scripts:
 - A `suspended` session reads as `failed` with `suspended: true`; `orc send` wakes it unless
   `--no-wake`. After 3 consecutive failed starts, auto-wake stops (`send` only queues) until
   `orc resume`.
+- Historical Codex records and history remain readable. They cannot receive prompts or resume
+  the removed harness; [continue their transcript in Pi](docs/MIGRATION-pi.md#existing-sessions).
 - `orc kill` drops messages still queued for the session (their delivery becomes `failed`).
   `kill --worktree` and `prune --worktree` remove the worktree checkout but keep its branch (it may
   hold the agent's commits); delete the branch yourself once merged.
@@ -117,7 +123,7 @@ Rules that matter for scripts:
 ## CLI
 
 ```
-orc spawn  --provider <claude|codex|pi> [options]   Launch a session (aliases: agent, new)
+orc spawn  --provider <claude|pi> [options]         Launch a session (aliases: agent, new)
 orc send   <id|@alias> [PROMPT | - | @file] [--idempotency-key K] [--no-wake]
 orc read   <id|@alias> [--last|--index N|--full|--raw]  Latest parsed turn; --full transcript; --raw journal
 orc state  <id|@alias>                              starting|running|done|waiting|failed
@@ -131,9 +137,6 @@ orc prune  [--worktree] [--suspended] [--taken-over]  Drop dead records (+ sessi
 orc workflow <run|list|status|attach|logs|resume|retry|cancel|cleanup> ...   (alias: wf)
 orc daemon [--port 8787] [--bind <ip>] [--insecure] Serve the HTTP API over tailscale
 orc remote <add|list|rm> <host> [--port P]          Manage trusted peers
-orc login  chatgpt [--import-pi] [--no-browser]     Sign in with ChatGPT (codex)
-orc login  status [--json]                          Which OpenAI credential codex uses
-orc logout chatgpt                                  Remove orc's ChatGPT credential
 orc settings [--json]                               Effective settings and where each value comes from
 orc mcp    [--wait-timeout SEC]                     Serve these commands as MCP tools over stdio (see MCP)
 orc --host <h> <command>                            Run a command against a peer's daemon
@@ -163,8 +166,8 @@ control characters stripped.
 
 | flag | meaning |
 | --- | --- |
-| `--provider, -p` | `claude` \| `codex` \| `pi` (required unless [settings](#settings-orc_host-and-settingstoml) set `provider`) |
-| `--model, -m` | model name; default: settings `[models].<provider>` (not with `--agent`), else the provider's own (codex: the first model your account lists, recorded on the session) |
+| `--provider, -p` | `claude` \| `pi` (required unless [settings](#settings-orc_host-and-settingstoml) set `provider`) |
+| `--model, -m` | model name; for Pi prefer `<model-provider>/<model-id>`, e.g. `openai/gpt-5.5`. Default: settings `[models].<provider>` (not with `--agent`), else the provider's own |
 | `--agent <name>` | named agent definition (exclusive with `--system-prompt`) |
 | `--alias <name>` | workspace-scoped handle (`@name`); does not change agent behaviour |
 | `--system-prompt <txt>`, `--system-prompt-mode` | system prompt; `append` (default) \| `replace` |
@@ -191,9 +194,6 @@ dir, and removes a `--worktree` it created.
 | `resume` | 0 / 1 | same shape as `state --json` |
 | `takeover` | 0 / 1 | `{id, cwd, command, note?}` |
 | `prune` | 0 / 1 | `{ok, pruned: [ids]}` |
-| `login chatgpt` | 0 signed in / imported; 1 failed | — (prints the default codex model) |
-| `login status` | 0; 1 when a credential file is unreadable | `{active: orc\|pi\|env\|none\|error, error?, orc: {path, credential}, pi: {path, credential}, openaiApiKey}` (no secrets) |
-| `logout chatgpt` | 0 | — (orc's credential only; pi's login is untouched) |
 | `workflow run` | 0 run `done`; 1 otherwise; 143 runner got SIGTERM | final `WorkflowRun`; `--detach`: `{runId, logPath}` |
 
 With `--json`, errors print `{"error": "..."}` on stdout and exit 1.
@@ -208,13 +208,13 @@ With `--json`, errors print `{"error": "..."}` on stdout and exit 1.
 - A killed or taken-over session refuses sends until `orc resume`.
 - With no prompt argument, `send` reads stdin when it is not a terminal (blocking until EOF; empty
   input is an error) and errors on a terminal. `spawn` never reads stdin implicitly.
-- There is no per-subcommand `--help`; `orc help` prints the whole reference.
+- `orc send --help` shows its options; `orc help` prints the whole reference.
 
 ### Examples
 
 ```sh
 orc send "$ID" @prompt.txt                         # multi-line file, delivered as ONE message
-orc spawn -p codex --alias reviewer --prompt "review the failing test"
+orc spawn -p pi -m openai/gpt-5.5 --alias reviewer --prompt "review the failing test"
 orc read @reviewer                                 # same workspace
 orc send @orc:reviewer "focus on the registry"     # from outside a workspace named `orc`
 orc read "$ID" --full                              # full parsed transcript
@@ -251,74 +251,86 @@ await s.kill({ removeWorktree: true });
 
 ## Providers
 
-| | claude | codex | pi |
-| --- | --- | --- | --- |
-| protocol | `claude -p` stream-json over stdio | orc's harness (`orc __codex-harness`, JSONL over stdio) → OpenAI Responses API | `pi --mode rpc` |
-| yolo | `--permission-mode bypassPermissions` | always (no approvals; tools run unattended) | `-a` |
-| system prompt | `--append-system-prompt-file` / `--system-prompt-file` | harness prompt + file (append) / the file alone (replace) | `--append-system-prompt` / `--system-prompt` `<file>` |
-| `--agent` | native `--agent <name>` | resolved body → system prompt | resolved body → system prompt |
-| transcript (`orc read`) | `~/.claude/projects/*/<id>.jsonl` | `~/.orc/sessions/<sid>/codex-session.jsonl` (pi session format) | `~/.orc/transcripts/pi/<sid>/` |
-| `orc takeover` prints | `claude --resume <id> …` | `pi --session <codex-session.jsonl>` | `pi … --session-id … --session-dir …` |
-| binary | `ORC_CLAUDE_BIN` or `PATH` | none (built into orc) | `PATH` |
+| | claude | pi |
+| --- | --- | --- |
+| protocol | `claude -p` stream-json over stdio | `pi --mode rpc` |
+| yolo | `--permission-mode bypassPermissions` | `-a` |
+| system prompt | `--append-system-prompt-file` / `--system-prompt-file` | `--append-system-prompt` / `--system-prompt` `<file>` |
+| `--agent` | native `--agent <name>` | resolved body → system prompt |
+| transcript (`orc read`) | `~/.claude/projects/*/<id>.jsonl` | `~/.orc/transcripts/pi/<sid>/` |
+| `orc takeover` prints | `claude --resume <id> …` | `pi … --session-id … --session-dir …` |
+| binary | `ORC_CLAUDE_BIN` or `PATH` | `PATH` |
 
 - System prompts live in an orc-owned file (`~/.orc/sessions/<sid>/system-prompt.md`), never on
   argv and never in the worktree. orc never writes `AGENTS.md` or provider config.
 - claude runs with `--setting-sources user,project,local` (never `--bare`), so skills, agents and
   hooks load. Permission requests that still arrive (claude `can_use_tool`, pi dialogs) are
-  journaled and denied; the codex harness never asks.
+  journaled and denied.
 - Slash commands, verified live with claude 2.1.300 through `orc send`: `/compact` compacts the
   session (the turn completes with an empty result; earlier context survives as a summary), and
   `/goal <condition>` sets a goal the turn keeps working toward until it holds. Interactive
-  pickers and `/login` don't work. pi slash commands are unverified; the codex harness has none
-  (a `/…` message is sent to the model as text).
+  pickers and `/login` don't work through orc; run provider login in its own interactive CLI.
+  Pi slash-command behaviour is owned by Pi and is not an ORC runtime guarantee.
 
 `--agent <name>` resolution, each provider's own store first:
 
 | provider | order |
 | --- | --- |
 | claude | native: `.claude/agents/` → `~/.claude/agents/` |
-| codex | `.codex/agents/*.toml` (by `name`) → `$CODEX_HOME/agents/*.toml` → `.codex/prompts/<name>.md` → `$CODEX_HOME/prompts/<name>.md` → `.claude/agents/<name>.md` → `~/.claude/agents/<name>.md` |
 | pi | `.claude/agents/<name>.md` → `~/.claude/agents/<name>.md` |
 
-A codex TOML agent's `developer_instructions` become the system prompt, and its `model` applies
-when `--model` is omitted. An unresolvable name is an error that lists the locations searched.
+Pi receives the Markdown body as its system prompt; Claude-specific frontmatter model aliases
+are not applied to Pi. Use `--model` explicitly or Pi's configured default. An unresolvable name
+is an error that lists the locations searched. Move former Codex TOML agents to this format as
+described in the [migration guide](docs/MIGRATION-pi.md#agent-definitions).
 
-### codex (built-in harness)
+### Pi and OpenAI/Codex models
 
-`--provider codex` runs orc's own coding agent: the actor starts `orc __codex-harness <sid>`
-(the same binary), which embeds [pi-ai](https://www.npmjs.com/package/@earendil-works/pi-ai) and
-pi-agent-core 1.2.0 and calls `https://api.openai.com/v1/responses` directly.
+ORC's `provider` selects an integration (`pi` or `claude`). For Pi, the `model` selects a
+**Pi model provider and model ID**, such as `openai/gpt-5.5`. Pi owns the agent loop, tools,
+compaction, model discovery, authentication and token refresh. ORC owns detached execution,
+delivery receipts and workflow durability.
 
-- **Credentials**, first match wins: `orc login chatgpt` (Sign in with ChatGPT, stored 0600 in
-  `~/.orc/auth/chatgpt.json`), then pi's ChatGPT login (`~/.pi/agent/auth.json` or
-  `$PI_CODING_AGENT_DIR`), then `OPENAI_API_KEY`. `orc login status` shows which one is active. A
-  refreshed token is written back to the store it came from (pi's file under pi's own lock).
-  `orc login chatgpt --import-pi` copies pi's login instead of signing in; the copies then
-  refresh independently.
-- **Login** prints (and, unless `--no-browser`, opens) the ChatGPT authorize URL and waits for
-  the browser on `http://127.0.0.1:1455/auth/callback`; from a remote shell, paste the final
-  redirect URL. On success it prints the default codex model. `orc logout chatgpt` removes orc's
-  credential only (pi's login stays and is then used).
-- **Eligibility.** Sign in with ChatGPT is an OpenAI program: eligible ChatGPT Plus/Pro users can
-  opt in to plan usage, which OpenAI offers to open-source projects and personal projects that
-  run locally (paid or remotely hosted apps must request access first). See OpenAI's
-  [Sign in with ChatGPT](https://developers.openai.com/cookbook/articles/sign-in-with-chatgpt)
-  guide. Otherwise set `OPENAI_API_KEY`.
-- **Model**: `--model`, else (on resume) the session's model, else the live default: the first
-  model your ChatGPT account lists (server order), or with an API key the newest chat model in
-  pi-ai's catalog (`GET /v1/models`, cached 10 min). The choice is recorded on the session and
-  printed by `orc spawn`. If no model can be listed, spawn fails and asks for `--model`.
-- **Tools**: `read`, `write`, `edit`, `bash`, `ls` (pi's names and schemas), in the session cwd,
-  unsandboxed. `bash` commands live in the harness's process group, so `orc kill` stops them.
-- **Session file**: pi's session JSONL v3 at `~/.orc/sessions/<sid>/codex-session.jsonl`; resume
-  replays it. `orc takeover` prints `cd <cwd> && pi --session <file>` (pi ≥ 1.2.0 with its own
-  OpenAI login); `orc resume` continues whatever pi appended.
-- **Known limitation: no context compaction yet.** When a conversation outgrows the model's
-  context window the turn fails ("the conversation exceeds the model's context window; start a
-  new session"). Start a fresh session and hand it a summary. (claude's `/compact` does not apply:
-  the harness has no slash commands.)
-- **Legacy sessions** from the removed `codex app-server` runtime are `dead`, have no transcript in
-  `orc read`, and cannot be resumed (see the upgrade notes).
+Install the reference CLI on every execution host (Node >=22.19.0 for npm installations):
+
+```sh
+npm install --global --ignore-scripts @earendil-works/pi-coding-agent@1.2.0
+pi --version
+pi
+```
+
+This pins the CLI package only; Pi 1.2.0's internal dependencies use version ranges. A
+reproducible installation also needs a lockfile or the corresponding upstream release's pinned
+installation artifacts. ORC does not install or silently upgrade Pi.
+
+Inside Pi, run `/login openai` and select **Sign in with ChatGPT**, or set `OPENAI_API_KEY` in
+the environment that launches the ORC actor. Both are supported by Pi 1.2.0's `openai` provider.
+Existing Pi login can be reused; an old `orc login` credential is not imported automatically.
+Pi's stored credential takes precedence over the environment key, so use Pi `/logout` if you
+intend to switch that provider to API-key authentication.
+
+```sh
+pi --list-models gpt                              # choose an available chat model
+orc spawn -p pi -m openai/gpt-5.5 --prompt "reply READY"
+```
+
+Use a model available to your configured Pi provider/account. A qualified selection is exact:
+ORC passes it as separate Pi `--provider` and `--model` arguments, then verifies the selected
+model and Pi's available-model list before releasing any queued prompt. An unknown or
+unavailable selection fails startup with guidance. Configure new or custom model IDs in Pi's
+[`models.json`](https://github.com/earendil-works/pi/blob/06a466935536f8c9bcacb2d5efc0fc021be1bdff/packages/coding-agent/docs/models.md).
+Pi's supported `:thinking` suffix can follow the model ID; existing bare Pi aliases/patterns
+still use Pi's resolution. With no ORC model override, Pi uses its own settings/default.
+
+Pi's `openai-codex` model provider is a separate legacy Codex backend with its own login route;
+it is not an alias for `openai`. Use it only when explicitly configured and authenticated in
+Pi. Its model names remain valid Pi selections and do not create another ORC integration.
+
+The exact login definitions and interfaces were checked against Pi 1.2.0
+([OpenAI provider](https://github.com/earendil-works/pi/blob/06a466935536f8c9bcacb2d5efc0fc021be1bdff/packages/ai/src/providers/openai.ts),
+[RPC documentation](https://github.com/earendil-works/pi/blob/06a466935536f8c9bcacb2d5efc0fc021be1bdff/packages/coding-agent/docs/rpc.md)).
+This is interface/authentication support, not proof of account eligibility or a live request on
+every host. `verify:live` reports actual provider checks separately from mocked protocol tests.
 
 ## Workflows
 
@@ -374,7 +386,7 @@ export default {
   name: 'feature',
   steps: [
     { id: 'implement', provider: 'claude', worktree: true, taskFile: 'tasks/01.md' },
-    { id: 'review', provider: 'codex', needs: ['implement'], cwd: '${implement.worktree}',
+    { id: 'review', provider: 'pi', needs: ['implement'], cwd: '${implement.worktree}',
       prompt: 'Review the diff on this branch; write findings to REVIEW.md',
       verify: { file: { path: 'REVIEW.md' } } },
   ],
@@ -400,7 +412,7 @@ neither) by `state === 'done' && commitsAhead >= 1`. A non-worktree step with no
 **unverified** and fails unless `allowUnverified`. Step sessions are left alive for inspection;
 `orc workflow cleanup <runId> --sessions --worktrees` removes what the run owns.
 
-Runnable example: `orc workflow run orc.workflows/example.ts --json` (claude writes a token, codex
+Runnable example: `orc workflow run orc.workflows/example.ts --json` (claude writes a token, pi
 reads it back).
 
 ## Daemon & remote hosts
@@ -480,8 +492,8 @@ Codex, any MCP client) at it and it runs a team of agents through tool calls.
 | `workflow_cancel`, `workflow_cleanup` | `workflow cancel\|cleanup <runId> …` | `admin` |
 
 Not exposed, on purpose: `attach` and `workflow attach` (live streams for a human; use `read` /
-`workflow_logs`), `takeover` (hands a session to a human: the lead keeps the reins), `login` /
-`logout` (credentials), `daemon` and `remote` (serving and trust configuration), `mcp`, `help`.
+`workflow_logs`), `takeover` (hands a session to a human: the lead keeps the reins), `daemon` and
+`remote` (serving and trust configuration), `mcp`, `help`. Provider login belongs to its CLI.
 
 **stdio** (the lead's machine). Add the server to the lead's client:
 
@@ -557,8 +569,7 @@ host = "studio"        # default remote target: host or host:port, as for --host
 provider = "claude"    # default `orc spawn --provider`
 [models]               # default --model per provider (spawn and workflow steps)
 claude = "haiku"
-codex  = "gpt-5.5"
-pi     = "openai/gpt-5"
+pi     = "openai/gpt-5.5"
 ```
 
 - **Files.** Global: `$ORC_HOME/settings.toml`. Local: the **nearest** `<dir>/.orc/settings.toml`
@@ -568,9 +579,12 @@ pi     = "openai/gpt-5"
   global file itself (running from `~`) is ignored as local. Local overrides global per key,
   `[models]` per provider.
 - **Validation.** Unknown keys or tables warn once on stderr (forward compatible). A wrong type or
-  value (provider not `claude|codex|pi`, empty strings, bad host syntax) or unparsable TOML is an
+  value (provider not `claude|pi`, empty strings, bad host syntax) or unparsable TOML is an
   error that names the file and key. An invalid `ORC_HOST` refuses only the commands it would
   route (with `--local` or `--host` it is irrelevant; `orc settings` shows it as a note).
+- The removed `provider = "codex"` and `[models].codex` fail with migration instructions.
+  Change the provider to `pi` and move the model to `[models].pi` with its Pi provider prefix;
+  files are never rewritten automatically. See [migration](docs/MIGRATION-pi.md#configuration-and-public-interfaces).
 - **`orc settings [--json]`** prints each effective value with its source (flag / env / local
   file / global file / default), the files considered and any warnings.
 
@@ -584,7 +598,7 @@ pi     = "openai/gpt-5"
   `workflow`, and prints one line on stderr — `orc: → studio (from ORC_HOST)` or
   `(from /path/settings.toml)` — even with `--json` (stdout stays machine-clean).
   `list --all-hosts` is unaffected. Host-local commands (`daemon`, `remote`, `resume`, `takeover`,
-  `prune`, `login`, `logout`, `settings`, `help`) ignore default hosts; an explicit `--host` on them
+  `prune`, `settings`, `help`) ignore default hosts; an explicit `--host` on them
   is still an error.
 - `spawn` resolves provider and model on the client and sends them explicitly, locally or remote.
 - **Safety.** A `host` from a **local** (project) file is honoured only for a trusted peer
@@ -622,14 +636,16 @@ peers.json                 trusted daemon peers
 settings.toml              global settings (optional; see Settings)
 locks/                     cross-process locks (a lock whose owner process is gone is reclaimed
                            at once; one with no recorded owner after 5 min)
-auth/                      codex login: chatgpt.json, device-id (ORC_AUTH_DIR overrides)
-cache/codex-models.json    codex model list per account (ids only, 10 min)
 sessions/<sid>/            spawn.json, state.json, journal.jsonl, inbox/, provider.jsonl,
-                           actor.log, system-prompt.md, codex-session.jsonl (codex)
+                           actor.log, system-prompt.md
 transcripts/pi/<sid>/      pi session files
 runs/<runId>.json          workflow run record (the plan includes step prompts)
 runs/<runId>/              runner.log, instruction drops, attempts/, artifacts/, inputs/
 ```
+
+Old Codex `auth/`, `cache/codex-models.json` and `codex-session.jsonl` files remain on disk;
+orc no longer reads the credentials or updates that model cache. Pi owns its authentication
+under `~/.pi/agent` (or `PI_CODING_AGENT_DIR`). Historical transcript reads remain supported.
 
 Prompt bodies, replies and step prompts are stored under `~/.orc`, **owner-only**: orc creates
 directories 0700 and files 0600 whatever the umask, and tightens state left by older versions the
@@ -641,25 +657,23 @@ delete a session's dir.
 | `ORC_HOME` | state root (default `~/.orc`) |
 | `ORC_HOST` | default remote host for remote-capable commands (`""` = none; see Settings) |
 | `ORC_CLAUDE_BIN` | claude executable |
-| `ORC_AUTH_DIR` | codex login dir (default `$ORC_HOME/auth`) |
-| `OPENAI_API_KEY` | codex fallback credential (API-key Responses API) |
-| `PI_CODING_AGENT_DIR` | where codex looks for pi's login (pi's own variable) |
-| `ORC_CODEX_THINKING` | codex reasoning level: `off`/`minimal`/`low`/`medium` (default)/`high`/`xhigh`/`max` |
-| `ORC_CODEX_MAX_RETRIES` | codex retries for 408/409/429/5xx (default 2) |
-| `ORC_CODEX_BOOT_TIMEOUT_MS` | codex harness ready timeout (default 60000) |
+| `OPENAI_API_KEY` | Pi `openai` provider's API-key authentication (Pi's stored credential takes precedence) |
+| `PI_CODING_AGENT_DIR` | Pi's own settings/authentication directory |
 | `ORC_CLAUDE_READY_TIMEOUT_MS` | claude initialize timeout (default 60000) |
 | `ORC_ACTOR_READY_TIMEOUT_MS` | the actor's provider-ready timeout (default 120000) |
 | `ORC_WORKFLOW_ROOTS` | daemon REST workflow import allowlist (`path.delimiter`-separated; see Daemon for its limits) |
 | `ORC_DAEMON_TOKENS`, `ORC_DAEMON_TOKEN`, `ORC_DAEMON_SECRET` | daemon auth (server, client, legacy) |
-| `CODEX_HOME` | codex agent/prompt lookup |
+
+Removed `ORC_AUTH_DIR`, `ORC_CODEX_*` and Codex-agent `CODEX_HOME` settings have no role in
+new sessions. Map them to Pi configuration using the [migration guide](docs/MIGRATION-pi.md).
 
 ## Development & verification
 
 ```sh
-bun test                                   # unit + fake-provider suites (codex: a local fake OpenAI server)
+bun test                                   # unit + fake-provider + retained architecture regressions
 bun run typecheck                          # tsc --noEmit (src, test, scripts)
-bun run check:compile                      # compile orc; run the codex harness's offline self-test
-bun run verify:live --claude-model haiku   # live end-to-end on an authenticated host
+bun run check:compile                      # standalone binary: Pi/Claude protocol + lifecycle smoke
+bun run verify:live --claude-model haiku --pi-model openai/gpt-5.4-mini # authenticated live checks
 ```
 
 With Nix, `nix develop` provides the toolchain and `nix flake check` builds, smoke-tests and
@@ -668,30 +682,35 @@ typechecks orc in the sandbox: see [Nix](#nix).
 `verify:live` runs `scripts/verify-runtime/all.ts`: per-provider runtime gates; CLI end-to-end
 (spawn, idempotent send, SIGKILL the actor → `suspended` → wake, takeover/resume, kill/prune); a
 detached workflow; and a check that `tmux` is never invoked. A missing provider is SKIP; any FAIL
-exits 1. Everything runs in a temp `ORC_HOME`; expect a few cents with haiku. Flags, every row and
-the per-provider gates: [`scripts/verify-runtime/README.md`](scripts/verify-runtime/README.md).
+exits 1. A native status command reporting no credentials produces **SKIP: blocked**, not a live
+pass. Everything runs in a temp `ORC_HOME`; choose an inexpensive chat model available to your
+account. Flags, every row and the per-provider gates:
+[`scripts/verify-runtime/README.md`](scripts/verify-runtime/README.md).
 
 ### Live verification on a Mac
 
-You need Bun ≥ 1.3.3, git and a signed-in `claude`. `pi` (for the pi rows) and an OpenAI credential
-(for the codex rows) are optional: a provider you don't have is reported SKIP.
+You need Bun ≥ 1.3.3 and git, plus `claude` and/or `pi` authenticated through their own CLI.
+A missing provider binary or known missing credentials is reported SKIP. A binary being installed
+does not demonstrate authenticated model execution; read the runtime gate results.
 
 ```sh
-git clone -b feat/actor-runtime https://github.com/thehumanworks/orc.git && cd orc
+git clone https://github.com/thehumanworks/orc.git && cd orc
 bun install
 bun test && bun run typecheck                  # optional: the offline suites first
-bun src/cli/index.ts login status              # which OpenAI credential codex would use
-bun src/cli/index.ts login chatgpt             # only if status shows none and you want codex rows
-                                               # (or reuse pi's ChatGPT login, or export OPENAI_API_KEY)
+pi --list-models gpt                           # Pi /login openai first, or OPENAI_API_KEY
 bun scripts/verify-runtime/all.ts --claude-model haiku \
-    [--codex-model <model-id>] [--pi-model <provider>/<model-id>]
+    --pi-model openai/gpt-5.4-mini
 ```
 
-- Without `--codex-model`, codex uses your account's default model (`orc login chatgpt` prints
-  it); without `--pi-model`, pi uses its own default. Each run prints a note for such providers.
-- Read the table: one `preflight` row per provider (claude/pi: binary and `--version`; codex: which
-  credential), then `runtime gate`, the `e2e …` rows, the `workflow` rows (claude), and
-  `tmux never invoked`. Exit 0 means no FAIL.
+- Without `--pi-model`, Pi uses its own default. Use `--providers claude,pi` (the default) or
+  select either provider; `--claude-bin` and `--pi-bin` can point to specific test executables.
+- Read the table: one `preflight` row per provider (binary, `--version` and supported native auth
+  status), then `runtime gate`,
+  the `e2e …` rows, the `workflow` rows (claude), and
+  `tmux never invoked`. Exit 0 means no FAIL; SKIP rows still leave those checks unverified.
+- With an explicit `--pi-model`, preflight uses `pi auth check --json --no-refresh` without
+  `--credentials`; Claude uses `claude auth status --json`. Older/custom binaries without the
+  status interface reach the runtime gate. Model/configuration errors are not credential skips.
 - Results are also written to `verify-results.json` in the repo root (no tokens, emails or env;
   home paths shown as `~`); share that file. `--keep` keeps the temp root for debugging.
 - Ctrl-C is safe: it stops workflow runners, then the run's processes, then every actor and
@@ -708,8 +727,9 @@ worktree of this repo; `bun scripts/dogfood/run.ts watch <id>` supervises it unt
 on Linux and macOS, and `build.yml`, which builds `orc-<os>-<arch>` natively on four runners
 (linux/darwin × x64/arm64) with `bun run compile:cli`, the same script as local builds, and the Bun
 pinned in `.bun-version` (1.4.2). It smoke-tests each binary on the runner that built it
-(`--version` matches `package.json`, `--help`, the codex harness self-test, no `.env` /
-`bunfig.toml` autoload from the cwd) and uploads it as a workflow artifact. `nix.yml` checks the
+(`--version` matches `package.json`, `--help`, scripted Pi/Claude runtime and lifecycle checks,
+no `.env` / `bunfig.toml` autoload from the cwd) and uploads it as a workflow artifact. These
+offline mocks exercise the compiled binary; they do not call live models. `nix.yml` checks the
 [Nix](#nix) flake on the same events.
 
 To cut a release, bump `version` in `package.json`, merge to `main`, then tag that commit:
@@ -734,7 +754,7 @@ Optional: `flake.nix` adds a dev shell and a pure build. Without Nix nothing cha
 nix develop               # bun (nixpkgs; 1.4.2 at this lock), git, jq, bash, nixfmt; procps on Linux
 nix build                 # ./result/bin/orc, built by package.json's compile:cli
 nix run . -- --version    # or from anywhere: nix run github:thehumanworks/orc -- --version
-nix flake check           # orc, a smoke test (--version, --help, codex self-test), the typecheck
+nix flake check           # orc, the compiled Pi/Claude smoke test, the typecheck
 nix fmt                   # nixfmt (RFC style) on the .nix files
 ```
 
@@ -783,7 +803,7 @@ The full list of user-visible and breaking changes, with schema migrations, is i
    - new commands `resume` and `takeover`; `resume`, `takeover`, `prune`, `daemon` and `remote`
      are host-local under `--host`
 5. Yolo flags: claude `--permission-mode bypassPermissions` (was `--dangerously-skip-permissions`);
-   pi `--mode rpc -a`; codex is now orc's built-in harness (see below).
+   pi `--mode rpc -a`. The later dedicated Codex harness has now also been removed; use Pi.
 6. Daemon `api` is 2; in a mixed fleet check `GET /health` → `api`.
 7. SDK: removed `Session.tmuxName`, `Session.capture()`, `classifyState`, `reduceWait`,
    `AgentOptions.driver`, `pruneSessions({driver})`, `runnerTmuxName`, `PaneInfo` and the
@@ -793,10 +813,16 @@ The full list of user-visible and breaking changes, with schema migrations, is i
 
 ### Upgrading from the codex app-server runtime
 
-codex no longer runs the `codex` CLI (`codex app-server`); it runs orc's built-in harness, and the
-codex CLI is not needed. Sessions created by the app-server runtime show as `dead`, have no
-transcript in `orc read` (their rollouts stay in `~/.codex/sessions`), and cannot be resumed;
-`orc prune` removes them. `ORC_CODEX_BIN` is ignored. Sign in once with `orc login chatgpt` (or
-reuse pi's login, or set `OPENAI_API_KEY`); `orc login status` shows which is used. `--agent`
-still reads codex TOML agents. Takeover now prints a `pi --session …` command, so install pi
-(1.2.0) if you want to continue codex sessions by hand.
+This older runtime used `codex app-server`; the subsequent built-in harness also no longer
+exists. App-server records remain historical and cannot be resumed by orc. Their original
+rollout data remains under `~/.codex/sessions`; ORC's Pi transcript reader cannot import that
+different format. Start a new Pi session with a summary of the relevant history.
+
+### Upgrading from the built-in Codex harness
+
+Use `--provider pi` with a qualified model such as `openai/gpt-5.5`, authenticate in Pi, and
+move `[models].codex` to `[models].pi`. ORC's old login/logout commands return actionable
+removed-command errors. Historical harness transcripts stay readable and can continue in
+native Pi after `orc takeover`; old ORC sessions are never silently converted or re-sent.
+The full configuration, agent-definition, environment and workflow steps are in
+[`docs/MIGRATION-pi.md`](docs/MIGRATION-pi.md).

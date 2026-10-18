@@ -1,35 +1,28 @@
 /**
- * Resolve agent / persona definitions from the on-disk stores the user already keeps,
- * preferring the provider's OWN convention before cross-provider fallback:
- *
- *   - codex: project `.codex/agents/*.toml` → user `$CODEX_HOME/agents/*.toml`
- *            → project `.codex/prompts/<name>.md` → user `$CODEX_HOME/prompts/<name>.md`
- *            → then claude agent files as a fallback.
- *   - claude/pi/other: project `.claude/agents/<name>.md` → user `~/.claude/agents/<name>.md`.
- *
- * (claude itself resolves named agents natively via `--agent`; this resolver is used for
- * the non-native providers so a single `agentName` works across providers.) Files may have
- * YAML frontmatter; we use the body as the persona/system prompt.
+ * Shared Markdown agent definitions: project `.claude/agents/<name>.md`, then user
+ * `~/.claude/agents/<name>.md`. Claude resolves native --agent itself; Pi uses this
+ * reader to inject only the body as its system prompt. Provider-specific frontmatter
+ * models are not silently interpreted as Pi model IDs.
  */
-import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
 import type { Provider } from './types.ts';
+import { assertProvider } from './providers.ts';
 
 export interface AgentDef {
   /** Bare agent name (frontmatter `name:` or filename without .md). */
   name: string;
-  /** Description from frontmatter or Codex TOML, if present. */
+  /** Description from frontmatter, if present. */
   description?: string;
-  /** Model from frontmatter or Codex TOML, if present. */
+  /** Model from frontmatter, if present. */
   model?: string;
-  /** The prompt body (markdown body or Codex TOML developer_instructions). */
+  /** The Markdown prompt body. */
   body: string;
   /** Absolute path the def was loaded from. */
   source: string;
-  /** Definition format. Only Codex TOML files carry Codex custom-agent config semantics. */
-  sourceType: 'codex-toml' | 'markdown';
+  /** Definition format. */
+  sourceType: 'markdown';
 }
 
 export interface ParsedFrontmatter {
@@ -79,109 +72,13 @@ export function parseFrontmatter(text: string): ParsedFrontmatter {
   return { frontmatter, body };
 }
 
-/** `$CODEX_HOME` (defaults to `~/.codex`), matching the codex CLI's own resolution. */
-function codexHome(): string {
-  return process.env.CODEX_HOME ?? path.join(os.homedir(), '.codex');
-}
-
-/**
- * Candidate file paths/globs for an agent name, project scope before user scope. When
- * `provider === 'codex'`, native custom TOML agents are searched before legacy prompt
- * markdown, and both codex stores win over the cross-provider claude fallback.
- */
+/** Project Markdown agents take precedence over user Markdown agents. */
 export function agentDefCandidates(name: string, cwd: string, provider?: Provider): string[] {
-  const claudeScopes = [
+  if (provider !== undefined) assertProvider(provider);
+  return [
     path.join(cwd, '.claude', 'agents', `${name}.md`),
     path.join(os.homedir(), '.claude', 'agents', `${name}.md`),
   ];
-  if (provider === 'codex') {
-    return [
-      path.join(cwd, '.codex', 'agents', '*.toml'),
-      path.join(codexHome(), 'agents', '*.toml'),
-      path.join(cwd, '.codex', 'prompts', `${name}.md`),
-      path.join(codexHome(), 'prompts', `${name}.md`),
-      ...claudeScopes,
-    ];
-  }
-  return claudeScopes;
-}
-
-function markdownAgentDefCandidates(name: string, cwd: string, provider?: Provider): string[] {
-  return agentDefCandidates(name, cwd, provider).filter((candidate) => !candidate.includes('*'));
-}
-
-async function tomlFiles(dir: string): Promise<string[]> {
-  try {
-    const entries = await fs.readdir(dir, { withFileTypes: true });
-    return entries
-      .filter((entry) => entry.isFile() && entry.name.endsWith('.toml'))
-      .map((entry) => path.join(dir, entry.name))
-      .sort();
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
-    throw error;
-  }
-}
-
-function stringField(value: unknown): string | undefined {
-  if (typeof value !== 'string') return undefined;
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : undefined;
-}
-
-function invalidCodexTomlError(source: string, fields: string[]): Error {
-  return new Error(
-    `Invalid Codex custom agent TOML at ${source}: missing or invalid required field(s): ${fields.join(', ')}`,
-  );
-}
-
-function codexTomlAgentDef(parsed: Record<string, unknown>, source: string): AgentDef {
-  const missing = ['name', 'description', 'developer_instructions'].filter(
-    (field) => stringField(parsed[field]) === undefined,
-  );
-  if (missing.length > 0) throw invalidCodexTomlError(source, missing);
-
-  return {
-    name: stringField(parsed.name)!,
-    description: stringField(parsed.description),
-    model: stringField(parsed.model),
-    body: stringField(parsed.developer_instructions)!,
-    source,
-    sourceType: 'codex-toml',
-  };
-}
-
-async function resolveCodexTomlAgent(name: string, cwd: string): Promise<AgentDef | null> {
-  const dirs = [path.join(cwd, '.codex', 'agents'), path.join(codexHome(), 'agents')];
-  for (const dir of dirs) {
-    for (const source of await tomlFiles(dir)) {
-      const stemMatches = path.basename(source, '.toml') === name;
-      let parsed: Record<string, unknown>;
-      try {
-        parsed = Bun.TOML.parse(await Bun.file(source).text()) as Record<string, unknown>;
-      } catch (error) {
-        if (stemMatches) {
-          throw new Error(`Invalid Codex custom agent TOML at ${source}: ${(error as Error).message}`);
-        }
-        continue;
-      }
-
-      const parsedName = stringField(parsed.name);
-      if (parsedName === name) return codexTomlAgentDef(parsed, source);
-      if (stemMatches && parsedName === undefined) throw invalidCodexTomlError(source, ['name']);
-    }
-  }
-  return null;
-}
-
-/** Return the effective model for a resolved definition; caller options win. */
-export function effectiveAgentModel(
-  callerModel: string | undefined,
-  def: AgentDef | null | undefined,
-  provider?: Provider,
-): string | undefined {
-  if (callerModel !== undefined) return callerModel;
-  return provider === 'codex' && def?.sourceType === 'codex-toml' ? def.model : undefined;
 }
 
 /**
@@ -192,12 +89,7 @@ export async function resolveAgentDef(
   cwd: string,
   provider?: Provider,
 ): Promise<AgentDef | null> {
-  if (provider === 'codex') {
-    const tomlDef = await resolveCodexTomlAgent(name, cwd);
-    if (tomlDef) return tomlDef;
-  }
-
-  for (const candidate of markdownAgentDefCandidates(name, cwd, provider)) {
+  for (const candidate of agentDefCandidates(name, cwd, provider)) {
     const file = Bun.file(candidate);
     if (!(await file.exists())) continue;
     const text = await file.text();

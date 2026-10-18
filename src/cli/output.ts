@@ -84,7 +84,9 @@ export function renderSessionLine(rec: SessionView, opts?: { lineage?: boolean; 
   const state = rec.state ? ` ${st.tone(rec.state)}` : '';
   const legacy = rec.legacy ? kv(st, 'legacy', rec.legacy, st.muted) : '';
   // Kept by `orc prune` (unless --taken-over): the human holds it; hand back with resume.
-  const taken = rec.stoppedBy === 'takeover' ? ` ${st.warning(`taken-over(hand back: orc resume ${rec.id})`)}` : '';
+  const taken = rec.stoppedBy === 'takeover' ? ` ${st.warning(rec.provider === 'codex'
+    ? 'taken-over(continue in Pi; historical ORC session)'
+    : `taken-over(hand back: orc resume ${rec.id})`)}` : '';
   return `${st.id(rec.id)}  ${st.text(rec.provider)} ${status}${state}${model}${agent}${alias}${legacy}${taken}  ${st.label('cwd=')}${st.muted(rec.cwd)}${wt}${lineage}`.trim();
 }
 
@@ -444,7 +446,7 @@ export function renderRunList(runs: WorkflowRun[], style?: Style): string {
 export const HELP_TEXT = `orc — multi-agent orchestration CLI
 
 Usage:
-  orc spawn  --provider <claude|codex|pi> [options]   Launch a new agent session
+  orc spawn  --provider <claude|pi> [options]   Launch a new agent session
              aliases: agent, new
   orc send   <id|@alias> [PROMPT | - | @file] [--idempotency-key K] [--no-wake]
                                                       Send a prompt (multi-line safe; wakes a suspended session)
@@ -460,18 +462,15 @@ Usage:
   orc workflow <run|list|status|attach|logs|resume|retry|cancel|cleanup> ...  Workflows (alias: wf)
   orc daemon [--port 8787] [--bind <ip>] [--insecure] Serve the HTTP API over tailscale
   orc remote <add|list|rm> <host> [--port P]          Manage trusted peers (~/.orc/peers.json)
-  orc login  chatgpt [--import-pi] [--no-browser]     Sign in with ChatGPT for the codex provider
-  orc login  status [--json]                          Which OpenAI credential codex sessions use
-  orc logout chatgpt                                  Remove orc's ChatGPT credential
   orc settings [--json]                               Effective settings (ORC_HOST, settings.toml) and their sources
   orc mcp    [--wait-timeout SEC]                     Serve orc's commands as MCP tools over stdio (for a lead agent)
   orc help                                            This help
   orc --version [--json]                              This binary's version (alias: -V; never remote)
 
 spawn options:
-  --provider, -p <p>     claude | codex | pi (required unless settings.toml sets \`provider\`)
+  --provider, -p <p>     claude | pi (required unless settings.toml sets \`provider\`)
   --model, -m <model>    model name (default: settings.toml [models].<provider>, unless --agent)
-  --agent <name>         named agent definition (codex TOML matched by name; mutually exclusive with --system-prompt)
+  --agent <name>         named .claude/agents/<name>.md definition (mutually exclusive with --system-prompt)
   --alias <name>         workspace-scoped session alias; later use @name or @workspace:name
   --system-prompt <txt>  system prompt text
   --system-prompt-mode   append (default) | replace
@@ -601,14 +600,16 @@ settings (ORC_HOST + settings.toml):
   that record, never settings; over --host the daemon applies no [models] (also --detach). A
   detached runner always runs with --local. The SDK reads no settings files (loadSettings()).
 
-codex provider (orc's built-in harness; no codex CLI needed):
-  Talks to the OpenAI Responses API directly. Credentials, first match wins: \`orc login
-  chatgpt\` (~/.orc/auth/chatgpt.json), pi's ChatGPT login (~/.pi/agent/auth.json, or
-  $PI_CODING_AGENT_DIR), then OPENAI_API_KEY. Without --model a session uses the first model
-  your ChatGPT account lists (API key: the newest chat model pi-ai knows); spawn prints it.
-  Tools: read, write, edit, bash, ls. No context compaction yet: a turn that overflows the
-  model's context window fails — start a new session. \`orc takeover\` prints
-  \`pi --session <file>\` (pi's session format; pi needs its own OpenAI login).
+OpenAI / Codex models through Pi:
+  Use --provider pi --model openai/<model-id>. Pi 1.2.0 supports OpenAI API keys
+  (OPENAI_API_KEY) and Pi /login → OpenAI → Sign in with ChatGPT. Pi owns login,
+  token refresh, model discovery and tools. Qualified models must be configured and
+  available in Pi; configure custom models in Pi models.json. Existing bare Pi model
+  selectors still use Pi's resolver. Claude uses its existing separate CLI.
+  The old --provider codex and ORC login/logout commands are removed. Historical
+  records and credentials are preserved; see docs/MIGRATION-pi.md. Read old history
+  with orc read <id> --full or --raw; orc takeover <id> prints a Pi continuation command
+  for compatible harness transcripts. Those old records cannot resume inside ORC.
 
 Global:
   --host <h>            Run the command against the daemon on host <h> (see above)
@@ -621,7 +622,7 @@ Global:
 Sessions run as detached per-session actors that drive each provider over a structured
 protocol (no terminal). Status: running (actor live) | suspended (actor gone without a
 stop — crash/reboot; the next send or \`orc resume\` wakes it) | spawning (being created
-right now) | dead (killed, taken over, pre-actor legacy, or a codex app-server session).
+right now) | dead (killed, taken over, pre-actor legacy, or a removed Codex session).
 \`orc list\` shows running + suspended + spawning; --dead/--all include dead. \`orc prune\`
 never removes suspended sessions unless --suspended, nor sessions taken over by
 \`orc takeover\` unless --taken-over (their dir holds the system prompt the printed provider

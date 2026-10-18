@@ -17,7 +17,8 @@ import type { SessionRecord } from './types.ts';
 import type { SpawnSpec } from './runtime/types.ts';
 import { resolveClaudeTranscript } from './runtime/providers/claude.ts';
 import { buildPiArgs } from './runtime/providers/pi-protocol.ts';
-import { CODEX_SESSION_FILE_NAME, isLegacyCodexSpec } from './runtime/providers/codex.ts';
+import { LEGACY_CODEX_SESSION_FILE } from './legacy-codex.ts';
+import { validateModel } from './providers.ts';
 import { sessionStateDir } from './paths.ts';
 
 function existing(p: string | undefined): string | null {
@@ -35,7 +36,7 @@ export function resolveTranscriptPath(
   if (rec.provider === 'codex') {
     // Only the harness's session file: a legacy app-server record points at a codex rollout.
     for (const p of [rec.transcriptPath, spec?.transcriptPath, safeSessionFile(rec.sessionId)]) {
-      if (p && path.basename(p) === CODEX_SESSION_FILE_NAME && fs.existsSync(p)) return p;
+      if (p && path.basename(p) === LEGACY_CODEX_SESSION_FILE && fs.existsSync(p)) return p;
     }
     return null;
   }
@@ -67,10 +68,79 @@ export function resolveTranscriptPath(
 
 function safeSessionFile(sessionId: string): string | undefined {
   try {
-    return path.join(sessionStateDir(sessionId), CODEX_SESSION_FILE_NAME);
+    return path.join(sessionStateDir(sessionId), LEGACY_CODEX_SESSION_FILE);
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Read only the model selection needed for a native handoff. Pi v3's active branch
+ * ends at the last entry; prior takeovers may have added other branches. Match Pi
+ * 1.2.0 session-manager's parent chain and model/assistant precedence, but refuse a
+ * broken chain instead of silently selecting a model from incomplete history.
+ */
+function legacyContinuationModel(spec: SpawnSpec, file: string): string {
+  const lines = fs.readFileSync(file, 'utf8').split('\n').filter((line) => line.trim());
+  const unsupported = (reason: string) => new Error(
+    `cannot safely continue historical Codex transcript ${file}: ${reason}; review its history with orc read ${spec.sessionId} --full and select a model explicitly in Pi. See docs/MIGRATION-pi.md.`,
+  );
+  let header: Record<string, unknown> | undefined;
+  const entries: Array<Record<string, unknown>> = [];
+  const byId = new Map<string, Record<string, unknown>>();
+  for (let i = 0; i < lines.length; i++) {
+    let parsed: unknown;
+    try { parsed = JSON.parse(lines[i]!); }
+    catch { continue; } // Pi's reader also skips malformed lines (including a torn tail).
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw unsupported('invalid entry');
+    const entry = parsed as Record<string, unknown>;
+    if (i === 0) {
+      header = entry;
+      continue;
+    }
+    if (entry.type === 'session' || typeof entry.id !== 'string' || !entry.id || byId.has(entry.id)) {
+      throw unsupported('missing or duplicate entry identity');
+    }
+    entries.push(entry);
+    byId.set(entry.id, entry);
+  }
+  if (header?.type !== 'session' || header.version !== 3 || header.id !== spec.sessionId) {
+    throw unsupported('not a matching Pi v3 session');
+  }
+  const active: Array<Record<string, unknown>> = [];
+  const seen = new Set<unknown>();
+  let entry = entries.at(-1);
+  while (entry) {
+    if (seen.has(entry.id)) throw unsupported('cyclic active branch');
+    seen.add(entry.id);
+    active.push(entry);
+    if (entry.parentId === null) break;
+    if (typeof entry.parentId !== 'string' || !byId.has(entry.parentId)) throw unsupported('broken active branch');
+    entry = byId.get(entry.parentId);
+  }
+  let model: unknown = spec.model;
+  let provider: unknown = 'openai';
+  for (const entry of active.reverse()) {
+    if (entry.type === 'model_change') {
+      model = entry.modelId;
+      provider = entry.provider;
+    } else if (entry.type === 'message' && entry.message && typeof entry.message === 'object') {
+      const message = entry.message as Record<string, unknown>;
+      if (message.role === 'assistant' && (message.model !== undefined || message.provider !== undefined)) {
+        model = message.model;
+        provider = message.provider;
+      }
+    }
+  }
+  if (!model) {
+    throw unsupported('no recorded model');
+  }
+  if (provider !== 'openai') {
+    throw unsupported('the active branch does not select the supported OpenAI provider');
+  }
+  try { validateModel('pi', model); }
+  catch { throw unsupported('invalid recorded model'); }
+  return model;
 }
 
 /** POSIX shell single-quoting (only when needed). */
@@ -105,12 +175,23 @@ export function nativeResumeArgv(spec: SpawnSpec): string[] {
       return argv;
     }
     case 'codex': {
-      if (isLegacyCodexSpec(spec)) return [];
+      if (spec.providerSessionId && spec.providerSessionId !== spec.sessionId) return [];
       const file =
-        spec.transcriptPath && path.basename(spec.transcriptPath) === CODEX_SESSION_FILE_NAME
+        spec.transcriptPath && path.basename(spec.transcriptPath) === LEGACY_CODEX_SESSION_FILE
           ? spec.transcriptPath
           : safeSessionFile(spec.sessionId);
-      return file && fs.existsSync(file) ? ['pi', '--session', file] : [];
+      if (!file || !fs.existsSync(file)) return [];
+      // Explicit flags prevent Pi restoring a different provider when the saved model's
+      // credentials are unavailable. No model catalog or auth is implemented in ORC.
+      const model = legacyContinuationModel(spec, file);
+      const argv = ['pi', '--session', file, '--provider', 'openai', '--model', model];
+      if (spec.systemPrompt) {
+        if (!existing(spec.systemPrompt.path) || !fs.statSync(spec.systemPrompt.path).isFile()) {
+          throw new Error(`historical session system prompt is missing or not a file: ${spec.systemPrompt.path}; restore it before continuing in Pi. See docs/MIGRATION-pi.md.`);
+        }
+        argv.push(spec.systemPrompt.mode === 'replace' ? '--system-prompt' : '--append-system-prompt', spec.systemPrompt.path);
+      }
+      return argv;
     }
     case 'pi': {
       const args = buildPiArgs(spec, true);
@@ -129,7 +210,7 @@ export function nativeResumeArgv(spec: SpawnSpec): string[] {
  */
 export function nativeResumeNote(spec: SpawnSpec): string | null {
   if (spec.provider !== 'codex') return null;
-  return 'needs pi (>= 1.2.0) on PATH, signed in to OpenAI in pi (Sign in with ChatGPT) or OPENAI_API_KEY set';
+  return 'Needs Pi (verified 1.2.0) on PATH; sign in with Pi /login → OpenAI → Sign in with ChatGPT, or set OPENAI_API_KEY. Continue in Pi; this historical ORC session cannot be handed back with orc resume. History and old credentials are preserved. See docs/MIGRATION-pi.md.';
 }
 
 /** `cd <cwd> && <native resume argv>` (shell-quoted), or a comment for `fake`. */

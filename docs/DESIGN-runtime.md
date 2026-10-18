@@ -2,10 +2,11 @@
 
 Status: **implemented (2026-10-15)**; proposed and judge-reviewed 2026-10-14. Supersedes the tmux
 driver decision in `RESEARCH.md` §F.16c and the old `Driver` section of `ARCHITECTURE.md`.
-§1–6 are the decision record as reviewed; §7 lists where the build differs and what it added.
-**codex changed since (S9, §7.3):** the `codex app-server` runtime in §4.1 was replaced by orc's
-built-in codex harness; read the codex column of §4.1, the codex notes in §4.1/§5 and the S3 row
-of §6 as history.
+§1–7.3 preserve the decision and implementation history through 2026-10-15. **Current
+integration decision (2026-10-18):** the later built-in Codex harness is also removed; production
+execution uses Pi CLI/RPC plus the separate Claude CLI. See §7.4, [current architecture](ARCHITECTURE.md)
+and [migration](MIGRATION-pi.md). The Codex app-server and built-in-harness descriptions below
+are historical, not supported execution paths.
 
 ## 1. Goal and constraints
 
@@ -304,3 +305,39 @@ end-to-end login. Eligibility: per OpenAI's
 [Sign in with ChatGPT guide](https://developers.openai.com/cookbook/articles/sign-in-with-chatgpt),
 plan usage is offered to open-source projects and personal projects that run locally (paid or
 remotely hosted apps must request access); otherwise `OPENAI_API_KEY` applies.
+
+### 7.4 Pi + Claude consolidation (2026-10-18)
+
+The maintenance cost of S9 included an independently maintained model/tool loop, custom protocol,
+tool implementations, login/refresh, model discovery, session writer and packaging checks. Pi
+already supplies those behaviours. ORC now uses only its existing `pi --mode rpc` and Claude
+stream-json adapters for production execution; OpenAI/Codex models are Pi model selections.
+The removed S9 execution implementation and its direct pi-ai/pi-agent-core dependencies do
+not survive as a compatibility adapter.
+
+Pi CLI 1.2.0's `openai` provider supports API keys and its **Sign in with ChatGPT** login route.
+Qualified `provider/model` selection is checked through Pi's own selected/available model
+responses before an initial prompt is dispatched. There is no ORC-owned model catalog or
+OAuth store. Claude's execution path remains separate and unchanged.
+
+Old Codex records, journals and native files remain inspectable. Built-in-harness sessions can
+continue in native Pi using their Pi-format transcript after ORC stops their actor through
+`takeover`. The command explicitly selects Pi's `openai` provider and the recorded model, checks
+the transcript identity and preserves the original persona file/mode. ORC does not silently
+rewrite a provider or replay an old prompt. Old app-server rollouts have no automatic Pi
+importer. Configuration and saved-workflow changes are explicit and described in
+[MIGRATION-pi.md](MIGRATION-pi.md).
+
+**pi-durable is skipped.** The [separate decision](decisions/pi-durable.md) checks Pi releases
+1.2.0 and 1.3.0 against the current code/tests. The earlier §3 summary is refined here: the
+portable Durable core can run on Bun, so incompatibility with a single binary is not assumed.
+The decisive cost is that it owns a model/tool harness rather than Pi CLI/RPC sessions, has no
+cross-process locking, and does not replace ORC's shared Claude/Pi actor ownership, uncertain
+delivery receipts, native takeover or workflow semantics. Adopting it would need new storage,
+transport and migration adapters while retaining those responsibilities. Its experimental API
+and recent breaking changes add further ongoing work.
+
+The session/mailbox/journal format and workflow durability implementation therefore stay in
+place. Compiled verification now exercises real ORC actors against scripted Pi and Claude
+protocols, replacing the removed harness self-test. Authenticated provider runs remain distinct
+from those offline checks.

@@ -37,6 +37,7 @@
  *   process exit with a turn open               → turn.interrupted (pi emits nothing)
  */
 import type { ProviderEvent, SpawnSpec, TurnUsage } from '../types.ts';
+import { parsePiModel, validateModel } from '../../providers.ts';
 
 /** pi version the protocol mapping was verified against (contract-test pin). */
 export const PI_VERIFIED_VERSION = '1.2.0';
@@ -76,7 +77,14 @@ export function piSessionIdFor(spec: SpawnSpec, resume: boolean): string {
  */
 export function buildPiArgs(spec: SpawnSpec, resume: boolean): string[] {
   const args = ['--mode', 'rpc', '-a'];
-  if (spec.model) args.push('--model', spec.model);
+  validateModel('pi', spec.model);
+  if (spec.model) {
+    const selected = parsePiModel(spec.model);
+    // An explicit --provider prevents Pi's provider inference from falling back to a
+    // similarly named raw model id on another authenticated provider.
+    if (selected.provider) args.push('--provider', selected.provider);
+    args.push('--model', selected.model);
+  }
   if (spec.systemPrompt) {
     args.push(
       spec.systemPrompt.mode === 'replace' ? '--system-prompt' : '--append-system-prompt',

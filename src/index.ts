@@ -257,6 +257,7 @@ export {
 } from './runs.ts';
 export type {
   Provider,
+  StoredProvider,
   AgentOptions,
   AgentState,
   SessionRecord,

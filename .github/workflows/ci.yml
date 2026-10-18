@@ -39,6 +39,14 @@ jobs:
         with:
           bun-version-file: .bun-version
 
+      # The npm-installed Pi CLI invokes Node (requires >=22.19.0). Use the same
+      # supported LTS version as local contract verification on both test runners.
+      - name: Set up Node for Pi
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.19.0'
+          package-manager-cache: false
+
       # Worktree tests commit in temp repos without setting an identity of their own.
       - name: Configure git identity
         run: |
@@ -47,6 +55,13 @@ jobs:
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
+
+      # Exercise the actual Pi RPC/model/auth contracts against local mock endpoints.
+      # This separate exact-release install is not shipped in ORC or added to its lockfile.
+      - name: Install Pi contract-test runtime
+        run: |
+          bun scripts/verify-runtime/install-pi-test-tooling.ts "$RUNNER_TEMP/orc-pi-test"
+          echo "ORC_TEST_PI_BIN=$RUNNER_TEMP/orc-pi-test/node_modules/.bin/pi" >> "$GITHUB_ENV"
 
       - name: Typecheck
         run: bun run typecheck

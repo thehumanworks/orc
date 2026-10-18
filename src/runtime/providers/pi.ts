@@ -12,7 +12,8 @@
  *   {"ts":"<iso>","dir":"info","line":"<lifecycle note: spawn argv, stdin closed, exit>"}
  *
  * Lifecycle:
- *   start  → spawn, `get_state` (≤ bootTimeoutMs), validate, emit `ready`
+ *   start  → spawn, `get_state` (and `get_available_models` for an explicit qualified
+ *            model; together ≤ bootTimeoutMs), validate, emit `ready`
  *            {providerSessionId: the --session-id, transcriptPath: get_state.sessionFile,
  *             info: {version, model, thinkingLevel, messageCount}}.
  *            Rejects when pi exits/times out, has no usable model (`model.provider` is
@@ -38,6 +39,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { parsePiModel, validateModel } from '../../providers.ts';
 import { processStartTime, signalProcessGroup, terminateProcessGroup } from '../process.ts';
 import type {
   ProcessIdentity,
@@ -62,6 +64,7 @@ export const PI_DEFAULT_BOOT_TIMEOUT_MS = 15_000;
 export const PI_DEFAULT_CLOSE_GRACE_MS = 3_000;
 /** After pi exits, how long to keep reading buffered stdout before giving up. */
 const STDOUT_DRAIN_MS = 2_000;
+const PI_MODELS_ID = '__orc:models';
 
 export interface PiRuntimeOptions {
   /** pi executable: a path, or a name looked up on launch.env.PATH. Default `pi`. */
@@ -87,9 +90,17 @@ export function piStderrLogPath(rawLogPath: string): string {
 
 type ReadyEvent = Extract<ProviderEvent, { type: 'ready' }>;
 
+/** Pi tries literal model ids before interpreting a final :thinking suffix. */
+function matchesPiModelId(requested: string, selected: string): boolean {
+  if (requested.toLowerCase() === selected.toLowerCase()) return true;
+  const suffix = requested.match(/:(off|minimal|low|medium|high|xhigh|max)$/);
+  return suffix !== null && requested.slice(0, -suffix[0].length).toLowerCase() === selected.toLowerCase();
+}
+
 async function startPi(launch: ProviderLaunch, opts: PiRuntimeOptions): Promise<ProviderRuntime> {
   const { spec, resume, env } = launch;
   if (spec.provider !== 'pi') throw new Error(`pi runtime: spec.provider is '${spec.provider}', expected 'pi'`);
+  validateModel('pi', spec.model);
   const sessionId = piSessionIdFor(spec, resume);
   if (!PI_SESSION_ID_RE.test(sessionId)) {
     throw new Error(`pi runtime: invalid pi session id '${sessionId}'`);
@@ -112,6 +123,7 @@ async function startPi(launch: ProviderLaunch, opts: PiRuntimeOptions): Promise<
       sessionId,
       resume,
       cwd: spec.cwd,
+      model: spec.model,
       timeoutMs: opts.bootTimeoutMs ?? PI_DEFAULT_BOOT_TIMEOUT_MS,
       version: readPiVersion(binPath),
     });
@@ -146,7 +158,7 @@ class PiRuntime implements ProviderRuntime {
   /** Events produced before `ready` (flushed after it); null once ready. */
   private held: ProviderEvent[] | null = [];
   private rawFd: number | null;
-  private bootWaiter: ((rec: PiRecord | null) => void) | null = null;
+  private bootWaiter: { id: string; resolve: (rec: PiRecord | null) => void } | null = null;
   private ackWaiter: { messageId: string; resolve: () => void } | null = null;
   /** Woken after every processed stdout line and on exit (close() waits on them). */
   private stateWaiters: Array<() => void> = [];
@@ -257,35 +269,50 @@ class PiRuntime implements ProviderRuntime {
     sessionId: string;
     resume: boolean;
     cwd: string;
+    model?: string;
     timeoutMs: number;
     version?: string;
   }): Promise<ReadyEvent> {
-    const rec = await new Promise<PiRecord | null | 'timeout'>((resolve) => {
-      const timer = setTimeout(() => resolve('timeout'), o.timeoutMs);
-      this.bootWaiter = (r) => {
-        clearTimeout(timer);
-        resolve(r);
-      };
-      this.write({ id: PI_BOOT_ID, type: 'get_state' }).catch(() => {});
-    });
-    this.bootWaiter = null;
-    if (rec === 'timeout') {
-      throw new Error(`pi runtime: no get_state response within ${o.timeoutMs} ms${this.stderrHint()}`);
-    }
-    if (rec === null) {
-      throw new Error(
-        `pi runtime: pi exited during startup (code=${this.proc.exitCode}, signal=${this.proc.signalCode})${this.stderrHint()}`,
-      );
-    }
-    if (rec.success !== true) {
-      throw new Error(`pi runtime: get_state failed: ${typeof rec.error === 'string' ? rec.error : 'unknown error'}`);
-    }
+    const deadline = Date.now() + o.timeoutMs;
+    const rec = await this.bootRequest('get_state', PI_BOOT_ID, o.timeoutMs);
     const data = isRecord(rec.data) ? rec.data : {};
     const model = isRecord(data.model) ? data.model : {};
     const modelProvider = typeof model.provider === 'string' ? model.provider : undefined;
-    if (!modelProvider || modelProvider === 'unknown') {
+    const modelId = typeof model.id === 'string' ? model.id : undefined;
+    if (!modelProvider || modelProvider === 'unknown' || !modelId || modelId === 'unknown') {
       throw new Error(
         'pi runtime: pi has no usable model (get_state.model.provider is "unknown") — set the session model or configure/log in to pi',
+      );
+    }
+    if (o.model) {
+      const requested = parsePiModel(o.model);
+      if (requested.provider) {
+        if (requested.provider.toLowerCase() !== modelProvider.toLowerCase() ||
+            !matchesPiModelId(requested.model, modelId)) {
+          throw new Error(
+            `pi runtime: requested model '${o.model}' but Pi selected '${modelProvider}/${modelId}'; ` +
+              'refusing to start a turn with a different model. Use an exact provider/model-id from pi --list-models',
+          );
+        }
+        // Pi may construct fallback metadata for an unknown explicit model id. Ask Pi's
+        // authenticated catalog so that typo cannot become an accepted ORC turn. Custom
+        // models remain supported through Pi's models.json; ORC keeps no model catalog.
+        const available = await this.bootRequest('get_available_models', PI_MODELS_ID, Math.max(1, deadline - Date.now()));
+        const models = isRecord(available.data) && Array.isArray(available.data.models) ? available.data.models : [];
+        if (!models.some((m: unknown) => isRecord(m) && m.provider === modelProvider && m.id === modelId)) {
+          throw new Error(
+            `pi runtime: requested model '${o.model}' is not available in Pi's authenticated model list; ` +
+              'configure or log in to its provider in Pi and check pi --list-models. ' +
+              'For OpenAI use /login openai (Sign in with ChatGPT) or OPENAI_API_KEY; ' +
+              'add custom models to Pi models.json before spawning',
+          );
+        }
+      }
+    }
+    if (data.sessionId !== o.sessionId) {
+      throw new Error(
+        `pi runtime: requested session '${o.sessionId}' but Pi opened '${String(data.sessionId)}'; ` +
+          'refusing to continue with a different session',
       );
     }
     const messageCount = typeof data.messageCount === 'number' ? data.messageCount : undefined;
@@ -296,15 +323,44 @@ class PiRuntime implements ProviderRuntime {
           `(cwd=${o.cwd}) or the session has no history; refusing to continue in a silently fresh session`,
       );
     }
-    const info: Record<string, unknown> = {
-      model: `${modelProvider}/${typeof model.id === 'string' ? model.id : 'unknown'}`,
-    };
+    const info: Record<string, unknown> = { model: `${modelProvider}/${modelId}` };
     if (o.version) info.version = o.version;
     if (typeof data.thinkingLevel === 'string') info.thinkingLevel = data.thinkingLevel;
     if (messageCount !== undefined) info.messageCount = messageCount;
     const ready: ReadyEvent = { type: 'ready', providerSessionId: o.sessionId, info };
     if (typeof data.sessionFile === 'string' && data.sessionFile.length > 0) ready.transcriptPath = data.sessionFile;
     return ready;
+  }
+
+  private async bootRequest(command: 'get_state' | 'get_available_models', id: string, timeoutMs: number): Promise<PiRecord> {
+    const rec = await new Promise<PiRecord | null | 'timeout'>((resolve) => {
+      if (this.hasExited) { resolve(null); return; }
+      const timer = setTimeout(() => resolve('timeout'), timeoutMs);
+      this.bootWaiter = {
+        id,
+        resolve: (r) => {
+          clearTimeout(timer);
+          resolve(r);
+        },
+      };
+      this.write({ id, type: command }).catch(() => {});
+    });
+    this.bootWaiter = null;
+    if (rec === 'timeout') {
+      throw new Error(`pi runtime: no ${command} response within ${timeoutMs} ms${this.stderrHint()}`);
+    }
+    if (rec === null) {
+      throw new Error(
+        `pi runtime: pi exited during startup (code=${this.proc.exitCode}, signal=${this.proc.signalCode})${this.stderrHint()}`,
+      );
+    }
+    if (rec.command !== command) {
+      throw new Error(`pi runtime: expected ${command} response, received '${String(rec.command)}'`);
+    }
+    if (rec.success !== true) {
+      throw new Error(`pi runtime: ${command} failed: ${typeof rec.error === 'string' ? rec.error : 'unknown error'}`);
+    }
+    return rec;
   }
 
   markReady(ready: ReadyEvent): void {
@@ -394,8 +450,8 @@ class PiRuntime implements ProviderRuntime {
       if (line.trim().length > 0) this.mapper.nonJsonLines++;
       return;
     }
-    if (rec.type === 'response' && rec.id === PI_BOOT_ID) {
-      this.bootWaiter?.(rec);
+    if (rec.type === 'response' && rec.id === this.bootWaiter?.id) {
+      this.bootWaiter?.resolve(rec);
       return;
     }
     const r = this.mapper.handleRecord(rec);
@@ -451,7 +507,7 @@ class PiRuntime implements ProviderRuntime {
     const signal = this.proc.signalCode ?? null;
     this.raw('info', `exit code=${code} signal=${signal}`);
     for (const ev of this.mapper.finishOnExit()) this.emit(ev);
-    this.bootWaiter?.(null);
+    this.bootWaiter?.resolve(null);
     const waiter = this.ackWaiter;
     this.ackWaiter = null;
     waiter?.resolve();
