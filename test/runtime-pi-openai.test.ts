@@ -145,6 +145,18 @@ async function complete(launch: ProviderLaunch): Promise<ProviderEvent[]> {
   return events;
 }
 
+async function finishesWithin(work: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work.then(() => true),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 beforeAll(() => { root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'orc-pi-openai-'))); });
 afterEach(async () => {
   await Promise.all(runtimes.splice(0).map((runtime) => runtime.close({ graceMs: 500 })));
@@ -272,11 +284,18 @@ suite('OpenAI through the actual Pi integration', () => {
         const retained = fs.readFileSync(transcriptPath, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
         expect(retained.slice(0, entries.length)).toEqual(entries);
       } finally {
-        await proc.stdin.end();
-        await terminateProcessGroup(identity, 1_000);
-        await proc.exited;
-        await pump;
+        // EOF asks Pi to shut down normally. Like PiRuntime.close(), wait for that
+        // exit before signalling; macOS CI rejected the immediate group SIGTERM.
+        const inputClosed = Promise.resolve(proc.stdin.end());
+        if (!(await finishesWithin(Promise.all([inputClosed, proc.exited]), 2_000))) {
+          await terminateProcessGroup(identity, 1_000);
+        }
+        if (!(await finishesWithin(Promise.all([inputClosed, proc.exited, pump, stderr]), 2_000))) {
+          throw new Error('native Pi continuation cleanup timed out waiting for exit or pipe drain');
+        }
       }
-    }, 25_000);
+      // A successful continuation also takes Pi's normal EOF shutdown path.
+      expect(proc.exitCode).toBe(0);
+    }, 30_000); // Two 10s RPC waits plus the bounded EOF/termination/drain cleanup.
   }
 });

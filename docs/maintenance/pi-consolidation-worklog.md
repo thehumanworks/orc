@@ -132,9 +132,47 @@ was explicit before edits; only the coordinator integrates and publishes commits
 
 ## Publication gate
 
-This log records the implementation state prepared for publication. The coordinator publishes
-coherent implementation/documentation commits, opens a PR against `main`, checks hosted CI on
-the latest commit and resolves introduced failures. Post-publication results are recorded in
-the PR description and its GitHub Checks; they are not inferred from local checks. Leave the
-PR open for review and do not merge it. Shell Git push credentials are absent in this environment;
-the authenticated GitHub connector can publish the same verified commit trees instead.
+The implementation and documentation were published as `fb5f40b` and `53d8ee3` in
+[PR #4](https://github.com/thehumanworks/orc/pull/4). The repository owner merged that PR
+at 2026-10-18 12:30:16 UTC and confirmed the merge in the task conversation. The merge commit
+`4b1c2b03a427ff880d5bd473997bb4851870a176` has the same tree as the final verified implementation.
+The coordinator did not merge the PR.
+
+### Follow-up from main
+
+At the owner's request, remaining hosted-CI corrections use a new branch, `fix/pi-contract-ci`,
+from that merge commit. The follow-up PR must remain open for review. No unrelated local changes
+were present when the branch was created.
+
+Hosted checks on the original PR head `53d8ee3` exposed two introduced verification defects:
+
+| Check | Observed result and correction |
+| --- | --- |
+| [Linux/macOS tests and native binaries](https://github.com/thehumanworks/orc/actions/runs/39127536223) | Linux tests and all four compiled-binary smoke jobs passed. The macOS continuation test passed its history/model/persona assertions, then failed during teardown with `EPERM` while signalling Pi immediately after closing stdin. Give Pi a bounded orderly EOF shutdown before process-group termination; retain the assertions and failing cleanup errors. |
+| [Nix on Linux x64/ARM and macOS ARM](https://github.com/thehumanworks/orc/actions/runs/39127536233) | Dependency hashes and ORC compilation succeeded on all three platforms; the new smoke failed. A minimal-PATH reproduction confirmed `git` was missing when session spawn resolves its workspace. Add Git to the smoke inputs and print failure JSON before propagating the nonzero status. |
+
+The validation agent owns `flake.nix`; the integration agent owns the native Pi continuation
+test cleanup. The durability agent independently reviews both changes, and the coordinator
+owns this log, combined verification and publication. Production provider and process code
+remain outside this follow-up's scope. Both fixes passed independent review with no unresolved
+material findings. The coordinator also reviewed the complete diff.
+
+Follow-up verification on the final combined local tree:
+
+- Exact Pi 1.2.0 OpenAI and lifecycle contracts: **17 passed / 0 failed**, 99 assertions.
+  Both native continuation cases now also require normal exit code 0. The test deadline allows
+  the existing two RPC deadlines and the bounded EOF/termination/pipe-drain cleanup.
+- The exact Nix smoke shell fragment, with a minimal PATH: without Git, **exit 1** with both
+  provider errors printed and no success marker; adding Git, **7/7 checks passed**, exit 0,
+  success marker created and empty stderr. This establishes the dependency and diagnostic
+  correction locally; it does not substitute for a hosted Nix build.
+- Coordinator's full suite with the exact Pi test install: **944 passed / 14 skipped / 0 failed**,
+  **10,395 assertions**, 63 files. The 14 skips remain the opt-in authenticated Claude contract.
+- Coordinator's typecheck: **PASS**. Final compiled smoke: **7/7 PASS**; 183 bundled modules.
+  `git diff --check`: **PASS**. No new compiler/build warnings were observed.
+- Live provider access is still blocked by the credentials limitation recorded above. These
+  CI corrections add no model/authentication, provider, storage or replay behavior.
+
+The new PR's latest-commit hosted results are recorded in its description and GitHub Checks.
+Platform success is never inferred from a local Linux run; macOS and all three Nix jobs must
+be checked after publication, and the follow-up PR must remain open.
